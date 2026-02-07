@@ -1,4 +1,4 @@
-import { Data, Deferred, Duration, Effect, FiberSet, Layer, Option, Queue, Ref, Runtime, Stream } from "effect"
+import { Data, Deferred, Duration, Effect, FiberSet, Layer, Match, Option, Queue, Ref, Runtime, Stream } from "effect"
 import { BridgeHandler } from "./BridgeHandler"
 import { SandboxError } from "./RlmError"
 import { SandboxConfig, SandboxFactory, type SandboxInstance } from "./Sandbox"
@@ -134,96 +134,85 @@ const dispatchFrame = (
   config: SandboxConfig["Type"],
   callerCallId: CallId,
   bridgeFibers: FiberSet.FiberSet<void, SandboxError>
-): Effect.Effect<void, never, never> => {
-  switch (frame._tag) {
-    case "ExecResult": {
-      return Effect.gen(function*() {
-        const pending = yield* Ref.get(pendingRequests)
-        const deferred = pending.get(frame.requestId)
-        if (deferred) yield* Deferred.succeed(deferred, frame.output)
-      })
-    }
-
-    case "ExecError": {
-      return Effect.gen(function*() {
-        const pending = yield* Ref.get(pendingRequests)
-        const deferred = pending.get(frame.requestId)
-        if (deferred) {
-          yield* Deferred.fail(deferred, new SandboxError({
-            message: frame.message
-          }))
+): Effect.Effect<void, never, never> =>
+  Match.value(frame).pipe(
+    Match.tagsExhaustive({
+      ExecResult: (f) =>
+        Effect.gen(function*() {
+          const pending = yield* Ref.get(pendingRequests)
+          const deferred = pending.get(f.requestId)
+          if (deferred) yield* Deferred.succeed(deferred, f.output)
+        }),
+      ExecError: (f) =>
+        Effect.gen(function*() {
+          const pending = yield* Ref.get(pendingRequests)
+          const deferred = pending.get(f.requestId)
+          if (deferred) {
+            yield* Deferred.fail(deferred, new SandboxError({
+              message: f.message
+            }))
+          }
+        }),
+      SetVarAck: (f) =>
+        Effect.gen(function*() {
+          const pending = yield* Ref.get(pendingRequests)
+          const deferred = pending.get(f.requestId)
+          if (deferred) yield* Deferred.succeed(deferred, undefined)
+        }),
+      SetVarError: (f) =>
+        Effect.gen(function*() {
+          const pending = yield* Ref.get(pendingRequests)
+          const deferred = pending.get(f.requestId)
+          if (deferred) {
+            yield* Deferred.fail(deferred, new SandboxError({ message: f.message }))
+          }
+        }),
+      GetVarResult: (f) =>
+        Effect.gen(function*() {
+          const pending = yield* Ref.get(pendingRequests)
+          const deferred = pending.get(f.requestId)
+          if (deferred) yield* Deferred.succeed(deferred, f.value)
+        }),
+      BridgeCall: (f) => {
+        if (config.sandboxMode === "strict") {
+          return trySend(proc, {
+            _tag: "BridgeFailed",
+            requestId: f.requestId,
+            message: "Bridge disabled in strict sandbox mode"
+          }).pipe(Effect.ignore)
         }
-      })
-    }
 
-    case "SetVarAck": {
-      return Effect.gen(function*() {
-        const pending = yield* Ref.get(pendingRequests)
-        const deferred = pending.get(frame.requestId)
-        if (deferred) yield* Deferred.succeed(deferred, undefined)
-      })
-    }
-
-    case "SetVarError": {
-      return Effect.gen(function*() {
-        const pending = yield* Ref.get(pendingRequests)
-        const deferred = pending.get(frame.requestId)
-        if (deferred) {
-          yield* Deferred.fail(deferred, new SandboxError({ message: frame.message }))
-        }
-      })
-    }
-
-    case "GetVarResult": {
-      return Effect.gen(function*() {
-        const pending = yield* Ref.get(pendingRequests)
-        const deferred = pending.get(frame.requestId)
-        if (deferred) yield* Deferred.succeed(deferred, frame.value)
-      })
-    }
-
-    case "BridgeCall": {
-      if (config.sandboxMode === "strict") {
-        return trySend(proc, {
-          _tag: "BridgeFailed",
-          requestId: frame.requestId,
-          message: "Bridge disabled in strict sandbox mode"
-        }).pipe(Effect.ignore)
-      }
-
-      // Fork bridge call handling into FiberSet for automatic cleanup on scope close
-      return FiberSet.run(bridgeFibers)(
-        bridgeSemaphore.withPermits(1)(
-          bridgeHandler.handle({
-            method: frame.method,
-            args: frame.args,
-            callerCallId
-          }).pipe(
-            Effect.flatMap((result) => {
-              const response = { _tag: "BridgeResult" as const, requestId: frame.requestId, result }
-              if (!checkFrameSize(response, config.maxFrameBytes)) {
-                return trySend(proc, { _tag: "BridgeFailed", requestId: frame.requestId, message: "Result too large" })
-              }
-              return trySend(proc, response)
-            }),
-            Effect.catchAll((err) =>
-              trySend(proc, { _tag: "BridgeFailed", requestId: frame.requestId, message: String(err) }).pipe(
-                Effect.ignore
+        // Fork bridge call handling into FiberSet for automatic cleanup on scope close
+        return FiberSet.run(bridgeFibers)(
+          bridgeSemaphore.withPermits(1)(
+            bridgeHandler.handle({
+              method: f.method,
+              args: f.args,
+              callerCallId
+            }).pipe(
+              Effect.flatMap((result) => {
+                const response = { _tag: "BridgeResult" as const, requestId: f.requestId, result }
+                if (!checkFrameSize(response, config.maxFrameBytes)) {
+                  return trySend(proc, { _tag: "BridgeFailed", requestId: f.requestId, message: "Result too large" })
+                }
+                return trySend(proc, response)
+              }),
+              Effect.catchAll((err) =>
+                trySend(proc, { _tag: "BridgeFailed", requestId: f.requestId, message: String(err) }).pipe(
+                  Effect.ignore
+                )
               )
             )
           )
-        )
-      ).pipe(Effect.asVoid)
-    }
-
-    case "WorkerLog": {
-      return Effect.sync(() => {
-        // Route worker logs to stderr for diagnostics
-        console.error(`[sandbox:${callerCallId}] [${frame.level}] ${frame.message}`)
-      })
-    }
-  }
-}
+        ).pipe(Effect.asVoid)
+      },
+      WorkerLog: (f) =>
+        Effect.sync(() => {
+          // Route worker logs to stderr for diagnostics
+          console.error(`[sandbox:${callerCallId}] [${f.level}] ${f.message}`)
+        })
+    })
+  )
 
 // --- Shutdown ---
 

@@ -1,3 +1,4 @@
+import { Match } from "effect"
 import type { RlmEvent } from "./RlmTypes"
 
 export interface RenderOptions {
@@ -30,71 +31,55 @@ export const renderEvent = (
   const showCode = options?.showCode ?? true
   const showOutput = options?.showOutput ?? true
 
-  switch (event._tag) {
-    case "IterationStarted": {
-      if (quiet) return
-      const budget = event.budget
-      out.write(
-        `${indent(event.depth)}${c(DIM, `--- Iteration ${event.iteration} --- (budget: ${budget.iterationsRemaining}i, ${budget.llmCallsRemaining}c)`, nc)}\n`
-      )
-      return
-    }
-
-    case "ModelResponse": {
-      if (quiet) return
-      const truncated = event.text.length > 200
-        ? event.text.slice(0, 200) + "..."
-        : event.text
-      out.write(`${indent(event.depth)}${c(DIM, truncated, nc)}\n`)
-      return
-    }
-
-    case "CodeExecutionStarted": {
-      if (quiet || !showCode) return
-      out.write(`${indent(event.depth)}${c(YELLOW, "> Executing code...", nc)}\n`)
-      return
-    }
-
-    case "CodeExecutionCompleted": {
-      if (quiet || !showOutput) return
-      const truncatedOutput = event.output.length > 500
-        ? event.output.slice(0, 500) + "..."
-        : event.output
-      out.write(`${indent(event.depth)}${c(GREEN, `< Output: ${truncatedOutput}`, nc)}\n`)
-      return
-    }
-
-    case "BridgeCallReceived": {
-      if (quiet) return
-      out.write(`${indent(event.depth)}${c(MAGENTA, `Bridge: ${event.method}`, nc)}\n`)
-      return
-    }
-
-    case "CallFinalized": {
-      const truncatedAnswer = event.answer.length > 200
-        ? event.answer.slice(0, 200) + "..."
-        : event.answer
-      out.write(`${indent(event.depth)}${c(BOLD + GREEN, `FINAL: ${truncatedAnswer}`, nc)}\n`)
-      return
-    }
-
-    case "CallFailed": {
-      const err = event.error
-      out.write(
-        `${indent(event.depth)}${c(RED, `FAILED: ${err._tag}: ${"message" in err ? err.message : ""}`, nc)}\n`
-      )
-      return
-    }
-
-    case "SchedulerWarning": {
-      if (quiet) return
-      out.write(`${c(YELLOW, `WARN: ${event.message}`, nc)}\n`)
-      return
-    }
-
-    case "CallStarted": {
-      if (quiet) return
-      return
-    }
-  }
+  Match.value(event).pipe(
+    Match.tagsExhaustive({
+      IterationStarted: (e) => {
+        if (quiet) return
+        out.write(
+          `${indent(e.depth)}${c(DIM, `--- Iteration ${e.iteration} --- (budget: ${e.budget.iterationsRemaining}i, ${e.budget.llmCallsRemaining}c)`, nc)}\n`
+        )
+      },
+      ModelResponse: (e) => {
+        if (quiet) return
+        const truncated = e.text.length > 200
+          ? e.text.slice(0, 200) + "..."
+          : e.text
+        out.write(`${indent(e.depth)}${c(DIM, truncated, nc)}\n`)
+      },
+      CodeExecutionStarted: (e) => {
+        if (quiet || !showCode) return
+        out.write(`${indent(e.depth)}${c(YELLOW, "> Executing code...", nc)}\n`)
+      },
+      CodeExecutionCompleted: (e) => {
+        if (quiet || !showOutput) return
+        const truncatedOutput = e.output.length > 500
+          ? e.output.slice(0, 500) + "..."
+          : e.output
+        out.write(`${indent(e.depth)}${c(GREEN, `< Output: ${truncatedOutput}`, nc)}\n`)
+      },
+      BridgeCallReceived: (e) => {
+        if (quiet) return
+        out.write(`${indent(e.depth)}${c(MAGENTA, `Bridge: ${e.method}`, nc)}\n`)
+      },
+      CallFinalized: (e) => {
+        const truncatedAnswer = e.answer.length > 200
+          ? e.answer.slice(0, 200) + "..."
+          : e.answer
+        out.write(`${indent(e.depth)}${c(BOLD + GREEN, `FINAL: ${truncatedAnswer}`, nc)}\n`)
+      },
+      CallFailed: (e) => {
+        const err = e.error
+        out.write(
+          `${indent(e.depth)}${c(RED, `FAILED: ${err._tag}: ${"message" in err ? err.message : ""}`, nc)}\n`
+        )
+      },
+      SchedulerWarning: (e) => {
+        if (quiet) return
+        out.write(`${c(YELLOW, `WARN: ${e.message}`, nc)}\n`)
+      },
+      CallStarted: (_) => {
+        if (quiet) return
+      }
+    })
+  )
 }

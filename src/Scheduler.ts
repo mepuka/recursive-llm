@@ -1,4 +1,4 @@
-import { Deferred, Duration, Effect, Exit, Option, PubSub, Queue, Ref, Scope, Stream } from "effect"
+import { Deferred, Duration, Effect, Exit, Match, Option, PubSub, Queue, Ref, Scope, Stream } from "effect"
 import { consumeIteration, recordTokens, reserveLlmCall, snapshot, withLlmPermit } from "./Budget"
 import { extractCodeBlock, extractFinal } from "./CodeExtractor"
 import { RlmConfig } from "./RlmConfig"
@@ -588,24 +588,17 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
 
   // --- Command dispatch ---
 
-  const processCommand = (command: RlmCommand) => {
-    switch (command._tag) {
-      case "StartCall":
-        return handleStartCall(command)
-      case "GenerateStep":
-        return handleGenerateStep(command)
-      case "ExecuteCode":
-        return handleExecuteCode(command)
-      case "CodeExecuted":
-        return handleCodeExecuted(command)
-      case "HandleBridgeCall":
-        return handleHandleBridgeCall(command)
-      case "Finalize":
-        return handleFinalize(command)
-      case "FailCall":
-        return handleFailCall(command)
-    }
-  }
+  const processCommand = Match.type<RlmCommand>().pipe(
+    Match.tagsExhaustive({
+      StartCall: handleStartCall,
+      GenerateStep: handleGenerateStep,
+      ExecuteCode: handleExecuteCode,
+      CodeExecuted: handleCodeExecuted,
+      HandleBridgeCall: handleHandleBridgeCall,
+      Finalize: handleFinalize,
+      FailCall: handleFailCall
+    })
+  )
 
   const closeRemainingCallScopes = (exit: Exit.Exit<unknown, unknown>) =>
     Effect.gen(function*() {

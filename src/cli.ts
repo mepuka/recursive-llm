@@ -2,7 +2,7 @@ import { BunRuntime } from "@effect/platform-bun"
 import { FetchHttpClient } from "@effect/platform"
 import { AnthropicClient } from "@effect/ai-anthropic"
 import { OpenAiClient } from "@effect/ai-openai"
-import { Effect, Layer, Redacted, Stream } from "effect"
+import { Effect, Layer, Match, Redacted, Stream } from "effect"
 import { makeAnthropicRlmModel, makeOpenAiRlmModel } from "./RlmModel"
 import { Rlm, rlmBunLayer } from "./Rlm"
 import { RlmConfig } from "./RlmConfig"
@@ -128,32 +128,34 @@ const main = (cliArgs: CliArgs) =>
       : cliArgs.context
 
     const rlm = yield* Rlm
-    let finalAnswer = ""
-    let failed = false
 
     const renderOpts: RenderOptions = {
       quiet: cliArgs.quiet,
       noColor: cliArgs.noColor
     }
 
-    yield* rlm.stream({ query: cliArgs.query, context }).pipe(
-      Stream.tap((event) => Effect.sync(() => {
-        if (event._tag === "CallFinalized" && event.depth === 0) {
-          finalAnswer = event.answer
-        }
-        if (event._tag === "CallFailed" && event.depth === 0) {
-          failed = true
-        }
-        renderEvent(event, process.stderr, renderOpts)
-      })),
-      Stream.runDrain
+    const result = yield* rlm.stream({ query: cliArgs.query, context }).pipe(
+      Stream.runFoldEffect(
+        { answer: "", failed: false },
+        (state, event) =>
+          Effect.sync(() => {
+            renderEvent(event, process.stderr, renderOpts)
+            return Match.value(event).pipe(
+              Match.tag("CallFinalized", (e) =>
+                e.depth === 0 ? { ...state, answer: e.answer } : state),
+              Match.tag("CallFailed", (e) =>
+                e.depth === 0 ? { ...state, failed: true } : state),
+              Match.orElse(() => state)
+            )
+          })
+      )
     )
 
-    if (failed || !finalAnswer) {
+    if (result.failed || !result.answer) {
       process.exitCode = 1
     }
 
-    process.stdout.write(finalAnswer + "\n")
+    process.stdout.write(result.answer + "\n")
   })
 
 // --- Layer construction ---

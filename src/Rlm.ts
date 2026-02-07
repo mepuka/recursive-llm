@@ -49,8 +49,7 @@ const streamInternal = (options: CompleteOptionsBase) =>
   Stream.unwrapScoped(
     Effect.gen(function*() {
       const runtime = yield* RlmRuntime
-      const subscription = yield* PubSub.subscribe(runtime.events)
-      const events = Stream.fromQueue(subscription)
+      const events = yield* Stream.fromPubSub(runtime.events, { scoped: true })
 
       yield* Effect.forkScoped(
         runScheduler(toSchedulerOptions(options)).pipe(
