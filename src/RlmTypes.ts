@@ -105,5 +105,12 @@ export type RlmEvent = Data.TaggedEnum<{
     readonly depth: number
     readonly error: RlmError
   }
+  SchedulerWarning: {
+    readonly completionId: string
+    readonly code: "STALE_COMMAND_DROPPED" | "QUEUE_CLOSED" | "CALL_SCOPE_CLEANUP"
+    readonly message: string
+    readonly callId?: CallId
+    readonly commandTag?: RlmCommand["_tag"]
+  }
 }>
 export const RlmEvent = Data.taggedEnum<RlmEvent>()

@@ -2,8 +2,8 @@
  * Sandbox worker — standalone Bun subprocess entry point.
  * Does NOT import Effect. Communicates with host via Bun IPC (JSON serialization).
  *
- * Trust model: process-level isolation only. No FS/network restrictions.
- * This is a prototype; true sandboxing is future work.
+ * Trust model: process-level isolation only.
+ * "strict" mode is best-effort JavaScript-level hardening, not a security boundary.
  */
 
 // --- State ---
@@ -11,6 +11,7 @@
 const vars = new Map<string, unknown>()
 let workerCallId = "unknown"
 let workerDepth = 0
+let sandboxMode: "permissive" | "strict" = "permissive"
 
 // Pending bridge calls: requestId → { resolve, reject }
 const pendingBridge = new Map<
@@ -20,6 +21,97 @@ const pendingBridge = new Map<
 
 // Max frame size (configurable via Init, default 4MB)
 let maxFrameBytes = 4 * 1024 * 1024
+
+const STRICT_BLOCKLIST = [
+  /\bimport\s*\(/,
+  /\brequire\s*\(/
+]
+
+const makeStrictScope = (
+  print: (...args: unknown[]) => void,
+  __vars: unknown,
+  llm_query: (query: string, context?: string) => Promise<unknown>
+) => {
+  const scope: Record<string, unknown> = {
+    // Explicitly provided worker bindings
+    print,
+    __vars,
+    llm_query,
+    undefined,
+
+    // Common JS built-ins
+    Array,
+    ArrayBuffer,
+    BigInt,
+    BigInt64Array,
+    BigUint64Array,
+    Boolean,
+    DataView,
+    Date,
+    Error,
+    EvalError,
+    Float32Array,
+    Float64Array,
+    Int8Array,
+    Int16Array,
+    Int32Array,
+    Uint8Array,
+    Uint8ClampedArray,
+    Uint16Array,
+    Uint32Array,
+    Intl,
+    JSON,
+    Map,
+    Math,
+    Number,
+    Object,
+    Promise,
+    RangeError,
+    ReferenceError,
+    RegExp,
+    Set,
+    String,
+    Symbol,
+    SyntaxError,
+    TypeError,
+    URIError,
+    URL,
+    URLSearchParams,
+    WeakMap,
+    WeakSet,
+    atob,
+    btoa,
+    clearInterval,
+    clearTimeout,
+    decodeURI,
+    decodeURIComponent,
+    encodeURI,
+    encodeURIComponent,
+    isFinite,
+    isNaN,
+    parseFloat,
+    parseInt,
+    setInterval,
+    setTimeout,
+    crypto
+  }
+
+  return new Proxy(scope, {
+    has() {
+      // Prevent fallback resolution to ambient globals.
+      return true
+    },
+    get(target, prop) {
+      if (typeof prop !== "string") return undefined
+      return Object.prototype.hasOwnProperty.call(target, prop)
+        ? target[prop]
+        : undefined
+    },
+    set() {
+      return false
+    }
+  })
+}
 
 // --- Helpers ---
 
@@ -82,6 +174,10 @@ async function executeCode(requestId: string, code: string): Promise<void> {
   })
 
   const llm_query = async (query: string, context?: string): Promise<unknown> => {
+    if (sandboxMode === "strict") {
+      throw new Error("Bridge disabled in strict sandbox mode")
+    }
+
     const bridgeRequestId = crypto.randomUUID()
 
     return new Promise((resolve, reject) => {
@@ -96,10 +192,28 @@ async function executeCode(requestId: string, code: string): Promise<void> {
   }
 
   try {
+    if (sandboxMode === "strict") {
+      for (const pattern of STRICT_BLOCKLIST) {
+        if (pattern.test(code)) {
+          throw new Error("Strict sandbox blocks dynamic module loading")
+        }
+      }
+    }
+
     // AsyncFunction constructor to allow top-level await in code
     const AsyncFunction = Object.getPrototypeOf(async function() {}).constructor
-    const fn = new AsyncFunction("print", "__vars", "llm_query", code)
-    await fn(print, __vars, llm_query)
+    if (sandboxMode === "strict") {
+      const strictScope = makeStrictScope(print, __vars, llm_query)
+      const fn = new AsyncFunction("print", "__vars", "llm_query", "__strictScope", `
+        with (__strictScope) {
+          ${code}
+        }
+      `)
+      await fn(print, __vars, llm_query, strictScope)
+    } else {
+      const fn = new AsyncFunction("print", "__vars", "llm_query", code)
+      await fn(print, __vars, llm_query)
+    }
 
     safeSend({
       _tag: "ExecResult",
@@ -130,11 +244,12 @@ function handleMessage(message: unknown): void {
     case "Init": {
       workerCallId = String(msg.callId ?? "unknown")
       workerDepth = Number(msg.depth ?? 0)
+      sandboxMode = msg.sandboxMode === "strict" ? "strict" : "permissive"
       if (typeof msg.maxFrameBytes === "number" && msg.maxFrameBytes > 0 &&
           Number.isInteger(msg.maxFrameBytes) && msg.maxFrameBytes <= 64 * 1024 * 1024) {
         maxFrameBytes = msg.maxFrameBytes
       }
-      console.error(`[sandbox-worker] Init: callId=${workerCallId} depth=${workerDepth} maxFrameBytes=${maxFrameBytes}`)
+      console.error(`[sandbox-worker] Init: callId=${workerCallId} depth=${workerDepth} mode=${sandboxMode} maxFrameBytes=${maxFrameBytes}`)
       break
     }
 

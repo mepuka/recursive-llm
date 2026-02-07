@@ -1,4 +1,4 @@
-import { Data, Deferred, Duration, Effect, FiberSet, Layer, Queue, Ref, Stream } from "effect"
+import { Data, Deferred, Duration, Effect, FiberSet, Layer, Option, Queue, Ref, Runtime, Stream } from "effect"
 import { BridgeHandler } from "./BridgeHandler"
 import { SandboxError } from "./RlmError"
 import { SandboxConfig, SandboxFactory, type SandboxInstance } from "./Sandbox"
@@ -43,6 +43,39 @@ const failAllPending = (
     )
   })
 
+const waitForExitWithin = (
+  proc: ReturnType<typeof Bun.spawn>,
+  timeoutMs: number
+) =>
+  Effect.promise(() =>
+    Promise.race([
+      proc.exited.then((code) => Option.some(code)),
+      Bun.sleep(timeoutMs).then(() => Option.none<number>())
+    ]).catch(() => Option.none<number>())
+  )
+
+const killProcess = (
+  proc: ReturnType<typeof Bun.spawn>,
+  signal: number | NodeJS.Signals
+) =>
+  Effect.try({
+    try: () => proc.kill(signal),
+    catch: () => undefined
+  }).pipe(Effect.ignore)
+
+const forceTerminateProcess = (
+  proc: ReturnType<typeof Bun.spawn>,
+  graceMs: number
+) =>
+  Effect.gen(function*() {
+    yield* killProcess(proc, 15)
+    const terminated = yield* waitForExitWithin(proc, graceMs)
+    if (Option.isSome(terminated)) return
+
+    yield* killProcess(proc, 9)
+    yield* waitForExitWithin(proc, graceMs).pipe(Effect.ignore)
+  })
+
 const sendRequest = <A>(
   state: SandboxState,
   message: unknown,
@@ -74,7 +107,7 @@ const sendRequest = <A>(
           Effect.gen(function*() {
             yield* Ref.set(state.health, "dead")
             yield* failAllPending(state.pendingRequests, "Sandbox killed after timeout")
-            yield* Effect.sync(() => state.proc.kill())
+            yield* forceTerminateProcess(state.proc, state.config.shutdownGraceMs)
             return yield* new SandboxError({ message: `Request ${requestId} timed out` })
           })
         )
@@ -150,6 +183,14 @@ const dispatchFrame = (
     }
 
     case "BridgeCall": {
+      if (config.sandboxMode === "strict") {
+        return trySend(proc, {
+          _tag: "BridgeFailed",
+          requestId: frame.requestId,
+          message: "Bridge disabled in strict sandbox mode"
+        }).pipe(Effect.ignore)
+      }
+
       // Fork bridge call handling into FiberSet for automatic cleanup on scope close
       return FiberSet.run(bridgeFibers)(
         bridgeSemaphore.withPermits(1)(
@@ -196,10 +237,12 @@ const shutdownWorker = (
   Effect.gen(function*() {
     yield* Ref.set(health, "shuttingDown")
     yield* trySend(proc, { _tag: "Shutdown" }).pipe(Effect.ignore)
-    yield* Effect.tryPromise(() => proc.exited).pipe(
-      Effect.timeout(Duration.millis(config.shutdownGraceMs)),
-      Effect.catchAll(() => Effect.sync(() => proc.kill()))
-    )
+
+    const exitedGracefully = yield* waitForExitWithin(proc, config.shutdownGraceMs)
+    if (Option.isNone(exitedGracefully)) {
+      yield* forceTerminateProcess(proc, config.shutdownGraceMs)
+    }
+
     yield* Ref.set(health, "dead")
     yield* failAllPending(pendingRequests, "Sandbox shut down")
     yield* Queue.shutdown(incomingFrames)
@@ -213,11 +256,25 @@ const createSandboxInstance = (
   config: SandboxConfig["Type"]
 ) =>
   Effect.gen(function*() {
+    const bunExecutable = Bun.which("bun") ?? "bun"
+    const strictSandboxCwd = Bun.env.TMPDIR ?? process.env.TMPDIR ?? "/tmp"
+    const strictMode = config.sandboxMode === "strict"
     const health = yield* Ref.make<HealthState>("alive")
     const pendingRequests = yield* Ref.make(new Map<string, Deferred.Deferred<unknown, SandboxError>>())
-    const incomingFrames = yield* Queue.unbounded<WorkerToHost>()
+    const incomingFrames = yield* Queue.bounded<WorkerToHost>(config.incomingFrameQueueCapacity)
     const bridgeSemaphore = yield* Effect.makeSemaphore(config.maxBridgeConcurrency)
     const bridgeFibers = yield* FiberSet.make<void, SandboxError>()
+    const runtime = yield* Effect.runtime<never>()
+    const runFork = Runtime.runFork(runtime)
+
+    const markDead = (message: string) =>
+      Effect.gen(function*() {
+        const currentHealth = yield* Ref.get(health)
+        if (currentHealth === "dead") return
+        yield* Ref.set(health, "dead")
+        yield* failAllPending(pendingRequests, message)
+        yield* Queue.shutdown(incomingFrames)
+      })
 
     // Mutable ref for proc — callbacks need it but Bun.spawn returns proc after callbacks are registered.
     // Safe because IPC callbacks only fire after spawn completes and messages arrive (post-Init).
@@ -226,50 +283,44 @@ const createSandboxInstance = (
     // Spawn subprocess (acquireRelease in caller's scope)
     const proc = yield* Effect.acquireRelease(
       Effect.sync(() => {
-        const p = Bun.spawn(["bun", "run", config.workerPath], {
+        const p = Bun.spawn([bunExecutable, "run", config.workerPath], {
           ipc(rawMessage) {
             try {
               if (!checkFrameSize(rawMessage, config.maxFrameBytes)) {
                 console.error(`[sandbox:${options.callId}] Fatal: oversized frame from worker, killing sandbox`)
-                Effect.runSync(
-                  Effect.gen(function*() {
-                    yield* Ref.set(health, "dead")
-                    yield* failAllPending(pendingRequests, "Worker sent oversized frame")
-                    yield* Queue.shutdown(incomingFrames)
-                  })
-                )
-                procHandle?.kill()
+                runFork(markDead("Worker sent oversized frame"))
+                procHandle?.kill(9)
                 return
               }
-              Queue.unsafeOffer(incomingFrames, decodeWorkerToHost(rawMessage))
+
+              const frame = decodeWorkerToHost(rawMessage)
+              const offered = Queue.unsafeOffer(incomingFrames, frame)
+              if (!offered) {
+                console.error(`[sandbox:${options.callId}] Fatal: incoming frame queue overflow, killing sandbox`)
+                runFork(markDead("Worker overwhelmed frame queue"))
+                procHandle?.kill(9)
+              }
             } catch (err) {
               console.error(`[sandbox:${options.callId}] Fatal: malformed frame from worker, killing sandbox`, err)
-              Effect.runSync(
-                Effect.gen(function*() {
-                  yield* Ref.set(health, "dead")
-                  yield* failAllPending(pendingRequests, "Worker sent malformed frame")
-                  yield* Queue.shutdown(incomingFrames)
-                })
-              )
-              procHandle?.kill()
+              runFork(markDead("Worker sent malformed frame"))
+              procHandle?.kill(9)
             }
           },
           onDisconnect() {
-            Effect.runSync(
+            runFork(
               Effect.gen(function*() {
                 const h = yield* Ref.get(health)
                 if (h === "alive") {
-                  yield* Ref.set(health, "dead")
-                  yield* failAllPending(pendingRequests, "Worker IPC disconnected")
-                  yield* Queue.shutdown(incomingFrames)
+                  yield* markDead("Worker IPC disconnected")
                 }
               })
             )
           },
           serialization: "json",
+          ...(strictMode ? { cwd: strictSandboxCwd, env: {} } : {}),
           stdin: "ignore",
           stdout: "ignore",
-          stderr: "inherit"
+          stderr: strictMode ? "ignore" : "inherit"
         })
         procHandle = p
         return p
@@ -304,6 +355,7 @@ const createSandboxInstance = (
       _tag: "Init",
       callId: options.callId,
       depth: options.depth,
+      sandboxMode: config.sandboxMode,
       maxFrameBytes: config.maxFrameBytes
     })
 

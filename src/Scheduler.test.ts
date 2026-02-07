@@ -1,10 +1,12 @@
 import { describe, expect, test } from "bun:test"
-import { Chunk, Effect, Layer, Stream } from "effect"
+import { Chunk, Effect, Layer, Option, PubSub, Queue, Ref, Stream } from "effect"
 import { complete, stream } from "./Rlm"
 import { RlmConfig, type RlmConfigService } from "./RlmConfig"
 import { SandboxError } from "./RlmError"
 import { SandboxFactory } from "./Sandbox"
-import { RlmRuntimeLive } from "./Runtime"
+import { RlmRuntime, RlmRuntimeLive } from "./Runtime"
+import { RlmCommand, CallId } from "./RlmTypes"
+import { runScheduler } from "./Scheduler"
 import { makeFakeLanguageModelClientLayer, type FakeModelMetrics } from "./testing/FakeLanguageModelClient"
 import { makeFakeSandboxFactoryLayer, type FakeSandboxMetrics } from "./testing/FakeSandboxFactory"
 
@@ -271,6 +273,80 @@ describe("Scheduler integration", () => {
     )
 
     expect(result._tag).toBe("Left")
+  })
+
+  test("drops stale commands and emits SchedulerWarning without failing root run", async () => {
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function*() {
+          const runtime = yield* RlmRuntime
+          const subscription = yield* PubSub.subscribe(runtime.events)
+
+          // Inject stale work before scheduler starts processing queue.
+          yield* Queue.offer(runtime.commands, RlmCommand.GenerateStep({
+            callId: CallId("stale-call")
+          }))
+
+          const answer = yield* runScheduler({
+            query: "warn on stale",
+            context: "ctx"
+          })
+
+          const events = yield* subscription.takeAll
+          return { answer, events: Chunk.toReadonlyArray(events) }
+        }).pipe(
+          Effect.provide(
+            makeLayers({
+              responses: [{ text: "FINAL(\"ok\")" }]
+            })
+          )
+        )
+      )
+    )
+
+    expect(result.answer).toBe("ok")
+    const staleWarning = result.events.find((event) =>
+      event._tag === "SchedulerWarning" &&
+      event.code === "STALE_COMMAND_DROPPED" &&
+      event.commandTag === "GenerateStep"
+    )
+    expect(staleWarning).toBeDefined()
+  })
+
+  test("scheduler interruption closes remaining call scopes", async () => {
+    const hangingSandboxLayer = Layer.succeed(
+      SandboxFactory,
+      SandboxFactory.of({
+        create: () =>
+          Effect.succeed({
+            execute: () => Effect.never,
+            setVariable: () => Effect.void,
+            getVariable: () => Effect.void
+          })
+      })
+    )
+
+    const layers = Layer.mergeAll(
+      makeFakeLanguageModelClientLayer([{ text: "```js\nprint('hanging')\n```" }]),
+      hangingSandboxLayer,
+      Layer.fresh(RlmRuntimeLive)
+    )
+
+    const result = await Effect.runPromise(
+      Effect.gen(function*() {
+        const runtime = yield* RlmRuntime
+        const timeout = yield* runScheduler({
+          query: "hang forever",
+          context: "ctx"
+        }).pipe(Effect.timeoutOption("200 millis"))
+
+        const statesAfter = yield* Ref.get(runtime.callStates)
+        return { timeout, remainingStates: statesAfter.size }
+      }).pipe(Effect.provide(layers))
+    )
+
+    expect(Option.isNone(result.timeout)).toBe(true)
+    expect(result.remainingStates).toBe(0)
   })
 
   test("StartCall failure with failing sandbox factory does not hang", async () => {

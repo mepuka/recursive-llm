@@ -246,6 +246,63 @@ describe("sandbox-worker", () => {
     expect(execResult.output).toBe("caught: service unavailable")
   })
 
+  test("strict mode disables llm_query bridge calls", async () => {
+    handle = spawnWorker()
+    handle.proc.send({ _tag: "Init", callId: "test-call", depth: 0, sandboxMode: "strict" })
+    await Bun.sleep(100)
+
+    handle.proc.send({
+      _tag: "ExecRequest",
+      requestId: "strict-no-bridge",
+      code: `
+        try {
+          await llm_query("hello")
+        } catch (e) {
+          print("caught: " + e.message)
+        }
+      `
+    })
+
+    const result = await handle.waitForMessage()
+    expect(result._tag).toBe("ExecResult")
+    expect(String(result.output)).toContain("Bridge disabled in strict sandbox mode")
+
+    await Bun.sleep(50)
+    expect(handle.messages.some((msg) => msg._tag === "BridgeCall")).toBe(false)
+  })
+
+  test("strict mode blocks dynamic imports", async () => {
+    handle = spawnWorker()
+    handle.proc.send({ _tag: "Init", callId: "test-call", depth: 0, sandboxMode: "strict" })
+    await Bun.sleep(100)
+
+    handle.proc.send({
+      _tag: "ExecRequest",
+      requestId: "strict-no-import",
+      code: "await import('node:fs')"
+    })
+
+    const result = await handle.waitForMessage()
+    expect(result._tag).toBe("ExecError")
+    expect(String(result.message)).toContain("Strict sandbox blocks dynamic module loading")
+  })
+
+  test("strict mode hides ambient globals", async () => {
+    handle = spawnWorker()
+    handle.proc.send({ _tag: "Init", callId: "test-call", depth: 0, sandboxMode: "strict" })
+    await Bun.sleep(100)
+
+    handle.proc.send({
+      _tag: "ExecRequest",
+      requestId: "strict-hidden-globals",
+      code: "print(typeof Bun); print(typeof process); print(typeof fetch); print(typeof globalThis)"
+    })
+
+    const result = await handle.waitForMessage()
+    expect(result._tag).toBe("ExecResult")
+    expect(result.output).toBe("undefined\nundefined\nundefined\nundefined")
+  })
+
   test("Shutdown → clean exit", async () => {
     handle = spawnWorker()
     handle.proc.send({ _tag: "Init", callId: "test-call", depth: 0 })

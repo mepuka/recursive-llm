@@ -17,19 +17,22 @@ const makeBridgeHandlerLayer = (
     })
   )
 
-const testConfig = {
+const testConfig: SandboxConfig["Type"] = {
+  sandboxMode: "permissive",
   executeTimeoutMs: 10_000,
   setVarTimeoutMs: 5_000,
   getVarTimeoutMs: 5_000,
   shutdownGraceMs: 2_000,
   maxFrameBytes: 4 * 1024 * 1024,
   maxBridgeConcurrency: 4,
+  incomingFrameQueueCapacity: 2_048,
   workerPath: new URL("./sandbox-worker.ts", import.meta.url).pathname
 }
+const stubbornWorkerPath = new URL("./testing/sandbox-worker-stubborn.ts", import.meta.url).pathname
 
 const makeTestLayer = (
   bridgeHandler?: (options: { method: string; args: ReadonlyArray<unknown>; callerCallId: CallId }) => Effect.Effect<unknown, SandboxError>,
-  configOverrides?: Partial<typeof testConfig>
+  configOverrides?: Partial<SandboxConfig["Type"]>
 ) => {
   const sandboxLayer = Layer.provide(SandboxBunLive, makeBridgeHandlerLayer(bridgeHandler))
   if (configOverrides) {
@@ -152,6 +155,39 @@ describe("SandboxBun", () => {
     expect(bridgeCalls[0]!.args).toEqual(["hello", "ctx"])
   })
 
+  test("strict mode does not invoke BridgeHandler", async () => {
+    let bridgeCallCount = 0
+
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function*() {
+          const factory = yield* SandboxFactory
+          const sandbox = yield* factory.create({ callId: "test" as CallId, depth: 0 })
+          return yield* sandbox.execute(`
+            try {
+              await llm_query("hello")
+            } catch (e) {
+              print("caught: " + e.message)
+            }
+          `)
+        })
+      ).pipe(
+        Effect.provide(
+          makeTestLayer(
+            () => {
+              bridgeCallCount += 1
+              return Effect.succeed("unexpected-bridge-result")
+            },
+            { sandboxMode: "strict" }
+          )
+        )
+      )
+    )
+
+    expect(result).toContain("Bridge disabled in strict sandbox mode")
+    expect(bridgeCallCount).toBe(0)
+  })
+
   test("execute timeout returns SandboxError", async () => {
     const result = await Effect.runPromise(
       Effect.scoped(
@@ -240,5 +276,32 @@ describe("SandboxBun", () => {
     const elapsed = Date.now() - start
     // Should complete well before the 30s execute timeout
     expect(elapsed).toBeLessThan(5_000)
+  }, 10_000)
+
+  test("shutdown escalates to SIGKILL for non-cooperative worker", async () => {
+    const startedAt = Date.now()
+
+    await Effect.runPromise(
+      Effect.gen(function*() {
+        const scope = yield* Scope.make()
+        const factory = yield* SandboxFactory
+
+        yield* factory.create({ callId: "test" as CallId, depth: 0 }).pipe(
+          Effect.provideService(Scope.Scope, scope)
+        )
+
+        yield* Scope.close(scope, Exit.void)
+      }).pipe(
+        Effect.provide(
+          makeTestLayer(undefined, {
+            workerPath: stubbornWorkerPath,
+            shutdownGraceMs: 150
+          })
+        )
+      )
+    )
+
+    const elapsed = Date.now() - startedAt
+    expect(elapsed).toBeLessThan(3_000)
   }, 10_000)
 })

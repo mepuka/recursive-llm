@@ -176,4 +176,24 @@ describe("SandboxProtocol", () => {
       expect(() => decode({ _tag: "Init", callId: "c1", depth: 0, maxFrameBytes: 65 * 1024 * 1024 })).toThrow()
     })
   })
+
+  describe("Init with sandboxMode", () => {
+    const decode = Schema.decodeUnknownSync(HostToWorker)
+
+    test("decodes Init with strict sandboxMode", () => {
+      const msg = decode({ _tag: "Init", callId: "c1", depth: 0, sandboxMode: "strict" })
+      expect(msg._tag).toBe("Init")
+      expect((msg as typeof Init.Type).sandboxMode).toBe("strict")
+    })
+
+    test("decodes Init with permissive sandboxMode", () => {
+      const msg = decode({ _tag: "Init", callId: "c1", depth: 0, sandboxMode: "permissive" })
+      expect(msg._tag).toBe("Init")
+      expect((msg as typeof Init.Type).sandboxMode).toBe("permissive")
+    })
+
+    test("rejects Init with invalid sandboxMode", () => {
+      expect(() => decode({ _tag: "Init", callId: "c1", depth: 0, sandboxMode: "locked" })).toThrow()
+    })
+  })
 })
