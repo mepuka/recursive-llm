@@ -487,4 +487,30 @@ describe("Scheduler tool dispatch (e2e with real sandbox)", () => {
     // The sandbox should catch the error since nonexistent is not a defined function
     expect(answer).toBe("handled")
   }, 15_000)
+
+  test("context and query are injected into __vars before code execution", async () => {
+    const events = await Effect.runPromise(
+      stream({
+        query: "what is the answer",
+        context: "the answer is 42"
+      }).pipe(
+        Stream.runCollect,
+        Effect.provide(makeRealSandboxLayers({
+          responses: [
+            { text: "```js\nprint(__vars.query + '|' + __vars.context)\n```" },
+            { text: 'FINAL("done")' }
+          ]
+        })),
+        Effect.timeout("10 seconds")
+      )
+    )
+
+    const eventList = Chunk.toReadonlyArray(events)
+    const execCompleted = eventList.find(
+      (e): e is Extract<typeof e, { _tag: "CodeExecutionCompleted" }> =>
+        e._tag === "CodeExecutionCompleted"
+    )
+    expect(execCompleted).toBeDefined()
+    expect(execCompleted!.output).toBe("what is the answer|the answer is 42")
+  }, 15_000)
 })
