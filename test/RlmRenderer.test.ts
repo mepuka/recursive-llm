@@ -17,26 +17,51 @@ const capture = (event: RlmEvent, options?: RenderOptions) =>
 const completionId = "test-completion"
 const callId = CallId("test-call")
 
+const makeBudget = (iters = 8, calls = 18) =>
+  new BudgetState({
+    iterationsRemaining: iters,
+    llmCallsRemaining: calls,
+    tokenBudgetRemaining: Option.none()
+  })
+
 describe("RlmRenderer", () => {
-  test("IterationStarted renders budget info", () => {
+  // --- Iteration block ---
+
+  test("IterationStarted renders coord + divider + budget", () => {
     const out = capture(
       RlmEvent.IterationStarted({
         completionId,
         callId,
         depth: 0,
         iteration: 2,
+        budget: makeBudget()
+      }),
+      { noColor: true }
+    )
+    expect(out).toContain("[0:2]")
+    expect(out).toContain("Iteration")
+    expect(out).toContain("(8i 18c)")
+  })
+
+  test("IterationStarted with token budget", () => {
+    const out = capture(
+      RlmEvent.IterationStarted({
+        completionId,
+        callId,
+        depth: 0,
+        iteration: 1,
         budget: new BudgetState({
-          iterationsRemaining: 8,
-          llmCallsRemaining: 18,
-          tokenBudgetRemaining: Option.none()
+          iterationsRemaining: 9,
+          llmCallsRemaining: 49,
+          tokenBudgetRemaining: Option.some(1000)
         })
       }),
       { noColor: true }
     )
-    expect(out).toContain("[2] ─── Iteration ───")
-    expect(out).toContain("8i")
-    expect(out).toContain("18c")
+    expect(out).toContain("1000tok")
   })
+
+  // --- Model response ---
 
   test("ModelResponse truncates long text", () => {
     const longText = "x".repeat(300)
@@ -48,21 +73,78 @@ describe("RlmRenderer", () => {
     expect(out.length).toBeLessThan(300)
   })
 
-  test("CodeExecutionStarted renders marker", () => {
+  // --- Code execution ---
+
+  test("CodeExecutionStarted shows code content", () => {
     const out = capture(
       RlmEvent.CodeExecutionStarted({ completionId, callId, depth: 0, code: "print(1)" }),
       { noColor: true }
     )
-    expect(out).toContain("▶ Executing...")
+    expect(out).toContain("▶ Code:")
+    expect(out).toContain("print(1)")
   })
 
-  test("CodeExecutionCompleted renders output", () => {
+  test("CodeExecutionStarted shows multiline code", () => {
+    const code = "x = 1\ny = 2\nprint(x + y)"
+    const out = capture(
+      RlmEvent.CodeExecutionStarted({ completionId, callId, depth: 0, code }),
+      { noColor: true }
+    )
+    expect(out).toContain("▶ Code:")
+    expect(out).toContain("x = 1")
+    expect(out).toContain("y = 2")
+    expect(out).toContain("print(x + y)")
+  })
+
+  test("CodeExecutionStarted truncates long code", () => {
+    const lines = Array.from({ length: 20 }, (_, i) => `line_${i}`)
+    const code = lines.join("\n")
+    const out = capture(
+      RlmEvent.CodeExecutionStarted({ completionId, callId, depth: 0, code }),
+      { noColor: true, maxCodeLines: 5 }
+    )
+    expect(out).toContain("line_0")
+    expect(out).toContain("line_4")
+    expect(out).not.toContain("line_5")
+    expect(out).toContain("... (15 more lines)")
+  })
+
+  // --- Output ---
+
+  test("CodeExecutionCompleted renders single-line output inline", () => {
     const out = capture(
       RlmEvent.CodeExecutionCompleted({ completionId, callId, depth: 0, output: "42" }),
       { noColor: true }
     )
-    expect(out).toContain("◀ Output: 42")
+    expect(out).toContain("◀ 42")
   })
+
+  test("CodeExecutionCompleted renders multiline output", () => {
+    const output = "line1\nline2\nline3"
+    const out = capture(
+      RlmEvent.CodeExecutionCompleted({ completionId, callId, depth: 0, output }),
+      { noColor: true }
+    )
+    expect(out).toContain("◀ Output:")
+    expect(out).toContain("line1")
+    expect(out).toContain("line2")
+    expect(out).toContain("line3")
+  })
+
+  test("CodeExecutionCompleted truncates long output", () => {
+    const lines = Array.from({ length: 30 }, (_, i) => `out_${i}`)
+    const output = lines.join("\n")
+    const out = capture(
+      RlmEvent.CodeExecutionCompleted({ completionId, callId, depth: 0, output }),
+      { noColor: true, maxOutputLines: 5 }
+    )
+    expect(out).toContain("out_0")
+    expect(out).toContain("out_4")
+    expect(out).not.toContain("out_5")
+    expect(out).toContain("... (25 more lines)")
+  })
+
+  // --- Bridge ---
 
   test("BridgeCallReceived renders method", () => {
     const out = capture(
@@ -72,6 +154,8 @@ describe("RlmRenderer", () => {
     expect(out).toContain("↗ Bridge: llm_query")
   })
 
+  // --- Final ---
+
   test("CallFinalized renders answer", () => {
     const out = capture(
       RlmEvent.CallFinalized({ completionId, callId, depth: 0, answer: "The answer is 42" }),
@@ -79,6 +163,8 @@ describe("RlmRenderer", () => {
     )
     expect(out).toContain("✓ FINAL: The answer is 42")
   })
+
+  // --- Errors ---
 
   test("CallFailed renders error", () => {
     const out = capture(
@@ -94,6 +180,8 @@ describe("RlmRenderer", () => {
     expect(out).toContain("boom")
   })
 
+  // --- Warnings ---
+
   test("SchedulerWarning renders message with code", () => {
     const out = capture(
       RlmEvent.SchedulerWarning({
@@ -106,18 +194,22 @@ describe("RlmRenderer", () => {
     expect(out).toContain("⚠ QUEUE_CLOSED: Queue was closed")
   })
 
+  // --- Quiet mode ---
+
   test("quiet mode suppresses non-final events", () => {
+    const callStartOut = capture(
+      RlmEvent.CallStarted({ completionId, callId, depth: 0 }),
+      { quiet: true, noColor: true }
+    )
+    expect(callStartOut).toBe("")
+
     const iterOut = capture(
       RlmEvent.IterationStarted({
         completionId,
         callId,
         depth: 0,
         iteration: 1,
-        budget: new BudgetState({
-          iterationsRemaining: 9,
-          llmCallsRemaining: 19,
-          tokenBudgetRemaining: Option.none()
-        })
+        budget: makeBudget(9, 19)
       }),
       { quiet: true, noColor: true }
     )
@@ -141,13 +233,64 @@ describe("RlmRenderer", () => {
     expect(failOut).toContain("✗ FAILED:")
   })
 
-  test("depth indentation", () => {
+  // --- Tree guide / depth ---
+
+  test("depth 0 has no guide prefix", () => {
     const out = capture(
-      RlmEvent.CallFinalized({ completionId, callId, depth: 2, answer: "nested" }),
+      RlmEvent.CallFinalized({ completionId, callId, depth: 0, answer: "root" }),
       { noColor: true }
     )
-    expect(out).toContain("    ✓ FINAL:")
+    expect(out).toStartWith("✓ FINAL:")
   })
+
+  test("depth 1 has │ guide prefix", () => {
+    const out = capture(
+      RlmEvent.CallFinalized({ completionId, callId, depth: 1, answer: "nested" }),
+      { noColor: true }
+    )
+    expect(out).toContain("│ ✓ FINAL:")
+  })
+
+  test("depth 2 has │ │ guide prefix", () => {
+    const out = capture(
+      RlmEvent.CallFinalized({ completionId, callId, depth: 2, answer: "deep" }),
+      { noColor: true }
+    )
+    expect(out).toContain("│ │ ✓ FINAL:")
+  })
+
+  test("multiline blocks preserve guides on every line", () => {
+    const code = "a = 1\nb = 2"
+    const out = capture(
+      RlmEvent.CodeExecutionStarted({ completionId, callId, depth: 1, code }),
+      { noColor: true }
+    )
+    const lines = out.trimEnd().split("\n")
+    for (const line of lines) {
+      expect(line).toStartWith("│ ")
+    }
+  })
+
+  // --- CallStarted renders call boundary ---
+
+  test("CallStarted renders call boundary box", () => {
+    const out = capture(
+      RlmEvent.CallStarted({ completionId, callId, depth: 0 }),
+      { noColor: true }
+    )
+    expect(out).toContain("╭─ Call [depth=0]")
+    expect(out).toContain("╮")
+  })
+
+  test("CallStarted at depth 1 has guide prefix", () => {
+    const out = capture(
+      RlmEvent.CallStarted({ completionId, callId, depth: 1 }),
+      { noColor: true }
+    )
+    expect(out).toContain("│ ╭─ Call [depth=1]")
+  })
+
+  // --- Color ---
 
   test("noColor disables ANSI codes", () => {
     const colored = capture(
@@ -161,9 +304,9 @@ describe("RlmRenderer", () => {
     expect(plain).not.toContain("\x1b[")
   })
 
-  // --- Token usage ---
+  // --- Token usage badge ---
 
-  test("token usage with totalTokens", () => {
+  test("token usage with breakdown", () => {
     const out = capture(
       RlmEvent.ModelResponse({
         completionId,
@@ -174,7 +317,7 @@ describe("RlmRenderer", () => {
       }),
       { noColor: true }
     )
-    expect(out).toContain("(42 tok)")
+    expect(out).toContain("[in:20 out:22 = 42]")
   })
 
   test("token usage falls back to sum when totalTokens is 0", () => {
@@ -188,7 +331,7 @@ describe("RlmRenderer", () => {
       }),
       { noColor: true }
     )
-    expect(out).toContain("(15 tok)")
+    expect(out).toContain("[in:10 out:5 = 15]")
   })
 
   test("token usage omitted when all zero", () => {
@@ -202,7 +345,25 @@ describe("RlmRenderer", () => {
       }),
       { noColor: true }
     )
-    expect(out).not.toContain("tok")
+    expect(out).not.toContain("[")
+  })
+
+  test("token usage with reasoning and cached tokens", () => {
+    const out = capture(
+      RlmEvent.ModelResponse({
+        completionId,
+        callId,
+        depth: 0,
+        text: "hello",
+        usage: { inputTokens: 200, outputTokens: 100, reasoningTokens: 50, cachedInputTokens: 180, totalTokens: 350 }
+      }),
+      { noColor: true }
+    )
+    expect(out).toContain("in:200")
+    expect(out).toContain("out:100")
+    expect(out).toContain("reason:50")
+    expect(out).toContain("cached:180")
+    expect(out).toContain("= 350")
   })
 
   // --- showCode / showOutput toggles ---
@@ -223,16 +384,6 @@ describe("RlmRenderer", () => {
     expect(out).toBe("")
   })
 
-  // --- Suppressed events ---
-
-  test("CallStarted returns empty", () => {
-    const out = capture(
-      RlmEvent.CallStarted({ completionId, callId, depth: 0 }),
-      { noColor: true }
-    )
-    expect(out).toBe("")
-  })
-
   // --- Configurable truncation ---
 
   test("modelTruncateLimit truncates model text", () => {
@@ -242,18 +393,17 @@ describe("RlmRenderer", () => {
       { modelTruncateLimit: 50, noColor: true }
     )
     expect(out).toContain("...")
-    // Should be roughly 50 chars of 'a' + "..." + newline
     expect(out.length).toBeLessThan(100)
   })
 
-  test("outputTruncateLimit truncates output text", () => {
-    const longOutput = "b".repeat(600)
+  test("outputTruncateLimit applies before line split", () => {
+    // 600 chars of output, limit to 100 chars first, then split
+    const longOutput = Array.from({ length: 30 }, (_, i) => `line_${i}_${"x".repeat(15)}`).join("\n")
     const out = capture(
       RlmEvent.CodeExecutionCompleted({ completionId, callId, depth: 0, output: longOutput }),
       { outputTruncateLimit: 100, noColor: true }
     )
     expect(out).toContain("...")
-    expect(out.length).toBeLessThan(200)
   })
 
   // --- Structured errors ---
@@ -346,6 +496,44 @@ describe("RlmRenderer", () => {
     expect(out).toContain("callId=missing-id")
   })
 
+  // --- Error with tree guide ---
+
+  test("CallFailed at depth preserves tree guides", () => {
+    const out = capture(
+      RlmEvent.CallFailed({
+        completionId,
+        callId,
+        depth: 1,
+        error: new SandboxError({ message: "nested fail" })
+      }),
+      { noColor: true }
+    )
+    expect(out).toContain("│ ✗ FAILED:")
+    expect(out).toContain("nested fail")
+  })
+
+  test("CallFailed multiline cause keeps guide on continuation lines", () => {
+    const out = capture(
+      RlmEvent.CallFailed({
+        completionId,
+        callId,
+        depth: 2,
+        error: new UnknownRlmError({
+          message: "nested fail",
+          cause: new Error("root line 1\nroot line 2")
+        })
+      }),
+      { noColor: true }
+    )
+    const lines = out.trimEnd().split("\n")
+    expect(lines.length).toBeGreaterThan(1)
+    for (const line of lines) {
+      expect(line).toStartWith("│ │ ")
+    }
+    expect(out).toContain("root line 1")
+    expect(out).toContain("root line 2")
+  })
+
   // --- Warning metadata ---
 
   test("SchedulerWarning renders metadata", () => {
@@ -362,6 +550,52 @@ describe("RlmRenderer", () => {
     expect(out).toContain("STALE_COMMAND_DROPPED")
     expect(out).toContain("call=abc")
     expect(out).toContain("cmd=GenerateStep")
+  })
+
+  // --- Width / layout ---
+
+  test("iterationBlock does not exceed lineWidth", () => {
+    const out = capture(
+      RlmEvent.IterationStarted({
+        completionId,
+        callId,
+        depth: 0,
+        iteration: 1,
+        budget: makeBudget(9, 49)
+      }),
+      { noColor: true, lineWidth: 80 }
+    )
+    const lines = out.trimEnd().split("\n")
+    for (const line of lines) {
+      expect(line.length).toBeLessThanOrEqual(80)
+    }
+  })
+
+  test("narrow lineWidth degrades gracefully", () => {
+    const out = capture(
+      RlmEvent.IterationStarted({
+        completionId,
+        callId,
+        depth: 0,
+        iteration: 1,
+        budget: makeBudget(9, 49)
+      }),
+      { noColor: true, lineWidth: 30 }
+    )
+    // Should not crash and should contain coord and budget
+    expect(out).toContain("[0:1]")
+    expect(out).toContain("(9i 49c)")
+  })
+
+  test("CallStarted respects configured lineWidth", () => {
+    const out = capture(
+      RlmEvent.CallStarted({ completionId, callId, depth: 1 }),
+      { noColor: true, lineWidth: 32 }
+    )
+    const lines = out.trimEnd().split("\n")
+    for (const line of lines) {
+      expect(line.length).toBeLessThanOrEqual(32)
+    }
   })
 
   // --- Backward-compat wrapper ---
