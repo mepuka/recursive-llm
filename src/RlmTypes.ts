@@ -38,6 +38,16 @@ export class CallState extends Data.Class<{
   readonly outputJsonSchema?: object
 }> {}
 
+export type FinalAnswerPayload =
+  | {
+      readonly source: "answer"
+      readonly answer: string
+    }
+  | {
+      readonly source: "value"
+      readonly value: unknown
+    }
+
 // --- Tagged Enums ---
 
 export type RlmCommand = Data.TaggedEnum<{
@@ -59,7 +69,7 @@ export type RlmCommand = Data.TaggedEnum<{
     readonly method: string
     readonly args: ReadonlyArray<unknown>
   }
-  Finalize: { readonly callId: CallId; readonly answer: string }
+  Finalize: { readonly callId: CallId; readonly payload: FinalAnswerPayload }
   FailCall: { readonly callId: CallId; readonly error: RlmError }
 }>
 export const RlmCommand = Data.taggedEnum<RlmCommand>()

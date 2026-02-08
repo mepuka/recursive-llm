@@ -5,7 +5,7 @@ import { RlmToolError, isValidToolName, make } from "../../src/RlmTool"
 import { assertProperty } from "./helpers/property"
 
 const RESERVED_TOOL_NAMES = new Set([
-  "print", "__vars", "llm_query", "__strictScope",
+  "print", "__vars", "llm_query", "llm_query_batched", "__strictScope",
   "break", "case", "catch", "continue", "debugger", "default", "delete",
   "do", "else", "finally", "for", "function", "if", "in", "instanceof",
   "new", "return", "switch", "this", "throw", "try", "typeof", "var",

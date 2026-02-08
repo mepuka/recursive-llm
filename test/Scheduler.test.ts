@@ -20,8 +20,18 @@ const defaultConfig: RlmConfigService = {
   maxLlmCalls: 20,
   maxTotalTokens: null,
   concurrency: 4,
+  enableLlmQueryBatched: true,
+  maxBatchQueries: 32,
   eventBufferCapacity: 4096,
-  maxExecutionOutputChars: 8_000
+  maxExecutionOutputChars: 8_000,
+  primaryTarget: {
+    provider: "anthropic",
+    model: "claude-sonnet-4-5-20250929"
+  },
+  subLlmDelegation: {
+    enabled: false,
+    depthThreshold: 1
+  }
 }
 
 const makeLayers = (options: {
@@ -37,6 +47,11 @@ const makeLayers = (options: {
   const configLayer = Layer.succeed(RlmConfig, { ...defaultConfig, ...options.config })
   return Layer.provideMerge(base, configLayer)
 }
+
+const submitAnswer = (answer: string, totalTokens?: number): FakeModelResponse => ({
+  ...(totalTokens !== undefined ? { totalTokens } : {}),
+  toolCalls: [{ name: "SUBMIT", params: { answer } }]
+})
 
 describe("Scheduler integration", () => {
   test("generate-execute loop: code block → sandbox execution → output in transcript → next iteration", async () => {
@@ -59,7 +74,7 @@ describe("Scheduler integration", () => {
               // First response: code block
               { text: "Let me compute:\n```python\nresult = 2 + 2\n```" },
               // Second response after execution: final answer
-              { text: "FINAL(\"4\")" }
+              submitAnswer("4")
             ],
             sandboxMetrics,
             modelMetrics
@@ -106,7 +121,7 @@ describe("Scheduler integration", () => {
           makeLayers({
             responses: [
               { text: `\`\`\`js\n${longSnippet}\n\`\`\`` },
-              { text: "FINAL(\"ok\")" }
+              submitAnswer("ok")
             ],
             modelMetrics,
             config: { maxExecutionOutputChars: 5 }
@@ -131,7 +146,7 @@ describe("Scheduler integration", () => {
     expect(lastUserText).toContain("llm_query()")
   })
 
-  test("FINAL extraction: model returns FINAL → immediate finalization (no sandbox execution)", async () => {
+  test("SUBMIT tool call finalizes immediately (no sandbox execution)", async () => {
     const sandboxMetrics: FakeSandboxMetrics = {
       createCalls: 0,
       executeCalls: 0,
@@ -146,7 +161,7 @@ describe("Scheduler integration", () => {
         Effect.either,
         Effect.provide(
           makeLayers({
-            responses: [{ text: "FINAL(\"42\")" }],
+            responses: [submitAnswer("42")],
             sandboxMetrics
           })
         )
@@ -158,11 +173,11 @@ describe("Scheduler integration", () => {
       expect(answer.right).toBe("42")
     }
 
-    // No sandbox execution for FINAL-only response
+    // No sandbox execution for SUBMIT-only response
     expect(sandboxMetrics.executeCalls).toBe(0)
   })
 
-  test("SUBMIT tool call finalizes immediately (no sandbox execution)", async () => {
+  test("textual FINAL response does not finalize under strict migration", async () => {
     const sandboxMetrics: FakeSandboxMetrics = {
       createCalls: 0,
       executeCalls: 0,
@@ -185,26 +200,23 @@ describe("Scheduler integration", () => {
         Effect.provide(
           makeLayers({
             responses: [{
-              text: "Submitting final answer.",
-              toolCalls: [{
-                name: "SUBMIT",
-                params: { answer: "42" }
-              }]
+              text: 'FINAL("42")'
+            }, {
+              text: "still no submit"
             }],
             sandboxMetrics,
-            modelMetrics
+            modelMetrics,
+            config: { maxIterations: 1 }
           })
         )
       )
     )
 
-    expect(answer._tag).toBe("Right")
-    if (answer._tag === "Right") {
-      expect(answer.right).toBe("42")
-    }
+    expect(answer._tag).toBe("Left")
     expect(sandboxMetrics.executeCalls).toBe(0)
     expect(modelMetrics.toolChoices?.[0]).toBe("auto")
-    expect(modelMetrics.disableToolCallResolutions?.[0]).toBe(true)
+    expect(modelMetrics.toolChoices?.[1]).toEqual({ tool: "SUBMIT" })
+    expect(modelMetrics.disableToolCallResolutions).toEqual([true, true])
   })
 
   test("SUBMIT tool call takes priority over code blocks in mixed responses", async () => {
@@ -272,7 +284,7 @@ describe("Scheduler integration", () => {
       )
     )
 
-    expect(result.answer).toBe("tool-wins")
+    expect(result.answer).toEqual({ source: "answer", answer: "tool-wins" })
     const warning = result.events.find((event) =>
       event._tag === "SchedulerWarning" && event.code === "MIXED_SUBMIT_AND_CODE"
     )
@@ -298,7 +310,7 @@ describe("Scheduler integration", () => {
           makeLayers({
             responses: [
               { error: "Failed to decode tool call parameters for tool 'SUBMIT'" },
-              { text: 'FINAL("fallback-ok")' }
+              submitAnswer("fallback-ok")
             ],
             modelMetrics
           })
@@ -378,7 +390,7 @@ describe("Scheduler integration", () => {
             responses: [
               { text: "I need one more pass." },
               { error: "Failed to decode tool call parameters for tool 'SUBMIT'" },
-              { text: 'FINAL("extract-fallback")' }
+              submitAnswer("extract-fallback")
             ],
             modelMetrics,
             config: { maxIterations: 1 }
@@ -395,7 +407,7 @@ describe("Scheduler integration", () => {
     expect(modelMetrics.disableToolCallResolutions).toEqual([true, true, undefined])
   })
 
-  test("no code block and no FINAL → loops to next GenerateStep", async () => {
+  test("no code block and no SUBMIT → loops to next GenerateStep", async () => {
     const modelMetrics: FakeModelMetrics = { calls: 0, prompts: [], depths: [] }
     const sandboxMetrics: FakeSandboxMetrics = {
       createCalls: 0,
@@ -414,7 +426,7 @@ describe("Scheduler integration", () => {
             responses: [
               { text: "Let me think about this..." },
               { text: "Still thinking..." },
-              { text: "FINAL(\"thought complete\")" }
+              submitAnswer("thought complete")
             ],
             modelMetrics,
             sandboxMetrics
@@ -444,7 +456,7 @@ describe("Scheduler integration", () => {
           makeLayers({
             responses: [
               { text: "```js\nprint(42)\n```" },
-              { text: "FINAL(\"42\")" }
+              submitAnswer("42")
             ]
           })
         )
@@ -483,7 +495,7 @@ describe("Scheduler integration", () => {
             responses: [
               { text: "```js\nstep1()\n```" },
               { text: "```js\nstep2()\n```" },
-              { text: "FINAL(\"done\")" }
+              submitAnswer("done")
             ],
             sandboxMetrics
           })
@@ -515,7 +527,7 @@ describe("Scheduler integration", () => {
         Effect.either,
         Effect.provide(
           makeLayers({
-            responses: [{ text: "FINAL(\"4\")", totalTokens: 12 }],
+            responses: [submitAnswer("4", 12)],
             modelMetrics,
             sandboxMetrics
           })
@@ -543,7 +555,7 @@ describe("Scheduler integration", () => {
             responses: [
               { text: "```js\nstep1()\n```" },
               { text: "```js\nstep2()\n```" },
-              { text: 'FINAL("extracted")' }  // extract fallback response
+              submitAnswer("extracted")
             ],
             config: { maxIterations: 2 }
           })
@@ -557,7 +569,7 @@ describe("Scheduler integration", () => {
     }
   })
 
-  test("extract fallback uses raw text when no FINAL in response", async () => {
+  test("extract fallback fails when no SUBMIT is returned", async () => {
     const result = await Effect.runPromise(
       complete({
         query: "compute",
@@ -569,7 +581,7 @@ describe("Scheduler integration", () => {
             responses: [
               { text: "```js\nstep1()\n```" },
               { text: "```js\nstep2()\n```" },
-              { text: "The answer is 42" }  // extract response without FINAL
+              { text: "The answer is 42" }
             ],
             config: { maxIterations: 2 }
           })
@@ -577,9 +589,9 @@ describe("Scheduler integration", () => {
       )
     )
 
-    expect(result._tag).toBe("Right")
-    if (result._tag === "Right") {
-      expect(result.right).toBe("The answer is 42")
+    expect(result._tag).toBe("Left")
+    if (result._tag === "Left") {
+      expect(result.left._tag).toBe("NoFinalAnswerError")
     }
   })
 
@@ -594,7 +606,7 @@ describe("Scheduler integration", () => {
           makeLayers({
             responses: [
               { text: "```js\nstep1()\n```" },
-              { text: 'FINAL("unreachable")' }
+              submitAnswer("unreachable")
             ],
             config: { maxIterations: 1, maxLlmCalls: 1 }
           })
@@ -627,14 +639,14 @@ describe("Scheduler integration", () => {
         }).pipe(
           Effect.provide(
             makeLayers({
-              responses: [{ text: "FINAL(\"ok\")" }]
+              responses: [submitAnswer("ok")]
             })
           )
         )
       )
     )
 
-    expect(result.answer).toBe("ok")
+    expect(result.answer).toEqual({ source: "answer", answer: "ok" })
     const staleWarning = result.events.find((event) =>
       event._tag === "SchedulerWarning" &&
       event.code === "STALE_COMMAND_DROPPED" &&
@@ -721,7 +733,7 @@ describe("Scheduler integration", () => {
     const model = makeFakeRlmModelLayer([
       { text: "```js\nlet y = x + 1\n```" },
       { text: "```js\nlet y = 1 + 1\n```" },
-      { text: 'FINAL("recovered")' }
+      submitAnswer("recovered")
     ], modelMetrics)
 
     const layers = Layer.mergeAll(model, failOnceSandboxLayer, Layer.fresh(RlmRuntimeLive))
@@ -748,7 +760,7 @@ describe("Scheduler integration", () => {
     const model = makeFakeRlmModelLayer([
       { text: "```js\nfail()\n```" },
       { text: "```js\nfail()\n```" },
-      { text: 'FINAL("extracted")' }
+      submitAnswer("extracted")
     ])
 
     const layers = Layer.provide(
@@ -783,7 +795,7 @@ describe("Scheduler integration", () => {
     const model = makeFakeRlmModelLayer([
       { text: "```js\nlet y = x + 1\n```" },
       { text: "```js\nlet y = 1 + 1\n```" },
-      { text: 'FINAL("ok")' }
+      submitAnswer("ok")
     ], modelMetrics)
 
     const layers = Layer.mergeAll(model, failOnceSandboxLayer, Layer.fresh(RlmRuntimeLive))
@@ -816,7 +828,7 @@ describe("Scheduler integration", () => {
     const model = makeFakeRlmModelLayer([
       { text: "```js\nbad()\n```" },
       { text: "```js\ngood()\n```" },
-      { text: 'FINAL("ok")' }
+      submitAnswer("ok")
     ])
 
     const layers = Layer.mergeAll(model, failOnceSandboxLayer, Layer.fresh(RlmRuntimeLive))
@@ -832,7 +844,7 @@ describe("Scheduler integration", () => {
 
     // First iteration: code → error surfaced as CodeExecuted
     // Second iteration: code → success
-    // Third iteration: FINAL
+    // Third iteration: SUBMIT
     expect(eventTags).toEqual([
       "CallStarted",
       "IterationStarted",
@@ -868,7 +880,7 @@ describe("Scheduler integration", () => {
     const model = makeFakeRlmModelLayer([
       { text: "```js\nlet y = x + 1\n```" },
       { text: "```js\nlet y = 1 + 1\n```" },
-      { text: 'FINAL("ok")' }
+      submitAnswer("ok")
     ], modelMetrics)
 
     const layers = Layer.mergeAll(model, primitiveFailOnceSandboxLayer, Layer.fresh(RlmRuntimeLive))
@@ -908,7 +920,7 @@ describe("Scheduler integration", () => {
     )
 
     const model = makeFakeRlmModelLayer(
-      [{ text: "FINAL(\"unreachable\")" }]
+      [submitAnswer("unreachable")]
     )
 
     const runtimeLayer = Layer.fresh(RlmRuntimeLive)
@@ -973,7 +985,7 @@ describe("Scheduler tool dispatch (e2e with real sandbox)", () => {
         Effect.provide(makeRealSandboxLayers({
           responses: [
             { text: "```js\nconst result = await add(2, 3)\nprint(result)\n```" },
-            { text: 'FINAL("5")' }
+            submitAnswer("5")
           ]
         })),
         Effect.timeout("10 seconds")
@@ -1017,7 +1029,7 @@ describe("Scheduler tool dispatch (e2e with real sandbox)", () => {
         Effect.provide(makeRealSandboxLayers({
           responses: [
             { text: "```js\nconst result = await flaky_add(2, 3)\nprint(result)\n```" },
-            { text: 'FINAL("5")' }
+            submitAnswer("5")
           ],
           modelMetrics
         })),
@@ -1048,7 +1060,7 @@ describe("Scheduler tool dispatch (e2e with real sandbox)", () => {
         Effect.provide(makeRealSandboxLayers({
           responses: [
             { text: "```js\ntry {\n  await nonexistent('arg')\n} catch (e) {\n  print('caught: ' + e.message)\n}\n```" },
-            { text: 'FINAL("handled")' }
+            submitAnswer("handled")
           ]
         })),
         Effect.timeout("10 seconds")
@@ -1063,7 +1075,8 @@ describe("Scheduler tool dispatch (e2e with real sandbox)", () => {
     const modelMetrics: FakeModelMetrics = {
       calls: 0,
       prompts: [],
-      depths: []
+      depths: [],
+      isSubCalls: []
     }
 
     const answer = await Effect.runPromise(
@@ -1076,8 +1089,8 @@ describe("Scheduler tool dispatch (e2e with real sandbox)", () => {
             { text: "```js\nconst result = await llm_query('sub-query', 'sub-context')\nprint(result)\n```" },
             { error: "transient sub-call model error" },
             { text: "sub-answer" },
-            { text: 'FINAL("sub-answer")' },
-            { text: 'FINAL("done")' }
+            submitAnswer("sub-answer"),
+            submitAnswer("done")
           ],
           modelMetrics,
           config: {
@@ -1091,6 +1104,8 @@ describe("Scheduler tool dispatch (e2e with real sandbox)", () => {
     expect(answer).toBe("sub-answer")
     expect(modelMetrics.depths[0]).toBe(0)
     expect(modelMetrics.depths.some((depth) => depth === 1)).toBe(true)
+    expect(modelMetrics.isSubCalls?.[0]).toBe(false)
+    expect(modelMetrics.isSubCalls?.some((value) => value === true)).toBe(true)
 
     const finalPrompt = modelMetrics.prompts[modelMetrics.prompts.length - 1]!
     const userMessages = finalPrompt.content.filter((m) => m.role === "user")
@@ -1100,6 +1115,76 @@ describe("Scheduler tool dispatch (e2e with real sandbox)", () => {
       : ""
     expect(lastUserText).toContain("[Execution Output]")
     expect(lastUserText).toContain("sub-answer")
+  }, 15_000)
+
+  test("llm_query_batched preserves result order and routes as sub-calls", async () => {
+    const modelMetrics: FakeModelMetrics = {
+      calls: 0,
+      prompts: [],
+      depths: [],
+      isSubCalls: []
+    }
+
+    const answer = await Effect.runPromise(
+      complete({
+        query: "batch ordering",
+        context: "ctx"
+      }).pipe(
+        Effect.provide(makeRealSandboxLayers({
+          responses: [
+            { text: "```js\nconst results = await llm_query_batched(['q1', 'q2'], ['c1', 'c2'])\nprint(JSON.stringify(results))\n```" },
+            { text: "first-result" },
+            { text: "second-result" },
+            submitAnswer("done")
+          ],
+          modelMetrics
+        })),
+        Effect.timeout("10 seconds")
+      )
+    )
+
+    expect(answer).toBe("done")
+    expect(modelMetrics.isSubCalls?.filter((value) => value === true).length).toBe(2)
+
+    const finalPrompt = modelMetrics.prompts[modelMetrics.prompts.length - 1]!
+    const userMessages = finalPrompt.content.filter((m) => m.role === "user")
+    const lastUserMsg = userMessages[userMessages.length - 1]!
+    const lastUserText = lastUserMsg.role === "user"
+      ? (lastUserMsg.content as ReadonlyArray<{ readonly text: string }>)[0]!.text
+      : ""
+    expect(lastUserText).toContain("[\"first-result\",\"second-result\"]")
+  }, 15_000)
+
+  test("llm_query_batched fails fast on budget exhaustion", async () => {
+    const events = await Effect.runPromise(
+      stream({
+        query: "batch budget failure",
+        context: "ctx"
+      }).pipe(
+        Stream.runCollect,
+        Effect.provide(makeRealSandboxLayers({
+          responses: [
+            { text: "```js\nconst results = await llm_query_batched(['q1', 'q2'], ['c1', 'c2'])\nprint(results)\n```" },
+            { text: "first-result" }
+          ],
+          config: {
+            maxLlmCalls: 2
+          }
+        })),
+        Effect.timeout("10 seconds")
+      )
+    )
+
+    const eventList = Chunk.toReadonlyArray(events)
+    const execCompleted = eventList.find(
+      (event): event is Extract<typeof event, { _tag: "CodeExecutionCompleted" }> =>
+        event._tag === "CodeExecutionCompleted"
+    )
+    expect(execCompleted).toBeDefined()
+    expect(execCompleted!.output).toContain("llm_query_batched item 1 failed")
+
+    const callFailed = eventList.find((event) => event._tag === "CallFailed")
+    expect(callFailed).toBeDefined()
   }, 15_000)
 
   test("context and query are injected into __vars before code execution", async () => {
@@ -1112,7 +1197,7 @@ describe("Scheduler tool dispatch (e2e with real sandbox)", () => {
         Effect.provide(makeRealSandboxLayers({
           responses: [
             { text: "```js\nprint(__vars.query + '|' + __vars.context)\n```" },
-            { text: 'FINAL("done")' }
+            submitAnswer("done")
           ]
         })),
         Effect.timeout("10 seconds")

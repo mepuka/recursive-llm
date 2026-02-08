@@ -1,11 +1,13 @@
-import { BunRuntime } from "@effect/platform-bun"
-import { FetchHttpClient } from "@effect/platform"
 import { AnthropicClient } from "@effect/ai-anthropic"
+import { GoogleClient } from "@effect/ai-google"
 import { OpenAiClient } from "@effect/ai-openai"
+import { FetchHttpClient } from "@effect/platform"
+import { BunRuntime } from "@effect/platform-bun"
 import { Effect, Layer, Match, Redacted, Stream } from "effect"
-import { makeAnthropicRlmModel, makeOpenAiRlmModel } from "./RlmModel"
 import { Rlm, rlmBunLayer } from "./Rlm"
-import { RlmConfig } from "./RlmConfig"
+import { RlmConfig, type RlmProvider } from "./RlmConfig"
+import type { RlmModel } from "./RlmModel"
+import { makeAnthropicRlmModel, makeGoogleRlmModel, makeOpenAiRlmModel } from "./RlmModel"
 import { formatEvent, type RenderOptions } from "./RlmRenderer"
 
 // --- Arg parsing ---
@@ -14,9 +16,11 @@ interface CliArgs {
   query: string
   context: string
   contextFile?: string
-  provider: "anthropic" | "openai"
+  provider: RlmProvider
   model: string
   subModel?: string
+  subDelegationEnabled?: boolean
+  subDelegationDepthThreshold?: number
   maxIterations?: number
   maxDepth?: number
   maxLlmCalls?: number
@@ -24,24 +28,40 @@ interface CliArgs {
   noColor: boolean
 }
 
+const PROVIDERS = ["anthropic", "openai", "google"] as const
+
+const isRlmProvider = (value: string): value is RlmProvider =>
+  PROVIDERS.includes(value as any)
+
+const providerApiKeyEnv = (provider: RlmProvider): "ANTHROPIC_API_KEY" | "OPENAI_API_KEY" | "GOOGLE_API_KEY" =>
+  provider === "anthropic"
+    ? "ANTHROPIC_API_KEY"
+    : provider === "openai"
+    ? "OPENAI_API_KEY"
+    : "GOOGLE_API_KEY"
+
 const printUsage = () => {
   console.error(`Usage: bun run src/cli.ts <query> [options]
 
 Options:
-  --context <text>          Context string
-  --context-file <path>     Read context from file
-  --provider <name>         Provider: anthropic (default), openai
-  --model <name>            Model name (default: claude-sonnet-4-5-20250929)
-  --sub-model <name>        Sub-model for recursive calls
-  --max-iterations <n>      Max iterations (default: 50)
-  --max-depth <n>           Max recursion depth (default: 1)
-  --max-llm-calls <n>       Max total LLM calls (default: 200)
-  --quiet                   Only show final answer and errors
-  --no-color                Disable ANSI colors
+  --context <text>                          Context string
+  --context-file <path>                     Read context from file
+  --provider <name>                         Provider: anthropic (default), openai, google
+  --model <name>                            Model name (default: claude-sonnet-4-5-20250929)
+  --sub-model <name>                        Lower-tier model for delegated sub-LLM calls
+  --sub-delegation-enabled                  Enable sub-LLM delegation (default: enabled when --sub-model is set)
+  --disable-sub-delegation                  Disable sub-LLM delegation
+  --sub-delegation-depth-threshold <n>      Minimum depth required to delegate to sub-model (default: 1)
+  --max-iterations <n>                      Max iterations (default: 50)
+  --max-depth <n>                           Max recursion depth (default: 1)
+  --max-llm-calls <n>                       Max total LLM calls (default: 200)
+  --quiet                                   Only show final answer and errors
+  --no-color                                Disable ANSI colors
 
 Environment:
-  ANTHROPIC_API_KEY         Required for anthropic provider
-  OPENAI_API_KEY            Required for openai provider`)
+  ANTHROPIC_API_KEY                         Required for anthropic provider
+  OPENAI_API_KEY                            Required for openai provider
+  GOOGLE_API_KEY                            Required for google provider`)
 }
 
 const parseArgs = (): CliArgs | null => {
@@ -78,9 +98,15 @@ const parseArgs = (): CliArgs | null => {
         if (val !== undefined) result.contextFile = val
         break
       }
-      case "--provider":
-        result.provider = (args[++i] ?? "anthropic") as "anthropic" | "openai"
+      case "--provider": {
+        const value = args[++i] ?? "anthropic"
+        if (!isRlmProvider(value)) {
+          console.error(`Invalid provider: ${value}. Use one of: ${PROVIDERS.join(", ")}`)
+          return null
+        }
+        result.provider = value
         break
+      }
       case "--model":
         result.model = args[++i] ?? result.model
         break
@@ -89,6 +115,15 @@ const parseArgs = (): CliArgs | null => {
         if (val !== undefined) result.subModel = val
         break
       }
+      case "--sub-delegation-enabled":
+        result.subDelegationEnabled = true
+        break
+      case "--disable-sub-delegation":
+        result.subDelegationEnabled = false
+        break
+      case "--sub-delegation-depth-threshold":
+        result.subDelegationDepthThreshold = parseInt(args[++i] ?? "1", 10)
+        break
       case "--max-iterations":
         result.maxIterations = parseInt(args[++i] ?? "50", 10)
         break
@@ -118,6 +153,25 @@ const parseArgs = (): CliArgs | null => {
   if (!result.query) {
     console.error("Error: query is required")
     printUsage()
+    return null
+  }
+
+  if (
+    result.subDelegationDepthThreshold !== undefined &&
+    (!Number.isInteger(result.subDelegationDepthThreshold) || result.subDelegationDepthThreshold < 1)
+  ) {
+    console.error("Error: --sub-delegation-depth-threshold must be an integer >= 1")
+    return null
+  }
+
+  if (result.subDelegationEnabled === true && result.subModel === undefined) {
+    console.error("Error: --sub-delegation-enabled requires --sub-model")
+    return null
+  }
+
+  const apiKeyEnv = providerApiKeyEnv(result.provider)
+  if (!Bun.env[apiKeyEnv]) {
+    console.error(`Error: missing ${apiKeyEnv} for provider ${result.provider}`)
     return null
   }
 
@@ -166,50 +220,83 @@ const main = (cliArgs: CliArgs) =>
 
 // --- Layer construction ---
 
-import type { RlmModel } from "./RlmModel"
-
 const buildRlmModelLayer = (cliArgs: CliArgs): Layer.Layer<RlmModel, never, never> => {
   const httpLayer = FetchHttpClient.layer
+  const subLlmDelegation = {
+    enabled: cliArgs.subDelegationEnabled ?? cliArgs.subModel !== undefined,
+    depthThreshold: cliArgs.subDelegationDepthThreshold ?? 1
+  }
 
   if (cliArgs.provider === "openai") {
     const clientLayer = OpenAiClient.layer({
-      ...(Bun.env.OPENAI_API_KEY
-        ? { apiKey: Redacted.make(Bun.env.OPENAI_API_KEY) }
-        : {})
+      apiKey: Redacted.make(Bun.env.OPENAI_API_KEY!)
     })
 
     const modelLayer = makeOpenAiRlmModel({
       primaryModel: cliArgs.model,
-      ...(cliArgs.subModel !== undefined ? { subModel: cliArgs.subModel } : {})
+      ...(cliArgs.subModel !== undefined ? { subModel: cliArgs.subModel } : {}),
+      subLlmDelegation
     })
 
     return Layer.provide(modelLayer, Layer.provide(clientLayer, httpLayer))
   }
 
-  // Default: Anthropic
+  if (cliArgs.provider === "google") {
+    const clientLayer = GoogleClient.layer({
+      apiKey: Redacted.make(Bun.env.GOOGLE_API_KEY!)
+    })
+
+    const modelLayer = makeGoogleRlmModel({
+      primaryModel: cliArgs.model,
+      ...(cliArgs.subModel !== undefined ? { subModel: cliArgs.subModel } : {}),
+      subLlmDelegation
+    })
+
+    return Layer.provide(modelLayer, Layer.provide(clientLayer, httpLayer))
+  }
+
   const clientLayer = AnthropicClient.layer({
-    ...(Bun.env.ANTHROPIC_API_KEY
-      ? { apiKey: Redacted.make(Bun.env.ANTHROPIC_API_KEY) }
-      : {})
+    apiKey: Redacted.make(Bun.env.ANTHROPIC_API_KEY!)
   })
 
   const modelLayer = makeAnthropicRlmModel({
     primaryModel: cliArgs.model,
-    ...(cliArgs.subModel !== undefined ? { subModel: cliArgs.subModel } : {})
+    ...(cliArgs.subModel !== undefined ? { subModel: cliArgs.subModel } : {}),
+    subLlmDelegation
   })
 
   return Layer.provide(modelLayer, Layer.provide(clientLayer, httpLayer))
 }
 
 const buildLayer = (cliArgs: CliArgs): Layer.Layer<Rlm, never, never> => {
+  const subLlmDelegation = {
+    enabled: cliArgs.subDelegationEnabled ?? cliArgs.subModel !== undefined,
+    depthThreshold: cliArgs.subDelegationDepthThreshold ?? 1
+  }
+
   const configLayer = Layer.succeed(RlmConfig, {
     maxIterations: cliArgs.maxIterations ?? 50,
     maxDepth: cliArgs.maxDepth ?? 1,
     maxLlmCalls: cliArgs.maxLlmCalls ?? 200,
     maxTotalTokens: null,
     concurrency: 4,
+    enableLlmQueryBatched: true,
+    maxBatchQueries: 32,
     eventBufferCapacity: 4096,
-    maxExecutionOutputChars: 8_000
+    maxExecutionOutputChars: 8_000,
+    primaryTarget: {
+      provider: cliArgs.provider,
+      model: cliArgs.model
+    },
+    ...(cliArgs.subModel !== undefined
+      ? {
+          subTarget: {
+            provider: cliArgs.provider,
+            model: cliArgs.subModel
+          }
+        }
+      : {}),
+    subLlmDelegation
   })
 
   const modelLayer = buildRlmModelLayer(cliArgs)

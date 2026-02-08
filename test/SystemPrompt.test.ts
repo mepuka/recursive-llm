@@ -10,9 +10,9 @@ describe("SystemPrompt", () => {
     budget: { iterationsRemaining: 9, llmCallsRemaining: 19 }
   }
 
-  test("REPL prompt contains FINAL instruction", () => {
+  test("REPL prompt does not contain FINAL(...) instructions", () => {
     const prompt = buildReplSystemPrompt(baseOptions)
-    expect(prompt).toContain("FINAL")
+    expect(prompt).not.toContain("FINAL(")
   })
 
   test("REPL prompt contains SUBMIT instruction", () => {
@@ -20,16 +20,22 @@ describe("SystemPrompt", () => {
     expect(prompt).toContain("SUBMIT")
   })
 
-  test("REPL prompt includes SUBMIT parameter schema guidance", () => {
+  test("REPL prompt includes SUBMIT invocation schema guidance", () => {
     const prompt = buildReplSystemPrompt(baseOptions)
-    expect(prompt).toContain("SUBMIT parameters schema")
-    expect(prompt).toContain("Plain-text final answer")
-    expect(prompt).toContain("Structured final value")
+    expect(prompt).toContain("SUBMIT invocation schema for this run")
+    expect(prompt).toContain("\"required\":[\"answer\"]")
+    expect(prompt).toContain("\"additionalProperties\":false")
   })
 
   test("REPL prompt contains llm_query when depth < maxDepth", () => {
     const prompt = buildReplSystemPrompt({ ...baseOptions, depth: 0, maxDepth: 1 })
     expect(prompt).toContain("llm_query")
+  })
+
+  test("REPL prompt contains llm_query_batched guidance when depth < maxDepth", () => {
+    const prompt = buildReplSystemPrompt({ ...baseOptions, depth: 0, maxDepth: 1 })
+    expect(prompt).toContain("llm_query_batched")
+    expect(prompt).toContain("Promise.all")
   })
 
   test("REPL prompt contains Strategy section", () => {
@@ -93,7 +99,7 @@ describe("SystemPrompt", () => {
     expect(prompt).not.toContain("```")
     expect(prompt).toContain("Do not use code blocks")
     expect(prompt).toContain("SUBMIT()")
-    expect(prompt).toContain("FINAL()")
+    expect(prompt).not.toContain("FINAL()")
   })
 
   test("REPL prompt includes tool documentation when tools provided", () => {
@@ -258,13 +264,12 @@ describe("SystemPrompt", () => {
 })
 
 describe("buildExtractSystemPrompt", () => {
-  test("returns FINAL instruction", () => {
+  test("returns SUBMIT-only extraction instruction", () => {
     const prompt = buildExtractSystemPrompt()
     expect(prompt).toContain("SUBMIT")
-    expect(prompt).toContain("FINAL")
     expect(prompt).toContain("ran out of iterations")
-    expect(prompt).toContain('FINAL("your answer")')
-    expect(prompt).toContain("Do not output both SUBMIT and FINAL")
+    expect(prompt).toContain('SUBMIT({ answer: "your answer" })')
+    expect(prompt).not.toContain('FINAL("your answer")')
   })
 
   test("includes JSON schema when provided", () => {
@@ -272,10 +277,10 @@ describe("buildExtractSystemPrompt", () => {
     const prompt = buildExtractSystemPrompt(schema)
     expect(prompt).toContain("valid JSON matching this schema")
     expect(prompt).toContain('"result"')
-    expect(prompt).toContain("FINAL(`{...}`)")
-    expect(prompt).toContain("not escaped")
-    expect(prompt).toContain("Fallback only if tool calling is unavailable")
-    expect(prompt).not.toContain('FINAL("your answer")')
+    expect(prompt).toContain("SUBMIT({ value: ... })")
+    expect(prompt).toContain("\"required\":[\"value\"]")
+    expect(prompt).not.toContain("Fallback only if tool calling is unavailable")
+    expect(prompt).not.toContain("FINAL(`{...}`)")
   })
 
   test("omits schema section when not provided", () => {

@@ -9,12 +9,13 @@ import {
   readTranscript,
   type CallContext
 } from "./CallContext"
-import { extractCodeBlock, extractFinal } from "./CodeExtractor"
+import { extractCodeBlock } from "./CodeExtractor"
 import { RlmConfig } from "./RlmConfig"
 import { RlmModel } from "./RlmModel"
 import {
   BudgetExhaustedError,
   NoFinalAnswerError,
+  OutputValidationError,
   SandboxError,
   UnknownRlmError,
   type RlmError
@@ -27,10 +28,10 @@ import {
   CONTEXT_PREVIEW_CHARS
 } from "./RlmPrompt"
 import { buildReplSystemPrompt, buildOneShotSystemPrompt, buildExtractSystemPrompt } from "./SystemPrompt"
-import { extractSubmitAnswer, SUBMIT_TOOL_NAME, submitToolkit } from "./SubmitTool"
+import { extractSubmitAnswer, renderSubmitAnswer, SUBMIT_TOOL_NAME, submitToolkit } from "./SubmitTool"
 import { SandboxConfig, SandboxFactory } from "./Sandbox"
 import { RlmRuntime } from "./Runtime"
-import { BridgeRequestId, CallId, RlmCommand, RlmEvent } from "./RlmTypes"
+import { BridgeRequestId, CallId, type FinalAnswerPayload, RlmCommand, RlmEvent } from "./RlmTypes"
 import { makeCallVariableSpace } from "./VariableSpace"
 
 import type { RlmToolAny } from "./RlmTool"
@@ -199,7 +200,7 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
     Schedule.compose(Schedule.recurs(bridgeLlmQueryRetryCount))
   )
 
-  const resultDeferred = yield* Deferred.make<string, RlmError>()
+  const resultDeferred = yield* Deferred.make<FinalAnswerPayload, RlmError>()
 
   // --- handleStartCall ---
 
@@ -345,10 +346,12 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
         contextPreview: callState.context.slice(0, CONTEXT_PREVIEW_CHARS),
         transcript
       })
+      const isSubCall = callState.parentBridgeRequestId !== undefined
       const response = yield* withLlmPermit(
         rlmModel.generateText({
           prompt,
           depth: callState.depth,
+          isSubCall,
           toolkit: submitToolkit,
           toolChoice: "auto",
           disableToolCallResolution: true
@@ -370,6 +373,7 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
               rlmModel.generateText({
                 prompt,
                 depth: callState.depth,
+                isSubCall,
                 toolChoice: "none"
               })
             )
@@ -406,9 +410,11 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
       yield* publishEvent(modelEvent)
 
       // Structured SUBMIT tool-call is the primary finalization path.
-      const submitAnswer = extractSubmitAnswer(response)
+      const submitAnswer = extractSubmitAnswer(response, {
+        outputMode: callState.outputJsonSchema !== undefined ? "structured" : "plain"
+      })
       const code = extractCodeBlock(response.text)
-      if (submitAnswer !== undefined) {
+      if (submitAnswer._tag === "Found") {
         if (code !== null) {
           yield* publishSchedulerWarning({
             code: "MIXED_SUBMIT_AND_CODE",
@@ -419,12 +425,23 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
         }
         yield* enqueueOrWarn(RlmCommand.Finalize({
           callId: callState.callId,
-          answer: submitAnswer.answer
+          payload: submitAnswer.value
         }))
         return
       }
 
-      // No SUBMIT — code block takes priority over legacy FINAL().
+      if (submitAnswer._tag === "Invalid") {
+        yield* enqueueOrWarn(RlmCommand.FailCall({
+          callId: command.callId,
+          error: new OutputValidationError({
+            message: submitAnswer.message,
+            raw: response.text
+          })
+        }))
+        return
+      }
+
+      // No SUBMIT — continue REPL via code or additional reasoning turns.
       if (code !== null) {
         yield* appendTranscript(callState, response.text)
         yield* incrementIteration(callState)
@@ -432,17 +449,7 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
         return
       }
 
-      // No code block — check for legacy FINAL answer
-      const finalAnswer = extractFinal(response.text)
-      if (finalAnswer !== null) {
-        yield* enqueueOrWarn(RlmCommand.Finalize({
-          callId: callState.callId,
-          answer: finalAnswer
-        }))
-        return
-      }
-
-      // Neither SUBMIT, code block, nor FINAL — add to transcript and loop
+      // Neither SUBMIT nor code block — add to transcript and loop.
       yield* appendTranscript(callState, response.text)
       yield* incrementIteration(callState)
       yield* enqueueOrWarn(RlmCommand.GenerateStep({ callId: callState.callId }))
@@ -491,6 +498,7 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
             rlmModel.generateText({
               prompt: extractPrompt,
               depth: callState.depth,
+              isSubCall: callState.parentBridgeRequestId !== undefined,
               toolkit: submitToolkit,
               toolChoice: { tool: SUBMIT_TOOL_NAME },
               disableToolCallResolution: true
@@ -512,6 +520,7 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
                   rlmModel.generateText({
                     prompt: extractPrompt,
                     depth: callState.depth,
+                    isSubCall: callState.parentBridgeRequestId !== undefined,
                     toolChoice: "none"
                   })
                 )
@@ -533,36 +542,32 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
             }
           }))
 
-          const submitAnswer = extractSubmitAnswer(response)
-          if (submitAnswer !== undefined) {
+          const submitAnswer = extractSubmitAnswer(response, {
+            outputMode: callState.outputJsonSchema !== undefined ? "structured" : "plain"
+          })
+          if (submitAnswer._tag === "Found") {
             yield* enqueueOrWarn(RlmCommand.Finalize({
               callId: callState.callId,
-              answer: submitAnswer.answer
+              payload: submitAnswer.value
             }))
             return
           }
 
-          // Try extracting FINAL from response
-          const finalAnswer = extractFinal(response.text)
-          if (finalAnswer !== null) {
-            yield* enqueueOrWarn(RlmCommand.Finalize({ callId: callState.callId, answer: finalAnswer }))
-          } else {
-            // Extract didn't produce FINAL() — strip code blocks and use
-            // the best available content as the answer
-            const stripped = response.text.replace(/```[\s\S]*?```/g, "").trim()
-            const lastOutput = transcript.length > 0
-              ? transcript[transcript.length - 1]!.executionOutput?.trim()
-              : undefined
-            // Prefer last execution output when it has real data and stripped
-            // text is just short commentary (the model continued generating
-            // code instead of answering)
-            const preferOutput = lastOutput && lastOutput.length > 0
-              && (stripped.length === 0 || (lastOutput.length > stripped.length * 2))
-            const answer = preferOutput
-              ? lastOutput!
-              : (stripped.length > 0 ? stripped : response.text)
-            yield* enqueueOrWarn(RlmCommand.Finalize({ callId: callState.callId, answer }))
+          if (submitAnswer._tag === "Invalid") {
+            yield* enqueueOrWarn(RlmCommand.FailCall({
+              callId: command.callId,
+              error: new OutputValidationError({
+                message: submitAnswer.message,
+                raw: response.text
+              })
+            }))
+            return
           }
+
+          yield* enqueueOrWarn(RlmCommand.FailCall({
+            callId: command.callId,
+            error: new NoFinalAnswerError({ callId: command.callId, maxIterations: config.maxIterations })
+          }))
         }).pipe(
           // If the extract call itself fails, fall back to NoFinalAnswerError
           Effect.catchAll(() =>
@@ -651,6 +656,28 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
 
   const handleHandleBridgeCall = (command: Extract<RlmCommand, { readonly _tag: "HandleBridgeCall" }>) =>
     Effect.gen(function*() {
+      const runOneShotSubCall = (query: string, context: string, depth: number) =>
+        Effect.gen(function*() {
+          const oneShotPrompt = buildOneShotPrompt({
+            systemPrompt: buildOneShotSystemPrompt(),
+            query,
+            context
+          })
+
+          yield* reserveLlmCall(command.callId)
+          const response = yield* withLlmPermit(
+            rlmModel.generateText({
+              prompt: oneShotPrompt,
+              depth,
+              isSubCall: true
+            })
+          )
+          yield* recordTokens(command.callId, response.usage.totalTokens)
+          return response.text
+        }).pipe(
+          Effect.retry(bridgeLlmQueryRetryPolicy)
+        )
+
       // Guard: call state may be deleted if call already finalized
       const states = yield* Ref.get(runtime.callStates)
       const callState = states.get(command.callId)
@@ -672,7 +699,92 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
         method: command.method
       }))
 
-      // Tool dispatch: non-llm_query methods route to user-defined tools
+      if (command.method === "llm_query_batched") {
+        if (!config.enableLlmQueryBatched) {
+          yield* failBridgeDeferred(command.bridgeRequestId, "llm_query_batched is disabled")
+          return
+        }
+
+        const queriesArg = command.args[0]
+        const contextsArg = command.args[1]
+        if (!Array.isArray(queriesArg)) {
+          yield* failBridgeDeferred(command.bridgeRequestId, "llm_query_batched requires an array of query strings as the first argument")
+          return
+        }
+
+        const queries: Array<string> = []
+        for (let index = 0; index < queriesArg.length; index += 1) {
+          const value = queriesArg[index]
+          if (typeof value !== "string") {
+            yield* failBridgeDeferred(
+              command.bridgeRequestId,
+              `llm_query_batched query at index ${index} must be a string`
+            )
+            return
+          }
+          queries.push(value)
+        }
+
+        if (queries.length > config.maxBatchQueries) {
+          yield* failBridgeDeferred(
+            command.bridgeRequestId,
+            `llm_query_batched exceeds maxBatchQueries (${config.maxBatchQueries})`
+          )
+          return
+        }
+
+        let contexts: ReadonlyArray<string> | undefined
+        if (contextsArg !== undefined) {
+          if (!Array.isArray(contextsArg)) {
+            yield* failBridgeDeferred(command.bridgeRequestId, "llm_query_batched contexts must be an array when provided")
+            return
+          }
+          if (contextsArg.length !== queries.length) {
+            yield* failBridgeDeferred(command.bridgeRequestId, "llm_query_batched contexts length must match queries length")
+            return
+          }
+          const parsedContexts: Array<string> = []
+          for (let index = 0; index < contextsArg.length; index += 1) {
+            const value = contextsArg[index]
+            if (typeof value !== "string") {
+              yield* failBridgeDeferred(
+                command.bridgeRequestId,
+                `llm_query_batched context at index ${index} must be a string`
+              )
+              return
+            }
+            parsedContexts.push(value)
+          }
+          contexts = parsedContexts
+        }
+
+        yield* Effect.forkIn(
+          Effect.gen(function*() {
+            const results = yield* Effect.forEach(
+              queries,
+              (query, index) =>
+                runOneShotSubCall(query, contexts?.[index] ?? "", callState.depth + 1).pipe(
+                  Effect.catchAll((error) =>
+                    Effect.fail(new SandboxError({
+                      message: `llm_query_batched item ${index} failed: ${formatExecutionError(error)}`
+                    }))
+                  )
+                ),
+              { concurrency: config.concurrency }
+            )
+
+            yield* resolveBridgeDeferred(command.bridgeRequestId, results)
+          }).pipe(
+            Effect.catchAll((error) =>
+              failBridgeDeferred(command.bridgeRequestId, error)
+            )
+          ),
+          callState.callScope
+        )
+        return
+      }
+
+      // Tool dispatch: methods not reserved for recursive bridgeing route to user-defined tools.
       if (command.method !== "llm_query") {
         const tool = callState.tools?.find((t) => t.name === command.method)
         if (!tool) {
@@ -700,23 +812,11 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
         // At max depth: one-shot model call (no REPL protocol) with budget reservation
         yield* Effect.forkIn(
           Effect.gen(function*() {
-            const oneShotPrompt = buildOneShotPrompt({
-              systemPrompt: buildOneShotSystemPrompt(),
-              query: String(command.args[0]),
-              context: String(command.args[1] ?? "")
-            })
-
-            const oneShotResponseText = yield* Effect.gen(function*() {
-              yield* reserveLlmCall(command.callId)
-              const response = yield* withLlmPermit(
-                rlmModel.generateText({ prompt: oneShotPrompt, depth: callState.depth + 1 })
-              )
-              yield* recordTokens(command.callId, response.usage.totalTokens)
-              return response.text
-            }).pipe(
-              Effect.retry(bridgeLlmQueryRetryPolicy)
+            const oneShotResponseText = yield* runOneShotSubCall(
+              String(command.args[0]),
+              String(command.args[1] ?? ""),
+              callState.depth + 1
             )
-
             yield* resolveBridgeDeferred(command.bridgeRequestId, oneShotResponseText)
           }).pipe(
             Effect.catchAll((error) =>
@@ -753,12 +853,13 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
       })
       if (Option.isNone(callStateOption)) return
       const callState = callStateOption.value
+      const renderedAnswer = renderSubmitAnswer(command.payload)
 
       yield* publishEvent(RlmEvent.CallFinalized({
         completionId: runtime.completionId,
         callId: command.callId,
         depth: callState.depth,
-        answer: command.answer
+        answer: renderedAnswer
       }))
 
       yield* Scope.close(callState.callScope, Exit.void)
@@ -766,7 +867,18 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
 
       if (callState.parentBridgeRequestId) {
         // Sub-call completing → resolve bridge deferred
-        yield* resolveBridgeDeferred(callState.parentBridgeRequestId, command.answer)
+        if (command.payload.source === "answer") {
+          yield* resolveBridgeDeferred(callState.parentBridgeRequestId, command.payload.answer)
+          return
+        }
+
+        yield* failBridgeDeferred(
+          callState.parentBridgeRequestId,
+          new OutputValidationError({
+            message: "Sub-call finalization must use `SUBMIT({ answer: ... })`.",
+            raw: renderedAnswer
+          })
+        )
       } else if (command.callId === rootCallId) {
         // Fail all outstanding bridge deferreds before queue shutdown
         const bridgePending = yield* Ref.getAndSet(runtime.bridgePending, new Map())
@@ -774,7 +886,7 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
           Deferred.fail(d, new SandboxError({ message: "RLM completion finished" })),
           { discard: true }
         )
-        yield* Deferred.succeed(resultDeferred, command.answer)
+        yield* Deferred.succeed(resultDeferred, command.payload)
         yield* Queue.shutdown(runtime.commands)
       }
     })

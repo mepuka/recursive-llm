@@ -10,7 +10,7 @@ export class RlmToolError extends Schema.TaggedError<RlmToolError>()(
 
 // Reserved words that cannot be used as function parameter names
 const RESERVED_PARAM_NAMES = new Set([
-  "print", "__vars", "llm_query", "__strictScope",
+  "print", "__vars", "llm_query", "llm_query_batched", "__strictScope",
   // JS reserved words
   "break", "case", "catch", "continue", "debugger", "default", "delete",
   "do", "else", "finally", "for", "function", "if", "in", "instanceof",

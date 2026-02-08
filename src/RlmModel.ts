@@ -1,5 +1,11 @@
 import * as LanguageModel from "@effect/ai/LanguageModel"
 import type * as Prompt from "@effect/ai/Prompt"
+import * as AnthropicLanguageModel from "@effect/ai-anthropic/AnthropicLanguageModel"
+import type { AnthropicClient } from "@effect/ai-anthropic/AnthropicClient"
+import * as GoogleLanguageModel from "@effect/ai-google/GoogleLanguageModel"
+import type { GoogleClient } from "@effect/ai-google/GoogleClient"
+import * as OpenAiLanguageModel from "@effect/ai-openai/OpenAiLanguageModel"
+import type { OpenAiClient } from "@effect/ai-openai/OpenAiClient"
 import { Context, Effect, Layer } from "effect"
 import type { RlmError } from "./RlmError"
 import { UnknownRlmError } from "./RlmError"
@@ -10,6 +16,7 @@ export interface RlmModelService {
   readonly generateText: (options: {
     readonly prompt: Prompt.Prompt
     readonly depth: number
+    readonly isSubCall?: boolean
     readonly toolkit?: LanguageModel.GenerateTextOptions<any>["toolkit"]
     readonly toolChoice?: LanguageModel.GenerateTextOptions<any>["toolChoice"]
     readonly disableToolCallResolution?: boolean
@@ -22,21 +29,37 @@ export class RlmModel extends Context.Tag("@recursive-llm/RlmModel")<
   RlmModelService
 >() {}
 
+export interface SubLlmDelegationOptions {
+  readonly enabled: boolean
+  readonly depthThreshold: number
+}
+
 // --- Layer constructor ---
 
-export const makeRlmModelLayer = <R>(options: {
-  readonly primary: Effect.Effect<LanguageModel.Service, never, R>
-  readonly sub?: Effect.Effect<LanguageModel.Service, never, R>
-  readonly depthThreshold?: number
-}): Layer.Layer<RlmModel, never, R> =>
+export const makeRlmModelLayer = <RPrimary, RSub = never>(options: {
+  readonly primary: Effect.Effect<LanguageModel.Service, never, RPrimary>
+  readonly sub?: Effect.Effect<LanguageModel.Service, never, RSub>
+  readonly subLlmDelegation?: SubLlmDelegationOptions
+}): Layer.Layer<RlmModel, never, RPrimary | RSub> =>
   Layer.effect(RlmModel, Effect.gen(function*() {
     const primaryLm = yield* options.primary
-    const subLm = options.sub ? yield* options.sub : primaryLm
-    const threshold = options.depthThreshold ?? 1
+    const hasSubModel = options.sub !== undefined
+    const subLm = hasSubModel ? yield* options.sub! : primaryLm
+    const subLlmDelegation: SubLlmDelegationOptions = options.subLlmDelegation ?? {
+      enabled: hasSubModel,
+      depthThreshold: 1
+    }
 
     return RlmModel.of({
-      generateText: ({ prompt, depth, toolkit, toolChoice, disableToolCallResolution, concurrency }) => {
-        const lm = depth >= threshold ? subLm : primaryLm
+      generateText: ({ prompt, depth, isSubCall, toolkit, toolChoice, disableToolCallResolution, concurrency }) => {
+        const useSubModel =
+          hasSubModel &&
+          subLlmDelegation.enabled &&
+          isSubCall === true &&
+          depth >= subLlmDelegation.depthThreshold
+
+        const lm = useSubModel ? subLm : primaryLm
+
         return lm.generateText({
           prompt,
           ...(toolkit !== undefined ? { toolkit } : {}),
@@ -56,19 +79,12 @@ export const makeRlmModelLayer = <R>(options: {
 
 // --- Provider convenience constructors ---
 
-import * as AnthropicLanguageModel from "@effect/ai-anthropic/AnthropicLanguageModel"
-import type { AnthropicClient } from "@effect/ai-anthropic/AnthropicClient"
-import * as GoogleLanguageModel from "@effect/ai-google/GoogleLanguageModel"
-import type { GoogleClient } from "@effect/ai-google/GoogleClient"
-import * as OpenAiLanguageModel from "@effect/ai-openai/OpenAiLanguageModel"
-import type { OpenAiClient } from "@effect/ai-openai/OpenAiClient"
-
 export const makeAnthropicRlmModel = (options: {
   readonly primaryModel: string
   readonly primaryConfig?: Omit<AnthropicLanguageModel.Config.Service, "model">
   readonly subModel?: string
   readonly subConfig?: Omit<AnthropicLanguageModel.Config.Service, "model">
-  readonly depthThreshold?: number
+  readonly subLlmDelegation?: SubLlmDelegationOptions
 }): Layer.Layer<RlmModel, never, AnthropicClient> =>
   makeRlmModelLayer({
     primary: AnthropicLanguageModel.make({
@@ -87,8 +103,8 @@ export const makeAnthropicRlmModel = (options: {
           })
         }
       : {}),
-    ...(options.depthThreshold !== undefined
-      ? { depthThreshold: options.depthThreshold }
+    ...(options.subLlmDelegation !== undefined
+      ? { subLlmDelegation: options.subLlmDelegation }
       : {})
   })
 
@@ -97,7 +113,7 @@ export const makeGoogleRlmModel = (options: {
   readonly primaryConfig?: Omit<GoogleLanguageModel.Config.Service, "model">
   readonly subModel?: string
   readonly subConfig?: Omit<GoogleLanguageModel.Config.Service, "model">
-  readonly depthThreshold?: number
+  readonly subLlmDelegation?: SubLlmDelegationOptions
 }): Layer.Layer<RlmModel, never, GoogleClient> =>
   makeRlmModelLayer({
     primary: GoogleLanguageModel.make({
@@ -116,8 +132,8 @@ export const makeGoogleRlmModel = (options: {
           })
         }
       : {}),
-    ...(options.depthThreshold !== undefined
-      ? { depthThreshold: options.depthThreshold }
+    ...(options.subLlmDelegation !== undefined
+      ? { subLlmDelegation: options.subLlmDelegation }
       : {})
   })
 
@@ -126,7 +142,7 @@ export const makeOpenAiRlmModel = (options: {
   readonly primaryConfig?: Omit<OpenAiLanguageModel.Config.Service, "model">
   readonly subModel?: string
   readonly subConfig?: Omit<OpenAiLanguageModel.Config.Service, "model">
-  readonly depthThreshold?: number
+  readonly subLlmDelegation?: SubLlmDelegationOptions
 }): Layer.Layer<RlmModel, never, OpenAiClient> =>
   makeRlmModelLayer({
     primary: OpenAiLanguageModel.make({
@@ -145,7 +161,7 @@ export const makeOpenAiRlmModel = (options: {
           })
         }
       : {}),
-    ...(options.depthThreshold !== undefined
-      ? { depthThreshold: options.depthThreshold }
+    ...(options.subLlmDelegation !== undefined
+      ? { subLlmDelegation: options.subLlmDelegation }
       : {})
   })

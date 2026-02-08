@@ -9,6 +9,7 @@ export interface FakeModelMetrics {
   calls: number
   readonly prompts: Array<Prompt.Prompt>
   readonly depths: Array<number>
+  readonly isSubCalls?: Array<boolean | undefined>
   readonly toolChoices?: Array<unknown>
   readonly disableToolCallResolutions?: Array<boolean | undefined>
 }
@@ -66,11 +67,13 @@ export const makeFakeRlmModelLayer = (
       generateText: Effect.fn("FakeRlmModel.generateText")(function*({
         prompt,
         depth,
+        isSubCall,
         toolChoice,
         disableToolCallResolution
       }) {
         metrics?.prompts.push(prompt)
         metrics?.depths.push(depth)
+        metrics?.isSubCalls?.push(isSubCall)
         metrics?.toolChoices?.push(toolChoice)
         metrics?.disableToolCallResolutions?.push(disableToolCallResolution)
         if (metrics) metrics.calls += 1

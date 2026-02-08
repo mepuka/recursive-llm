@@ -1,48 +1,12 @@
 import { describe, test } from "bun:test"
 import * as FC from "effect/FastCheck"
-import { extractCodeBlock, extractFinal } from "../../src/CodeExtractor"
+import { extractCodeBlock } from "../../src/CodeExtractor"
 import { assertProperty } from "./helpers/property"
 
 const withoutToken = (token: string) =>
   FC.string().filter((s) => !s.includes(token))
 
 describe("CodeExtractor properties", () => {
-  test("prop: extractFinal round-trips double-quoted payloads", () => {
-    assertProperty(
-      FC.property(
-        withoutToken("\""),
-        (payload) => extractFinal(`FINAL("${payload}")`) === payload
-      )
-    )
-  })
-
-  test("prop: extractFinal round-trips single-quoted payloads", () => {
-    assertProperty(
-      FC.property(
-        withoutToken("'"),
-        (payload) => extractFinal(`FINAL('${payload}')`) === payload
-      )
-    )
-  })
-
-  test("prop: extractFinal round-trips backtick-quoted payloads", () => {
-    assertProperty(
-      FC.property(
-        withoutToken("`"),
-        (payload) => extractFinal(`FINAL(\`${payload}\`)`) === payload
-      )
-    )
-  })
-
-  test("prop: extractFinal returns null when FINAL token is absent", () => {
-    assertProperty(
-      FC.property(
-        FC.string().filter((s) => !s.includes("FINAL(")),
-        (text) => extractFinal(text) === null
-      )
-    )
-  })
-
   test("prop: extractCodeBlock trims payload for fenced code", () => {
     assertProperty(
       FC.property(
@@ -67,4 +31,3 @@ describe("CodeExtractor properties", () => {
     )
   })
 })
-

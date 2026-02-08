@@ -213,6 +213,33 @@ describe("sandbox-worker", () => {
     expect(execResult.output).toBe("4")
   })
 
+  test("bridge flow: code calls llm_query_batched → BridgeCall → BridgeResult → completion", async () => {
+    handle = spawnWorker()
+    handle.proc.send({ _tag: "Init", callId: "test-call", depth: 0 })
+    await Bun.sleep(100)
+
+    handle.proc.send({
+      _tag: "ExecRequest",
+      requestId: "exec-bridge-batch",
+      code: "const results = await llm_query_batched(['q1', 'q2'], ['c1', 'c2']); print(results.join('|'))"
+    })
+
+    const bridgeCall = await handle.waitForMessage()
+    expect(bridgeCall._tag).toBe("BridgeCall")
+    expect(bridgeCall.method).toBe("llm_query_batched")
+    expect(bridgeCall.args).toEqual([["q1", "q2"], ["c1", "c2"]])
+
+    handle.proc.send({
+      _tag: "BridgeResult",
+      requestId: bridgeCall.requestId,
+      result: ["r1", "r2"]
+    })
+
+    const execResult = await handle.waitForMessage()
+    expect(execResult._tag).toBe("ExecResult")
+    expect(execResult.output).toBe("r1|r2")
+  })
+
   test("bridge BridgeFailed → code catches error", async () => {
     handle = spawnWorker()
     handle.proc.send({ _tag: "Init", callId: "test-call", depth: 0 })
@@ -257,6 +284,31 @@ describe("sandbox-worker", () => {
       code: `
         try {
           await llm_query("hello")
+        } catch (e) {
+          print("caught: " + e.message)
+        }
+      `
+    })
+
+    const result = await handle.waitForMessage()
+    expect(result._tag).toBe("ExecResult")
+    expect(String(result.output)).toContain("Bridge disabled in strict sandbox mode")
+
+    await Bun.sleep(50)
+    expect(handle.messages.some((msg) => msg._tag === "BridgeCall")).toBe(false)
+  })
+
+  test("strict mode disables llm_query_batched bridge calls", async () => {
+    handle = spawnWorker()
+    handle.proc.send({ _tag: "Init", callId: "test-call", depth: 0, sandboxMode: "strict" })
+    await Bun.sleep(100)
+
+    handle.proc.send({
+      _tag: "ExecRequest",
+      requestId: "strict-no-bridge-batch",
+      code: `
+        try {
+          await llm_query_batched(["q1", "q2"], ["c1", "c2"])
         } catch (e) {
           print("caught: " + e.message)
         }

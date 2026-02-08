@@ -85,36 +85,35 @@ describe("SystemPrompt properties", () => {
             outputJsonSchema: schema
           })
           return prompt.includes(JSON.stringify(schema, null, 2)) &&
-            prompt.includes("Use FINAL(`{...}`)")
+            prompt.includes("SUBMIT invocation schema for this run")
         }
       )
     )
   })
 
-  test("prop: extract prompt uses JSON-safe FINAL instruction when schema is present", () => {
+  test("prop: extract prompt requires SUBMIT value instruction when schema is present", () => {
     assertProperty(
       FC.property(
         jsonSchemaArbitrary,
         (schema) => {
           const prompt = buildExtractSystemPrompt(schema)
-          return prompt.includes("FINAL(`{...}`)") &&
-            !prompt.includes('FINAL("your answer")')
-        }
-      )
-    )
-  })
-
-  test("prop: extract prompt uses quoted-string FINAL instruction without schema", () => {
-    assertProperty(
-      FC.property(
-        FC.constant(undefined),
-        () => {
-          const prompt = buildExtractSystemPrompt()
-          return prompt.includes('FINAL("your answer")') &&
+          return prompt.includes("SUBMIT({ value: ... })") &&
             !prompt.includes("FINAL(`{...}`)")
         }
       )
     )
   })
-})
 
+  test("prop: extract prompt requires SUBMIT answer instruction without schema", () => {
+    assertProperty(
+      FC.property(
+        FC.constant(undefined),
+        () => {
+          const prompt = buildExtractSystemPrompt()
+          return prompt.includes('SUBMIT({ answer: "your answer" })') &&
+            !prompt.includes('FINAL("your answer")')
+        }
+      )
+    )
+  })
+})

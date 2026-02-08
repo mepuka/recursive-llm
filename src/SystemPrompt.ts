@@ -1,4 +1,4 @@
-import { submitToolDescriptor } from "./SubmitTool"
+import { buildSubmitInvocationSchema } from "./SubmitTool"
 
 export interface ToolDescriptor {
   readonly name: string
@@ -26,6 +26,7 @@ export interface ReplSystemPromptOptions {
 export const buildReplSystemPrompt = (options: ReplSystemPromptOptions): string => {
   const isStrict = options.sandboxMode === "strict"
   const canRecurse = !isStrict && options.depth < options.maxDepth
+  const submitInvocationSchema = buildSubmitInvocationSchema(options.outputJsonSchema)
   const lines: Array<string> = []
 
   lines.push("You are a recursive problem-solving agent with access to a code sandbox.")
@@ -78,18 +79,17 @@ export const buildReplSystemPrompt = (options: ReplSystemPromptOptions): string 
   lines.push(options.outputJsonSchema
     ? "- For structured output: `SUBMIT({ value: {...} })`."
     : "- For plain-text output: `SUBMIT({ answer: \"your answer\" })`.")
-  lines.push("- Do NOT provide both `answer` and `value` in one SUBMIT call.")
+  lines.push("- Use exactly one field in SUBMIT: `answer` OR `value`.")
   lines.push("- `SUBMIT` ends execution immediately. You MUST have seen execution output confirming your results before calling it.")
   lines.push("- Do NOT include SUBMIT() inside a code block — place it as standalone text.")
-  lines.push(`- SUBMIT parameters schema: ${JSON.stringify(submitToolDescriptor.parametersJsonSchema)}`)
-  lines.push("- Legacy fallback: `FINAL(\"your answer\")` is still accepted if tool calling is unavailable.")
+  lines.push(`- SUBMIT invocation schema for this run: ${JSON.stringify(submitInvocationSchema)}`)
   lines.push("")
   lines.push("## Rules")
   lines.push("1. EXPLORE FIRST — Read your data with code before processing it. Do not guess at content.")
   lines.push("2. ITERATE — Write small code snippets. Observe output. Then decide next steps.")
-  lines.push("3. VERIFY BEFORE SUBMITTING — If results seem wrong or empty, reconsider your approach before calling SUBMIT()/FINAL().")
+  lines.push("3. VERIFY BEFORE SUBMITTING — If results seem wrong or empty, reconsider your approach before calling SUBMIT().")
   lines.push("4. HANDLE ERRORS — If your code throws an error, read the error message, fix your code, and try again. Do not guess at an answer after an error.")
-  lines.push("5. NO MIXED FINALIZATION — Never combine SUBMIT()/FINAL() and executable code in the same response.")
+  lines.push("5. NO MIXED FINALIZATION — Never combine SUBMIT() and executable code in the same response.")
   lines.push("6. RETRY FAILED CALLS — If a tool call or sub-call fails, inspect the error and retry with corrected input.")
   lines.push("7. MINIMIZE RETYPING — Do not paste context text into code as string literals. Access data through `__vars` and compute over it. Retyping wastes tokens and introduces errors.")
   if (canRecurse) {
@@ -100,10 +100,12 @@ export const buildReplSystemPrompt = (options: ReplSystemPromptOptions): string 
   if (canRecurse) {
     lines.push("## Recursive Sub-calls")
     lines.push("`const result = await llm_query(query, context?)` — delegate semantic analysis to a sub-LLM. Returns a string.")
+    lines.push("`const results = await llm_query_batched(queries, contexts?)` — run multiple independent semantic sub-calls in parallel. Returns a string array in input order.")
     lines.push("- MUST use `await` — without it you get `[object Promise]`, not the answer.")
     lines.push("- Each call counts against your LLM call budget.")
     lines.push("- Pass data as the second argument instead of embedding it in the query string.")
     lines.push("- If context is not a string, serialize it first (for example `JSON.stringify(data)`).")
+    lines.push("- Prefer `llm_query_batched` or `Promise.all([...llm_query(...)])` for independent chunk analysis; use sequential `await` only when each step depends on the previous output.")
     if (options.subModelContextChars !== undefined) {
       lines.push(`- Sub-model context guidance: keep each llm_query context near or below ~${options.subModelContextChars} characters.`)
     }
@@ -124,7 +126,7 @@ export const buildReplSystemPrompt = (options: ReplSystemPromptOptions): string 
     lines.push("### Budget-aware chunking strategy")
     lines.push("1. Inspect data size and shape with code.")
     lines.push("2. Compute chunk size from available LLM-call budget.")
-    lines.push("3. Analyze each chunk with llm_query().")
+    lines.push("3. Analyze each chunk with `llm_query_batched` or `Promise.all` over `llm_query`.")
     lines.push("4. Aggregate with code or one final llm_query().")
     lines.push("")
     lines.push("### Anti-Patterns (unless user explicitly requests rule-based behavior)")
@@ -152,14 +154,10 @@ export const buildReplSystemPrompt = (options: ReplSystemPromptOptions): string 
     lines.push("")
     lines.push("Iteration 2:")
     lines.push("```js")
-    lines.push("const analyses = []")
-    lines.push("for (const chunk of __vars.chunks) {")
-    lines.push("  const out = await llm_query(")
-    lines.push("    \"Identify main political themes in this chunk. Return short bullet points.\",")
-    lines.push("    chunk")
-    lines.push("  )")
-    lines.push("  analyses.push(out)")
-    lines.push("}")
+    lines.push("const analyses = await llm_query_batched(")
+    lines.push("  __vars.chunks.map(() => \"Identify main political themes in this chunk. Return short bullet points.\"),")
+    lines.push("  __vars.chunks")
+    lines.push(")")
     lines.push("__vars.analyses = analyses")
     lines.push("print(analyses.join('\\n---\\n'))")
     lines.push("```")
@@ -191,12 +189,10 @@ export const buildReplSystemPrompt = (options: ReplSystemPromptOptions): string 
 
   if (options.outputJsonSchema) {
     lines.push("## Output Format")
-    lines.push("Primary path: `SUBMIT({ value: {...} })` with valid JSON.")
-    lines.push("Fallback only if tool calling is unavailable: FINAL(`{...}`).")
-    lines.push("Do not output both SUBMIT and FINAL in the same response.")
-    lines.push("Any final payload MUST be valid JSON matching this schema:")
+    lines.push("Respond with exactly one SUBMIT tool call using `value`.")
+    lines.push("The `value` payload MUST be valid JSON matching this schema:")
     lines.push(JSON.stringify(options.outputJsonSchema, null, 2))
-    lines.push("Use FINAL(`{...}`) with backticks for JSON content.")
+    lines.push(`SUBMIT invocation schema for this run: ${JSON.stringify(submitInvocationSchema)}`)
     lines.push("")
   }
 
@@ -206,34 +202,33 @@ export const buildReplSystemPrompt = (options: ReplSystemPromptOptions): string 
     `LLM calls remaining: ${options.budget.llmCallsRemaining}.`)
 
   if (options.budget.iterationsRemaining <= 0) {
-    lines.push("WARNING: This is your LAST iteration. If you have verified output, call SUBMIT() now. Otherwise, write one small verification snippet — the extract fallback will finalize from your work if needed.")
+    lines.push("WARNING: This is your LAST iteration. If you have verified output, call SUBMIT() now.")
   }
 
   return lines.join("\n")
 }
 
 export const buildExtractSystemPrompt = (outputJsonSchema?: object): string => {
+  const submitInvocationSchema = buildSubmitInvocationSchema(outputJsonSchema)
   const lines: Array<string> = []
   lines.push("You ran out of iterations. Based on the work done so far, provide your best answer now.")
   lines.push("")
   lines.push("Review the conversation above and extract the final answer to the original query.")
+  lines.push("You MUST finalize using exactly one SUBMIT tool call.")
+  lines.push("Do NOT output code blocks, FINAL(), or commentary.")
+  lines.push(`SUBMIT invocation schema for this run: ${JSON.stringify(submitInvocationSchema)}`)
+  lines.push("")
 
   if (outputJsonSchema) {
-    lines.push("Primary path: respond with SUBMIT({ value: {...} }) and nothing else.")
-    lines.push("Fallback only if tool calling is unavailable: respond with FINAL(`{...}`) and nothing else.")
-    lines.push("Do not output both SUBMIT and FINAL.")
-    lines.push("Use backticks for FINAL JSON so content is not escaped.")
-    lines.push("")
+    lines.push("Call `SUBMIT({ value: ... })` and nothing else.")
     lines.push("Your answer MUST be valid JSON matching this schema:")
     lines.push(JSON.stringify(outputJsonSchema, null, 2))
   } else {
-    lines.push("Primary path: respond with SUBMIT({ answer: \"your answer\" }) and nothing else.")
-    lines.push("Fallback only if tool calling is unavailable: respond with FINAL(\"your answer\") and nothing else.")
-    lines.push("Do not output both SUBMIT and FINAL.")
+    lines.push("Call `SUBMIT({ answer: \"your answer\" })` and nothing else.")
   }
 
   return lines.join("\n")
 }
 
 export const buildOneShotSystemPrompt = (): string =>
-  "Answer the query directly and concisely. Do not use code blocks, SUBMIT(), FINAL(), or any special formatting. Return your answer as plain text."
+  "Answer the query directly and concisely. Do not use code blocks, SUBMIT(), or any special formatting. Return your answer as plain text."

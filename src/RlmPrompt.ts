@@ -31,7 +31,7 @@ export const buildReplPrompt = (options: BuildReplPromptOptions): Prompt.Prompt 
 
   const isFirstIteration = options.transcript.length === 0
   const safeguard = isFirstIteration && options.contextLength > 0
-    ? "You have not seen the context yet. Explore it with code first — do not call SUBMIT()/FINAL() immediately.\n\n"
+    ? "You have not seen the context yet. Explore it with code first — do not call SUBMIT() immediately.\n\n"
     : ""
 
   const userContent = options.contextLength > 0

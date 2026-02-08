@@ -53,6 +53,7 @@ const makeStrictScope = (
   print: (...args: unknown[]) => void,
   __vars: unknown,
   llm_query: (query: string, context?: string) => Promise<unknown>,
+  llm_query_batched: (queries: ReadonlyArray<string>, contexts?: ReadonlyArray<string>) => Promise<unknown>,
   tools?: Record<string, (...args: unknown[]) => Promise<unknown>>
 ) => {
   const scope: Record<string, unknown> = {
@@ -60,6 +61,7 @@ const makeStrictScope = (
     print,
     __vars,
     llm_query,
+    llm_query_batched,
     undefined,
     // Tool functions
     ...tools,
@@ -216,6 +218,27 @@ async function executeCode(requestId: string, code: string): Promise<void> {
     })
   }
 
+  const llm_query_batched = async (
+    queries: ReadonlyArray<string>,
+    contexts?: ReadonlyArray<string>
+  ): Promise<unknown> => {
+    if (sandboxMode === "strict") {
+      throw new Error("Bridge disabled in strict sandbox mode")
+    }
+
+    const bridgeRequestId = crypto.randomUUID()
+
+    return new Promise((resolve, reject) => {
+      pendingBridge.set(bridgeRequestId, { resolve, reject })
+      safeSend({
+        _tag: "BridgeCall",
+        requestId: bridgeRequestId,
+        method: "llm_query_batched",
+        args: contexts !== undefined ? [queries, contexts] : [queries]
+      })
+    })
+  }
+
   try {
     if (sandboxMode === "strict") {
       for (const blocked of STRICT_BLOCKLIST) {
@@ -231,16 +254,16 @@ async function executeCode(requestId: string, code: string): Promise<void> {
     const toolValues = Object.values(toolFunctions)
 
     if (sandboxMode === "strict") {
-      const strictScope = makeStrictScope(print, __vars, llm_query, toolFunctions)
-      const fn = new AsyncFunction("print", "__vars", "llm_query", "__strictScope", ...toolNames, `
+      const strictScope = makeStrictScope(print, __vars, llm_query, llm_query_batched, toolFunctions)
+      const fn = new AsyncFunction("print", "__vars", "llm_query", "llm_query_batched", "__strictScope", ...toolNames, `
         with (__strictScope) {
           ${code}
         }
       `)
-      await fn(print, __vars, llm_query, strictScope, ...toolValues)
+      await fn(print, __vars, llm_query, llm_query_batched, strictScope, ...toolValues)
     } else {
-      const fn = new AsyncFunction("print", "__vars", "llm_query", ...toolNames, code)
-      await fn(print, __vars, llm_query, ...toolValues)
+      const fn = new AsyncFunction("print", "__vars", "llm_query", "llm_query_batched", ...toolNames, code)
+      await fn(print, __vars, llm_query, llm_query_batched, ...toolValues)
     }
 
     safeSend({
@@ -281,7 +304,7 @@ function handleMessage(message: unknown): void {
       // Create tool bridge functions from tool descriptors
       toolFunctions = {}
       const jsIdentifierRe = /^[a-zA-Z_$][a-zA-Z0-9_$]*$/
-      const reservedBindings = new Set(["print", "__vars", "llm_query", "__strictScope"])
+      const reservedBindings = new Set(["print", "__vars", "llm_query", "llm_query_batched", "__strictScope"])
       if (Array.isArray(msg.tools)) {
         for (const tool of msg.tools) {
           const toolName = String(tool.name)

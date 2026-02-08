@@ -13,8 +13,18 @@ const defaultConfig: RlmConfigService = {
   maxLlmCalls: 20,
   maxTotalTokens: null,
   concurrency: 4,
+  enableLlmQueryBatched: true,
+  maxBatchQueries: 32,
   eventBufferCapacity: 4096,
-  maxExecutionOutputChars: 8_000
+  maxExecutionOutputChars: 8_000,
+  primaryTarget: {
+    provider: "anthropic",
+    model: "claude-sonnet-4-5-20250929"
+  },
+  subLlmDelegation: {
+    enabled: false,
+    depthThreshold: 1
+  }
 }
 
 const makeLayers = (options: {
@@ -30,6 +40,15 @@ const makeLayers = (options: {
   const configLayer = Layer.succeed(RlmConfig, { ...defaultConfig, ...options.config })
   return Layer.provideMerge(base, configLayer)
 }
+
+const submitAnswer = (answer: string, totalTokens?: number): FakeModelResponse => ({
+  ...(totalTokens !== undefined ? { totalTokens } : {}),
+  toolCalls: [{ name: "SUBMIT", params: { answer } }]
+})
+
+const submitValue = (value: unknown): FakeModelResponse => ({
+  toolCalls: [{ name: "SUBMIT", params: { value } }]
+})
 
 describe("Rlm thin slice", () => {
   test("returns final answer from scripted model", async () => {
@@ -48,7 +67,7 @@ describe("Rlm thin slice", () => {
         Effect.either,
         Effect.provide(
           makeLayers({
-            responses: [{ text: "FINAL(\"4\")", totalTokens: 12 }],
+            responses: [submitAnswer("4", 12)],
             modelMetrics,
             sandboxMetrics
           })
@@ -91,7 +110,7 @@ describe("Rlm thin slice", () => {
     }
   })
 
-  test("SUBMIT value fallback finalizes even when JSON serialization fails", async () => {
+  test("plain-output mode rejects SUBMIT value payloads", async () => {
     const result = await Effect.runPromise(
       complete({
         query: "return bigint",
@@ -111,9 +130,10 @@ describe("Rlm thin slice", () => {
       )
     )
 
-    expect(result._tag).toBe("Right")
-    if (result._tag === "Right") {
-      expect(result.right).toBe("10")
+    expect(result._tag).toBe("Left")
+    if (result._tag === "Left") {
+      expect(result.left).toBeInstanceOf(OutputValidationError)
+      expect(result.left.message).toContain("Plain-text output requires")
     }
   })
 
@@ -128,7 +148,7 @@ describe("Rlm thin slice", () => {
         Effect.either,
         Effect.provide(
           makeLayers({
-            responses: [{ text: "FINAL(\"unreachable\")" }],
+            responses: [submitAnswer("unreachable")],
             modelMetrics,
             config: {
               maxIterations: 2,
@@ -158,7 +178,7 @@ describe("Rlm thin slice", () => {
             makeLayers({
               responses: [
                 { text: "I will inspect first." },
-                { text: "FINAL(\"done\")" }
+                submitAnswer("done")
               ]
             })
           )
@@ -236,7 +256,7 @@ describe("Rlm typed output", () => {
         Effect.either,
         Effect.provide(
           makeLayers({
-            responses: [{ text: 'FINAL(`{"answer": 4, "unit": "count"}`)' }]
+            responses: [submitValue({ answer: 4, unit: "count" })]
           })
         )
       )
@@ -248,7 +268,7 @@ describe("Rlm typed output", () => {
     }
   })
 
-  test("complete with outputSchema fails on invalid JSON", async () => {
+  test("complete with outputSchema fails when value payload is invalid", async () => {
     const ResultSchema = Schema.Struct({ value: Schema.Number })
 
     const result = await Effect.runPromise(
@@ -260,7 +280,7 @@ describe("Rlm typed output", () => {
         Effect.either,
         Effect.provide(
           makeLayers({
-            responses: [{ text: 'FINAL("not json")' }]
+            responses: [submitValue(undefined)]
           })
         )
       )
@@ -269,7 +289,7 @@ describe("Rlm typed output", () => {
     expect(result._tag).toBe("Left")
     if (result._tag === "Left") {
       expect(result.left).toBeInstanceOf(OutputValidationError)
-      expect(result.left.message).toContain("JSON Parse error")
+      expect(result.left.message).toContain("does not match output schema")
     }
   })
 
@@ -285,7 +305,7 @@ describe("Rlm typed output", () => {
         Effect.either,
         Effect.provide(
           makeLayers({
-            responses: [{ text: 'FINAL(`{"value": "not a number"}`)' }]
+            responses: [submitValue({ value: "not a number" })]
           })
         )
       )
@@ -298,7 +318,7 @@ describe("Rlm typed output", () => {
     }
   })
 
-  test("complete without outputSchema returns raw string (backward compat)", async () => {
+  test("complete without outputSchema returns SUBMIT answer string", async () => {
     const result = await Effect.runPromise(
       complete({
         query: "test",
@@ -307,7 +327,7 @@ describe("Rlm typed output", () => {
         Effect.either,
         Effect.provide(
           makeLayers({
-            responses: [{ text: 'FINAL("hello world")' }]
+            responses: [submitAnswer("hello world")]
           })
         )
       )

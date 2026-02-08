@@ -1,47 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { extractFinal, extractCodeBlock } from "../src/CodeExtractor"
-
-describe("extractFinal", () => {
-  test("double quotes", () => {
-    expect(extractFinal('FINAL("answer")')).toBe("answer")
-  })
-
-  test("single quotes", () => {
-    expect(extractFinal("FINAL('answer')")).toBe("answer")
-  })
-
-  test("backtick quotes", () => {
-    expect(extractFinal("FINAL(`answer`)")).toBe("answer")
-  })
-
-  test("multiline in backticks", () => {
-    expect(extractFinal("FINAL(`line1\nline2`)")).toBe("line1\nline2")
-  })
-
-  test("no quotes returns null", () => {
-    expect(extractFinal("FINAL(answer)")).toBeNull()
-  })
-
-  test("no FINAL returns null", () => {
-    expect(extractFinal("just some text")).toBeNull()
-  })
-
-  test("FINAL inside code block still extracts", () => {
-    expect(extractFinal('```js\nFINAL("x")\n```')).toBe("x")
-  })
-
-  test("nested quotes", () => {
-    expect(extractFinal("FINAL(\"it's\")")).toBe("it's")
-  })
-
-  test("empty FINAL", () => {
-    expect(extractFinal('FINAL("")')).toBe("")
-  })
-
-  test("JSON in backticks", () => {
-    expect(extractFinal('FINAL(`{"a":1}`)')).toBe('{"a":1}')
-  })
-})
+import { extractCodeBlock } from "../src/CodeExtractor"
 
 describe("extractCodeBlock", () => {
   test("js fence", () => {

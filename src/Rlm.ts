@@ -10,6 +10,7 @@ import type { RunSchedulerOptions } from "./Scheduler"
 import { runScheduler } from "./Scheduler"
 import { SandboxConfig, SandboxFactory } from "./Sandbox"
 import { SandboxBunLive } from "./SandboxBun"
+import { renderSubmitAnswer } from "./SubmitTool"
 import type { RlmToolAny } from "./RlmTool"
 import { JSONSchema } from "effect"
 
@@ -73,16 +74,29 @@ const streamInternal = (options: CompleteOptionsBase) =>
 const completeInternal = Effect.fn("Rlm.complete")(function*(
   options: CompleteOptionsBase & { readonly outputSchema?: Schema.Schema<any, any, never> }
 ) {
-  const raw = yield* runScheduler(toSchedulerOptions(options))
+  const submitted = yield* runScheduler(toSchedulerOptions(options))
 
   if (!options.outputSchema) {
-    return raw
+    if (submitted.source === "answer") {
+      return submitted.answer
+    }
+    return yield* new OutputValidationError({
+      message: "Plain-text completion requires `SUBMIT({ answer: \"...\" })`.",
+      raw: renderSubmitAnswer(submitted)
+    })
   }
 
-  return yield* Schema.decodeUnknown(Schema.parseJson(options.outputSchema))(raw).pipe(
+  if (submitted.source !== "value") {
+    return yield* new OutputValidationError({
+      message: "Structured completion requires `SUBMIT({ value: ... })`.",
+      raw: renderSubmitAnswer(submitted)
+    })
+  }
+
+  return yield* Schema.decodeUnknown(options.outputSchema)(submitted.value).pipe(
     Effect.mapError((e) => new OutputValidationError({
       message: `Submitted final content does not match output schema: ${String(e)}`,
-      raw
+      raw: renderSubmitAnswer(submitted)
     }))
   )
 })
