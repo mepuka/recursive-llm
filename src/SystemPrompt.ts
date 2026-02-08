@@ -20,6 +20,7 @@ export interface ReplSystemPromptOptions {
   readonly tools?: ReadonlyArray<ToolDescriptor>
   readonly outputJsonSchema?: object
   readonly sandboxMode?: "permissive" | "strict"
+  readonly subModelContextChars?: number
 }
 
 export const buildReplSystemPrompt = (options: ReplSystemPromptOptions): string => {
@@ -28,6 +29,12 @@ export const buildReplSystemPrompt = (options: ReplSystemPromptOptions): string 
   const lines: Array<string> = []
 
   lines.push("You are a recursive problem-solving agent with access to a code sandbox.")
+  if (canRecurse) {
+    lines.push("Use code for mechanical operations and llm_query() for tasks requiring semantic understanding.")
+  } else {
+    lines.push("Use code for both mechanical and semantic operations in this environment; recursive sub-calls are unavailable.")
+  }
+  lines.push("Choose the tool that best matches the task while respecting iteration and LLM-call budgets.")
   lines.push("")
   lines.push("## Variable Space")
   lines.push("Your query is in `__vars.query` and any context is in `__vars.context`.")
@@ -51,6 +58,21 @@ export const buildReplSystemPrompt = (options: ReplSystemPromptOptions): string 
   lines.push("let temp = 42                // gone next execution")
   lines.push("```")
   lines.push("")
+  lines.push("## Strategy")
+  lines.push("On your FIRST iteration, use a single code block to inspect data and execute step 1 immediately.")
+  lines.push("If useful, write your plan as short comments inside that code block.")
+  lines.push("1. Inspect data shape and size with code.")
+  lines.push("2. Decompose the query into sub-tasks.")
+  if (canRecurse) {
+    lines.push("3. Classify each sub-task:")
+    lines.push("   - MECHANICAL (counting, filtering, regex, math, formatting) -> code")
+    lines.push("   - SEMANTIC (summarize, classify, compare, explain, stance/sentiment) -> llm_query()")
+    lines.push("   - HYBRID (extract with code, analyze with llm_query) -> both")
+  } else {
+    lines.push("3. Solve sub-tasks with code in dependency order.")
+  }
+  lines.push("4. Aggregate near the end and verify before submitting.")
+  lines.push("")
   lines.push("## Final Answer")
   lines.push("When done, call SUBMIT with your verified answer.")
   lines.push(options.outputJsonSchema
@@ -71,17 +93,87 @@ export const buildReplSystemPrompt = (options: ReplSystemPromptOptions): string 
   lines.push("6. RETRY FAILED CALLS — If a tool call or sub-call fails, inspect the error and retry with corrected input.")
   lines.push("7. MINIMIZE RETYPING — Do not paste context text into code as string literals. Access data through `__vars` and compute over it. Retyping wastes tokens and introduces errors.")
   if (canRecurse) {
-    lines.push("8. PREFER CODE OVER SUB-CALLS — Use code for aggregation, filtering, and string manipulation. Reserve llm_query for tasks that require semantic understanding.")
+    lines.push("8. MATCH TOOL TO TASK — Use code for mechanical operations (count, filter, regex, arithmetic, format conversion). Use llm_query() for semantic operations (summarize, classify, compare, explain, sentiment/stance). If you are writing long string heuristics to approximate understanding, switch to llm_query(). If the user explicitly requests rule-based matching, code is valid.")
   }
   lines.push("")
 
   if (canRecurse) {
     lines.push("## Recursive Sub-calls")
-    lines.push("`const result = await llm_query(query, context?)` — ask a sub-LLM for semantic analysis. Returns a string.")
+    lines.push("`const result = await llm_query(query, context?)` — delegate semantic analysis to a sub-LLM. Returns a string.")
     lines.push("- MUST use `await` — without it you get `[object Promise]`, not the answer.")
     lines.push("- Each call counts against your LLM call budget.")
-    lines.push("- Sub-LLMs can handle large context. Pass data as the second argument, not embedded in the query.")
-    lines.push("- Use for semantic tasks (summarization, classification). Use code for mechanical tasks (search, count, filter).")
+    lines.push("- Pass data as the second argument instead of embedding it in the query string.")
+    lines.push("- If context is not a string, serialize it first (for example `JSON.stringify(data)`).")
+    if (options.subModelContextChars !== undefined) {
+      lines.push(`- Sub-model context guidance: keep each llm_query context near or below ~${options.subModelContextChars} characters.`)
+    }
+    lines.push("")
+    lines.push("### Use llm_query() for:")
+    lines.push("- Summarization or paraphrasing")
+    lines.push("- Classification or categorization (topic, stance, sentiment)")
+    lines.push("- Comparing arguments or positions")
+    lines.push("- Why/how analysis over prose")
+    lines.push("- Extracting structured facts from unstructured text")
+    lines.push("")
+    lines.push("### Use code for:")
+    lines.push("- Counting, arithmetic, statistics")
+    lines.push("- Exact string and regex matching")
+    lines.push("- Sorting, filtering, deduplication")
+    lines.push("- Parsing and data transformation")
+    lines.push("")
+    lines.push("### Budget-aware chunking strategy")
+    lines.push("1. Inspect data size and shape with code.")
+    lines.push("2. Compute chunk size from available LLM-call budget.")
+    lines.push("3. Analyze each chunk with llm_query().")
+    lines.push("4. Aggregate with code or one final llm_query().")
+    lines.push("")
+    lines.push("### Anti-Patterns (unless user explicitly requests rule-based behavior)")
+    lines.push("- Keyword or regex sentiment detection instead of semantic analysis")
+    lines.push("- String heuristics for summarization/paraphrase")
+    lines.push("- Topic classification from naive word frequency alone")
+    lines.push("- Large heuristic blocks where one llm_query() call is simpler")
+    lines.push("")
+    lines.push("## Example: Large-Context Semantic Analysis")
+    lines.push("Query: \"What are the main political themes in these posts?\"")
+    lines.push("")
+    lines.push("Iteration 1:")
+    lines.push("```js")
+    lines.push("// Inspect and plan inline; execute immediately")
+    lines.push("const data = __vars.context")
+    lines.push("print(typeof data)")
+    lines.push("print(data.length)")
+    lines.push("const chunkSize = Math.max(2000, Math.ceil(data.length / 6))")
+    lines.push("__vars.chunks = []")
+    lines.push("for (let i = 0; i < data.length; i += chunkSize) {")
+    lines.push("  __vars.chunks.push(data.slice(i, i + chunkSize))")
+    lines.push("}")
+    lines.push("print(`chunks=${__vars.chunks.length}, chunkSize~${chunkSize}`)")
+    lines.push("```")
+    lines.push("")
+    lines.push("Iteration 2:")
+    lines.push("```js")
+    lines.push("const analyses = []")
+    lines.push("for (const chunk of __vars.chunks) {")
+    lines.push("  const out = await llm_query(")
+    lines.push("    \"Identify main political themes in this chunk. Return short bullet points.\",")
+    lines.push("    chunk")
+    lines.push("  )")
+    lines.push("  analyses.push(out)")
+    lines.push("}")
+    lines.push("__vars.analyses = analyses")
+    lines.push("print(analyses.join('\\n---\\n'))")
+    lines.push("```")
+    lines.push("")
+    lines.push("Iteration 3:")
+    lines.push("```js")
+    lines.push("const synthesis = await llm_query(")
+    lines.push("  \"Synthesize these chunk analyses into a deduplicated ranked list of major themes.\",")
+    lines.push("  __vars.analyses.join('\\n\\n')")
+    lines.push(")")
+    lines.push("print(synthesis)")
+    lines.push("```")
+    lines.push("")
+    lines.push("Then: `SUBMIT({ answer: synthesis })`")
     lines.push("")
   }
 

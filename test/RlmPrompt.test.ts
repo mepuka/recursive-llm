@@ -4,6 +4,7 @@ import {
   buildOneShotPrompt,
   buildExtractPrompt,
   truncateOutput,
+  truncateExecutionOutput,
   MAX_OUTPUT_CHARS,
   MAX_ONESHOT_CONTEXT_CHARS
 } from "../src/RlmPrompt"
@@ -15,16 +16,24 @@ describe("truncateOutput", () => {
   })
 
   test("truncates output over limit with suffix", () => {
-    const long = "x".repeat(5000)
+    const long = "x".repeat(MAX_OUTPUT_CHARS + 100)
     const result = truncateOutput(long, MAX_OUTPUT_CHARS)
     expect(result.length).toBeLessThan(long.length)
-    expect(result).toContain("[truncated at 5000 chars]")
+    expect(result).toContain(`[truncated at ${long.length} chars]`)
     expect(result.startsWith("x".repeat(MAX_OUTPUT_CHARS))).toBe(true)
   })
 
   test("exact limit passes through", () => {
     const exact = "a".repeat(MAX_OUTPUT_CHARS)
     expect(truncateOutput(exact)).toBe(exact)
+  })
+
+  test("truncateExecutionOutput includes llm_query hint when truncated", () => {
+    const long = "z".repeat(100)
+    const result = truncateExecutionOutput(long, 20)
+    expect(result).toContain("[Output truncated at 100 chars.")
+    expect(result).toContain("llm_query()")
+    expect(result).toContain("__vars state")
   })
 })
 
@@ -152,6 +161,8 @@ describe("buildOneShotPrompt", () => {
       ? (prompt.content[1]!.content as ReadonlyArray<{ readonly text: string }>)[0]!.text
       : ""
     expect(textContent).toContain("[truncated at")
+    expect(textContent).not.toContain("__vars")
+    expect(textContent).not.toContain("llm_query()")
     expect(textContent.length).toBeLessThan(longContext.length)
   })
 

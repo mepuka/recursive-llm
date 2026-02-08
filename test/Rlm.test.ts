@@ -13,7 +13,8 @@ const defaultConfig: RlmConfigService = {
   maxLlmCalls: 20,
   maxTotalTokens: null,
   concurrency: 4,
-  eventBufferCapacity: 4096
+  eventBufferCapacity: 4096,
+  maxExecutionOutputChars: 8_000
 }
 
 const makeLayers = (options: {
@@ -26,9 +27,8 @@ const makeLayers = (options: {
   const sandbox = makeFakeSandboxFactoryLayer(options.sandboxMetrics)
   const runtimeLayer = Layer.fresh(RlmRuntimeLive)
   const base = Layer.mergeAll(model, sandbox, runtimeLayer)
-  return options.config
-    ? Layer.provide(base, Layer.succeed(RlmConfig, { ...defaultConfig, ...options.config }))
-    : base
+  const configLayer = Layer.succeed(RlmConfig, { ...defaultConfig, ...options.config })
+  return Layer.provideMerge(base, configLayer)
 }
 
 describe("Rlm thin slice", () => {

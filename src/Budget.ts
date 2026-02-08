@@ -4,23 +4,14 @@ import { RlmRuntime } from "./Runtime"
 import { BudgetState, type CallId } from "./RlmTypes"
 
 export const consumeIteration = Effect.fn("Budget.consumeIteration")(function*(
-  callId: CallId
+  _callId: CallId
 ) {
   const { budgetRef } = yield* RlmRuntime
-  const allowed = yield* Ref.modify(budgetRef, (state) => {
-    if (state.iterationsRemaining <= 0) {
-      return [false, state] as const
-    }
-    return [true, new BudgetState({ ...state, iterationsRemaining: state.iterationsRemaining - 1 })] as const
-  })
-
-  if (!allowed) {
-    return yield* new BudgetExhaustedError({
-      resource: "iterations",
-      callId,
-      remaining: 0
-    })
-  }
+  yield* Ref.update(budgetRef, (state) =>
+    state.iterationsRemaining <= 0
+      ? state
+      : new BudgetState({ ...state, iterationsRemaining: state.iterationsRemaining - 1 })
+  )
 })
 
 export const reserveLlmCall = Effect.fn("Budget.reserveLlmCall")(function*(

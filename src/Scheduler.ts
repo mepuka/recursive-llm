@@ -13,15 +13,22 @@ import { extractCodeBlock, extractFinal } from "./CodeExtractor"
 import { RlmConfig } from "./RlmConfig"
 import { RlmModel } from "./RlmModel"
 import {
+  BudgetExhaustedError,
   NoFinalAnswerError,
   SandboxError,
   UnknownRlmError,
   type RlmError
 } from "./RlmError"
-import { buildReplPrompt, buildOneShotPrompt, buildExtractPrompt, truncateOutput, CONTEXT_PREVIEW_CHARS } from "./RlmPrompt"
+import {
+  buildReplPrompt,
+  buildOneShotPrompt,
+  buildExtractPrompt,
+  truncateExecutionOutput,
+  CONTEXT_PREVIEW_CHARS
+} from "./RlmPrompt"
 import { buildReplSystemPrompt, buildOneShotSystemPrompt, buildExtractSystemPrompt } from "./SystemPrompt"
 import { extractSubmitAnswer, SUBMIT_TOOL_NAME, submitToolkit } from "./SubmitTool"
-import { SandboxFactory } from "./Sandbox"
+import { SandboxConfig, SandboxFactory } from "./Sandbox"
 import { RlmRuntime } from "./Runtime"
 import { BridgeRequestId, CallId, RlmCommand, RlmEvent } from "./RlmTypes"
 import { makeCallVariableSpace } from "./VariableSpace"
@@ -179,6 +186,7 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
   const config = yield* RlmConfig
   const rlmModel = yield* RlmModel
   const sandboxFactory = yield* SandboxFactory
+  const sandboxConfig = yield* SandboxConfig
   const bridgeRetryBaseDelayMs = config.bridgeRetryBaseDelayMs ?? 50
   const bridgeToolRetryCount = config.bridgeToolRetryCount ?? 1
   const bridgeLlmQueryRetryCount = config.bridgeLlmQueryRetryCount ?? 1
@@ -281,6 +289,15 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
       const iteration = yield* readIteration(callState)
       const transcript = yield* readTranscript(callState)
 
+      // Per-call iteration enforcement: each call gets its own maxIterations budget
+      if (iteration >= config.maxIterations) {
+        return yield* new BudgetExhaustedError({
+          resource: "iterations",
+          callId: callState.callId,
+          remaining: 0
+        })
+      }
+
       yield* consumeIteration(callState.callId)
 
       const budget = yield* snapshot
@@ -309,7 +326,7 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
           maxIterations: config.maxIterations,
           maxDepth: config.maxDepth,
           budget: {
-            iterationsRemaining: budget.iterationsRemaining,
+            iterationsRemaining: config.maxIterations - (iteration + 1),
             llmCallsRemaining: budget.llmCallsRemaining
           },
           ...(toolDescriptors !== undefined && toolDescriptors.length > 0
@@ -317,6 +334,10 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
             : {}),
           ...(callState.outputJsonSchema !== undefined
             ? { outputJsonSchema: callState.outputJsonSchema }
+            : {}),
+          sandboxMode: sandboxConfig.sandboxMode,
+          ...(config.subModelContextChars !== undefined
+            ? { subModelContextChars: config.subModelContextChars }
             : {})
         }),
         query: callState.query,
@@ -613,7 +634,10 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
         output: command.output
       }))
 
-      yield* attachExecutionOutput(callState, truncateOutput(command.output))
+      yield* attachExecutionOutput(
+        callState,
+        truncateExecutionOutput(command.output, config.maxExecutionOutputChars)
+      )
 
       const vars = makeCallVariableSpace(callState)
       yield* vars.sync.pipe(

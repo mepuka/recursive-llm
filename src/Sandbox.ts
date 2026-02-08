@@ -51,12 +51,12 @@ export class SandboxConfig extends Context.Reference<SandboxConfig>()(
   {
     defaultValue: (): SandboxConfigService => ({
       sandboxMode: "permissive",
-      executeTimeoutMs: 120_000,
+      executeTimeoutMs: 300_000,
       setVarTimeoutMs: 5_000,
       getVarTimeoutMs: 5_000,
       listVarTimeoutMs: 5_000,
       shutdownGraceMs: 2_000,
-      maxFrameBytes: 4 * 1024 * 1024,
+      maxFrameBytes: 32 * 1024 * 1024,
       maxBridgeConcurrency: 4,
       incomingFrameQueueCapacity: 2_048,
       workerPath: new URL("./sandbox-worker.ts", import.meta.url).pathname

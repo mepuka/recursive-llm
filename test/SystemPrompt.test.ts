@@ -32,9 +32,43 @@ describe("SystemPrompt", () => {
     expect(prompt).toContain("llm_query")
   })
 
+  test("REPL prompt contains Strategy section", () => {
+    const prompt = buildReplSystemPrompt(baseOptions)
+    expect(prompt).toContain("## Strategy")
+    expect(prompt).toContain("On your FIRST iteration")
+  })
+
+  test("REPL prompt rewrites Rule 8 to MATCH TOOL TO TASK", () => {
+    const prompt = buildReplSystemPrompt({ ...baseOptions, depth: 0, maxDepth: 1 })
+    expect(prompt).toContain("MATCH TOOL TO TASK")
+    expect(prompt).not.toContain("PREFER CODE OVER SUB-CALLS")
+  })
+
   test("REPL prompt omits llm_query when depth >= maxDepth", () => {
     const prompt = buildReplSystemPrompt({ ...baseOptions, depth: 1, maxDepth: 1 })
     expect(prompt).not.toContain("llm_query")
+  })
+
+  test("REPL prompt includes recursive example when depth < maxDepth", () => {
+    const prompt = buildReplSystemPrompt({ ...baseOptions, depth: 0, maxDepth: 1 })
+    expect(prompt).toContain("## Example: Large-Context Semantic Analysis")
+    expect(prompt).toContain("### Anti-Patterns")
+  })
+
+  test("REPL prompt omits recursive example when depth >= maxDepth", () => {
+    const prompt = buildReplSystemPrompt({ ...baseOptions, depth: 1, maxDepth: 1 })
+    expect(prompt).not.toContain("## Example: Large-Context Semantic Analysis")
+    expect(prompt).not.toContain("### Anti-Patterns")
+  })
+
+  test("REPL prompt includes sub-model context hint when provided", () => {
+    const prompt = buildReplSystemPrompt({
+      ...baseOptions,
+      depth: 0,
+      maxDepth: 1,
+      subModelContextChars: 12_345
+    })
+    expect(prompt).toContain("~12345 characters")
   })
 
   test("REPL prompt contains budget numbers", () => {

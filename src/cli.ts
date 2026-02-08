@@ -90,7 +90,7 @@ const parseArgs = (): CliArgs | null => {
         break
       }
       case "--max-iterations":
-        result.maxIterations = parseInt(args[++i] ?? "10", 10)
+        result.maxIterations = parseInt(args[++i] ?? "50", 10)
         break
       case "--max-depth":
         result.maxDepth = parseInt(args[++i] ?? "1", 10)
@@ -208,7 +208,8 @@ const buildLayer = (cliArgs: CliArgs): Layer.Layer<Rlm, never, never> => {
     maxLlmCalls: cliArgs.maxLlmCalls ?? 200,
     maxTotalTokens: null,
     concurrency: 4,
-    eventBufferCapacity: 4096
+    eventBufferCapacity: 4096,
+    maxExecutionOutputChars: 8_000
   })
 
   const modelLayer = buildRlmModelLayer(cliArgs)

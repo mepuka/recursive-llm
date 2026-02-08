@@ -10,6 +10,12 @@ export const truncateOutput = (output: string, maxChars = MAX_OUTPUT_CHARS): str
   return output.slice(0, maxChars) + `\n[truncated at ${output.length} chars]`
 }
 
+export const truncateExecutionOutput = (output: string, maxChars = MAX_OUTPUT_CHARS): string => {
+  if (output.length <= maxChars) return output
+  return output.slice(0, maxChars) +
+    `\n[Output truncated at ${output.length} chars. Full data remains in __vars state; analyze in chunks with llm_query() instead of printing everything.]`
+}
+
 export interface BuildReplPromptOptions {
   readonly systemPrompt: string
   readonly query: string

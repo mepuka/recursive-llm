@@ -20,7 +20,8 @@ const defaultConfig: RlmConfigService = {
   maxLlmCalls: 20,
   maxTotalTokens: null,
   concurrency: 4,
-  eventBufferCapacity: 4096
+  eventBufferCapacity: 4096,
+  maxExecutionOutputChars: 8_000
 }
 
 const makeLayers = (options: {
@@ -33,9 +34,8 @@ const makeLayers = (options: {
   const sandbox = makeFakeSandboxFactoryLayer(options.sandboxMetrics)
   const runtimeLayer = Layer.fresh(RlmRuntimeLive)
   const base = Layer.mergeAll(model, sandbox, runtimeLayer)
-  return options.config
-    ? Layer.provide(base, Layer.succeed(RlmConfig, { ...defaultConfig, ...options.config }))
-    : base
+  const configLayer = Layer.succeed(RlmConfig, { ...defaultConfig, ...options.config })
+  return Layer.provideMerge(base, configLayer)
 }
 
 describe("Scheduler integration", () => {
@@ -90,6 +90,45 @@ describe("Scheduler integration", () => {
       : ""
     expect(lastUserText).toContain("[Execution Output]")
     expect(lastUserText).toContain("executed:14") // FakeSandbox returns executed:{length}
+  })
+
+  test("execution output truncation uses configured maxExecutionOutputChars", async () => {
+    const modelMetrics: FakeModelMetrics = { calls: 0, prompts: [], depths: [] }
+
+    const longSnippet = "x".repeat(200)
+    const answer = await Effect.runPromise(
+      complete({
+        query: "truncate output",
+        context: "ctx"
+      }).pipe(
+        Effect.either,
+        Effect.provide(
+          makeLayers({
+            responses: [
+              { text: `\`\`\`js\n${longSnippet}\n\`\`\`` },
+              { text: "FINAL(\"ok\")" }
+            ],
+            modelMetrics,
+            config: { maxExecutionOutputChars: 5 }
+          })
+        )
+      )
+    )
+
+    expect(answer._tag).toBe("Right")
+    if (answer._tag === "Right") {
+      expect(answer.right).toBe("ok")
+    }
+
+    const secondPrompt = modelMetrics.prompts[1]!
+    const userMessages = secondPrompt.content.filter((m) => m.role === "user")
+    const lastUserMsg = userMessages[userMessages.length - 1]!
+    const lastUserText = lastUserMsg.role === "user"
+      ? (lastUserMsg.content as ReadonlyArray<{ readonly text: string }>)[0]!.text
+      : ""
+    expect(lastUserText).toContain("[Execution Output]")
+    expect(lastUserText).toContain("[Output truncated at")
+    expect(lastUserText).toContain("llm_query()")
   })
 
   test("FINAL extraction: model returns FINAL → immediate finalization (no sandbox execution)", async () => {
@@ -908,9 +947,8 @@ describe("Scheduler tool dispatch (e2e with real sandbox)", () => {
       )
     )
     const base = Layer.mergeAll(model, perCallLayer)
-    return options.config
-      ? Layer.provide(base, Layer.succeed(RlmConfig, { ...defaultConfig, ...options.config }))
-      : base
+    const configLayer = Layer.succeed(RlmConfig, { ...defaultConfig, ...options.config })
+    return Layer.provideMerge(base, configLayer)
   }
 
   test("tool bridge call flows through scheduler dispatch", async () => {
@@ -1050,7 +1088,7 @@ describe("Scheduler tool dispatch (e2e with real sandbox)", () => {
       )
     )
 
-    expect(answer).toBe("done")
+    expect(answer).toBe("sub-answer")
     expect(modelMetrics.depths[0]).toBe(0)
     expect(modelMetrics.depths.some((depth) => depth === 1)).toBe(true)
 
