@@ -12,6 +12,7 @@ import { SandboxConfig, SandboxFactory } from "./Sandbox"
 import { SandboxBunLive } from "./SandboxBun"
 import { renderSubmitAnswer } from "./SubmitTool"
 import type { RlmToolAny } from "./RlmTool"
+import { BridgeStoreLive } from "./scheduler/BridgeStore"
 import { JSONSchema } from "effect"
 
 export interface CompleteOptionsBase {
@@ -106,6 +107,20 @@ export class Rlm extends Context.Tag("@recursive-llm/Rlm")<
   RlmService
 >() {}
 
+const makeRuntimeStoreLayer = () =>
+  Layer.merge(
+    RlmRuntimeLive,
+    Layer.provide(BridgeStoreLive, RlmRuntimeLive)
+  )
+
+const makeRlmService = (makePerCallDeps: () => Layer.Layer<any, never, never>) =>
+  Rlm.of({
+    complete: ((options: CompleteOptionsBase & { readonly outputSchema?: Schema.Schema<any, any, never> }) =>
+      completeInternal(options).pipe(Effect.provide(makePerCallDeps()))) as RlmService["complete"],
+    stream: (options) =>
+      streamInternal(options).pipe(Stream.provideLayer(makePerCallDeps()))
+  })
+
 export const rlmLayer: Layer.Layer<Rlm, never, RlmModel | SandboxFactory> = Layer.effect(
   Rlm,
   Effect.gen(function*() {
@@ -121,16 +136,7 @@ export const rlmLayer: Layer.Layer<Rlm, never, RlmModel | SandboxFactory> = Laye
       Layer.succeed(SandboxConfig, sandboxConfig)
     )
 
-    return Rlm.of({
-      complete: ((options: CompleteOptionsBase & { readonly outputSchema?: Schema.Schema<any, any, never> }) =>
-        completeInternal(options).pipe(
-          Effect.provide(Layer.provideMerge(Layer.fresh(RlmRuntimeLive), dependencies))
-        )) as RlmService["complete"],
-      stream: (options) =>
-        streamInternal(options).pipe(
-          Stream.provideLayer(Layer.provideMerge(Layer.fresh(RlmRuntimeLive), dependencies))
-        )
-    })
+    return makeRlmService(() => Layer.fresh(Layer.merge(makeRuntimeStoreLayer(), dependencies)))
   })
 )
 
@@ -148,23 +154,19 @@ export const rlmBunLayer: Layer.Layer<Rlm, never, RlmModel> = Layer.effect(
       Layer.succeed(SandboxConfig, sandboxConfig)
     )
 
-    // Per-call layer constructor: fresh RlmRuntime → BridgeHandler → SandboxFactory
+    // Per-call layer constructor: fresh RlmRuntime + BridgeStore → BridgeHandler → SandboxFactory
     const makePerCallDeps = () => {
+      const runtimeStoreLayer = makeRuntimeStoreLayer()
       const perCallLayer = Layer.fresh(
         Layer.provideMerge(
           SandboxBunLive,
-          Layer.provideMerge(BridgeHandlerLive, RlmRuntimeLive)
+          Layer.provideMerge(BridgeHandlerLive, runtimeStoreLayer)
         )
       )
       return Layer.provideMerge(perCallLayer, sharedLayers)
     }
 
-    return Rlm.of({
-      complete: ((options: CompleteOptionsBase & { readonly outputSchema?: Schema.Schema<any, any, never> }) =>
-        completeInternal(options).pipe(Effect.provide(makePerCallDeps()))) as RlmService["complete"],
-      stream: (options) =>
-        streamInternal(options).pipe(Stream.provideLayer(makePerCallDeps()))
-    })
+    return makeRlmService(makePerCallDeps)
   })
 )
 

@@ -1,4 +1,4 @@
-import { Deferred, Duration, Effect, Exit, Match, Option, PubSub, Queue, Ref, Schedule, Scope, Stream } from "effect"
+import { Deferred, Duration, Effect, Exit, Match, Option, Queue, Ref, Schedule, Scope, Stream } from "effect"
 import { consumeIteration, recordTokens, reserveLlmCall, snapshot, withLlmPermit } from "./Budget"
 import {
   appendTranscript,
@@ -6,8 +6,7 @@ import {
   incrementIteration,
   makeCallContext,
   readIteration,
-  readTranscript,
-  type CallContext
+  readTranscript
 } from "./CallContext"
 import { extractCodeBlock } from "./CodeExtractor"
 import { RlmConfig } from "./RlmConfig"
@@ -33,6 +32,10 @@ import { SandboxConfig, SandboxFactory } from "./Sandbox"
 import { RlmRuntime } from "./Runtime"
 import { BridgeRequestId, CallId, type FinalAnswerPayload, RlmCommand, RlmEvent } from "./RlmTypes"
 import { makeCallVariableSpace } from "./VariableSpace"
+import { getCallStateOption, getCallStateOrWarn, deleteCallState, setCallState } from "./scheduler/CallStateStore"
+import { BridgeStore } from "./scheduler/BridgeStore"
+import { publishEvent, publishSchedulerWarning } from "./scheduler/Events"
+import { enqueue, enqueueOrWarn } from "./scheduler/Queue"
 
 import type { RlmToolAny } from "./RlmTool"
 
@@ -44,130 +47,6 @@ export interface RunSchedulerOptions {
   readonly tools?: ReadonlyArray<RlmToolAny>
   readonly outputJsonSchema?: object
 }
-
-// --- Hot-path helpers (untraced for performance) ---
-
-const publishEvent = Effect.fnUntraced(function*(event: RlmEvent) {
-  const runtime = yield* RlmRuntime
-  yield* PubSub.publish(runtime.events, event)
-})
-
-const publishSchedulerWarning = Effect.fnUntraced(function*(warning: {
-  readonly code:
-    | "STALE_COMMAND_DROPPED"
-    | "QUEUE_CLOSED"
-    | "CALL_SCOPE_CLEANUP"
-    | "MIXED_SUBMIT_AND_CODE"
-    | "TOOLKIT_DEGRADED"
-  readonly message: string
-  readonly callId?: CallId
-  readonly commandTag?: RlmCommand["_tag"]
-}) {
-  const runtime = yield* RlmRuntime
-  yield* PubSub.publish(runtime.events, RlmEvent.SchedulerWarning({
-    completionId: runtime.completionId,
-    code: warning.code,
-    message: warning.message,
-    ...(warning.callId !== undefined ? { callId: warning.callId } : {}),
-    ...(warning.commandTag !== undefined ? { commandTag: warning.commandTag } : {})
-  })).pipe(Effect.ignore)
-})
-
-const enqueue = Effect.fnUntraced(function*(command: RlmCommand) {
-  const runtime = yield* RlmRuntime
-  const offerExit = yield* Effect.exit(Queue.offer(runtime.commands, command))
-  if (Exit.isFailure(offerExit)) {
-    return yield* new UnknownRlmError({
-      message: `Scheduler queue closed while enqueueing ${command._tag}`
-    })
-  }
-
-  const offered = offerExit.value
-  if (!offered) {
-    return yield* new UnknownRlmError({
-      message: `Scheduler queue refused ${command._tag}`
-    })
-  }
-})
-
-const enqueueOrWarn = Effect.fnUntraced(function*(command: RlmCommand) {
-  const enqueueExit = yield* Effect.exit(enqueue(command))
-  if (Exit.isFailure(enqueueExit)) {
-    yield* publishSchedulerWarning({
-      code: "QUEUE_CLOSED",
-      message: `Dropped command ${command._tag} because scheduler queue is closed`,
-      callId: command.callId,
-      commandTag: command._tag
-    })
-    return false
-  }
-  return true
-})
-
-const getCallStateOption = Effect.fnUntraced(function*(callId: CallId) {
-  const runtime = yield* RlmRuntime
-  const states = yield* Ref.get(runtime.callStates)
-  return Option.fromNullable(states.get(callId))
-})
-
-const setCallState = Effect.fnUntraced(function*(
-  callId: CallId,
-  state: CallContext
-) {
-  const runtime = yield* RlmRuntime
-  yield* Ref.update(runtime.callStates, (current) => {
-    const next = new Map(current)
-    next.set(callId, state)
-    return next
-  })
-})
-
-const deleteCallState = (callId: CallId) =>
-  Effect.gen(function*() {
-    const runtime = yield* RlmRuntime
-    yield* Ref.update(runtime.callStates, (current) => {
-      const next = new Map(current)
-      next.delete(callId)
-      return next
-    })
-  })
-
-const getCallStateOrWarn = Effect.fnUntraced(function*(
-  options: {
-    readonly callId: CallId
-    readonly commandTag: RlmCommand["_tag"]
-  }
-) {
-  const callStateOption = yield* getCallStateOption(options.callId)
-  if (Option.isNone(callStateOption)) {
-    yield* publishSchedulerWarning({
-      code: "STALE_COMMAND_DROPPED",
-      message: `Dropped stale command ${options.commandTag} for inactive call ${options.callId}`,
-      callId: options.callId,
-      commandTag: options.commandTag
-    })
-    return Option.none<CallContext>()
-  }
-  return callStateOption
-})
-
-// --- Bridge deferred helpers ---
-
-const resolveBridgeDeferred = (bridgeRequestId: BridgeRequestId, value: unknown) =>
-  Effect.gen(function*() {
-    const runtime = yield* RlmRuntime
-    const pending = yield* Ref.get(runtime.bridgePending)
-    const deferred = pending.get(bridgeRequestId)
-    if (deferred) yield* Deferred.succeed(deferred, value)
-  })
-
-const failBridgeDeferred = (bridgeRequestId: BridgeRequestId, error: unknown) =>
-  Effect.gen(function*() {
-    const runtime = yield* RlmRuntime
-    const pending = yield* Ref.get(runtime.bridgePending)
-    const deferred = pending.get(bridgeRequestId)
-    if (deferred) yield* Deferred.fail(deferred, new SandboxError({ message: String(error) }))
-  })
 
 const formatExecutionError = (error: unknown): string => {
   if (typeof error === "object" && error !== null && "message" in error) {
@@ -188,6 +67,7 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
   const rlmModel = yield* RlmModel
   const sandboxFactory = yield* SandboxFactory
   const sandboxConfig = yield* SandboxConfig
+  const bridgeStore = yield* BridgeStore
   const bridgeRetryBaseDelayMs = config.bridgeRetryBaseDelayMs ?? 50
   const bridgeToolRetryCount = config.bridgeToolRetryCount ?? 1
   const bridgeLlmQueryRetryCount = config.bridgeLlmQueryRetryCount ?? 1
@@ -201,6 +81,12 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
   )
 
   const resultDeferred = yield* Deferred.make<FinalAnswerPayload, RlmError>()
+
+  const resolveBridgeDeferred = (bridgeRequestId: BridgeRequestId, value: unknown) =>
+    bridgeStore.resolve(bridgeRequestId, value).pipe(Effect.asVoid)
+
+  const failBridgeDeferred = (bridgeRequestId: BridgeRequestId, error: unknown) =>
+    bridgeStore.fail(bridgeRequestId, error).pipe(Effect.asVoid)
 
   // --- handleStartCall ---
 
@@ -764,10 +650,10 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
               queries,
               (query, index) =>
                 runOneShotSubCall(query, contexts?.[index] ?? "", callState.depth + 1).pipe(
-                  Effect.catchAll((error) =>
-                    Effect.fail(new SandboxError({
+                  Effect.mapError((error) =>
+                    new SandboxError({
                       message: `llm_query_batched item ${index} failed: ${formatExecutionError(error)}`
-                    }))
+                    })
                   )
                 ),
               { concurrency: config.concurrency }
@@ -881,11 +767,7 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
         )
       } else if (command.callId === rootCallId) {
         // Fail all outstanding bridge deferreds before queue shutdown
-        const bridgePending = yield* Ref.getAndSet(runtime.bridgePending, new Map())
-        yield* Effect.forEach([...bridgePending.values()], (d) =>
-          Deferred.fail(d, new SandboxError({ message: "RLM completion finished" })),
-          { discard: true }
-        )
+        yield* bridgeStore.failAll("RLM completion finished")
         yield* Deferred.succeed(resultDeferred, command.payload)
         yield* Queue.shutdown(runtime.commands)
       }
@@ -915,11 +797,7 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
         yield* failBridgeDeferred(callState.parentBridgeRequestId, command.error)
       } else if (command.callId === rootCallId) {
         // Fail all outstanding bridge deferreds before queue shutdown
-        const bridgePending = yield* Ref.getAndSet(runtime.bridgePending, new Map())
-        yield* Effect.forEach([...bridgePending.values()], (d) =>
-          Deferred.fail(d, new SandboxError({ message: "RLM completion failed" })),
-          { discard: true }
-        )
+        yield* bridgeStore.failAll("RLM completion failed")
         yield* Deferred.fail(resultDeferred, command.error)
         yield* Queue.shutdown(runtime.commands)
       }
@@ -958,15 +836,7 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
     })
 
   const failRemainingBridgeDeferreds = () =>
-    Effect.gen(function*() {
-      const remainingBridgePending = yield* Ref.getAndSet(runtime.bridgePending, new Map())
-      if (remainingBridgePending.size === 0) return
-
-      yield* Effect.forEach([...remainingBridgePending.values()], (deferred) =>
-        Deferred.fail(deferred, new SandboxError({ message: "Scheduler stopped before bridge response" })),
-        { discard: true }
-      )
-    })
+    bridgeStore.failAll("Scheduler stopped before bridge response")
 
   const runLoop = Effect.gen(function*() {
     yield* enqueue(RlmCommand.StartCall({

@@ -10,6 +10,7 @@ import { RlmRuntime, RlmRuntimeLive } from "../src/Runtime"
 import { BridgeRequestId, CallId, RlmCommand } from "../src/RlmTypes"
 import { runScheduler } from "../src/Scheduler"
 import * as RlmTool from "../src/RlmTool"
+import { BridgeStoreLive } from "../src/scheduler/BridgeStore"
 import { makeFakeRlmModelLayer, type FakeModelMetrics, type FakeModelResponse } from "./helpers/FakeRlmModel"
 import { makeFakeSandboxFactoryLayer, type FakeSandboxMetrics } from "./helpers/FakeSandboxFactory"
 import { makeCustomSandboxFactoryLayer } from "./helpers/CustomSandboxFactory"
@@ -34,6 +35,14 @@ const defaultConfig: RlmConfigService = {
   }
 }
 
+const runtimeWithBridgeStoreLayer = Layer.merge(
+  RlmRuntimeLive,
+  Layer.provide(BridgeStoreLive, RlmRuntimeLive)
+)
+
+const makeRuntimeWithBridgeStoreLayer = () =>
+  Layer.fresh(runtimeWithBridgeStoreLayer)
+
 const makeLayers = (options: {
   readonly responses: ReadonlyArray<FakeModelResponse>
   readonly modelMetrics?: FakeModelMetrics
@@ -42,7 +51,7 @@ const makeLayers = (options: {
 }) => {
   const model = makeFakeRlmModelLayer(options.responses, options.modelMetrics)
   const sandbox = makeFakeSandboxFactoryLayer(options.sandboxMetrics)
-  const runtimeLayer = Layer.fresh(RlmRuntimeLive)
+  const runtimeLayer = makeRuntimeWithBridgeStoreLayer()
   const base = Layer.mergeAll(model, sandbox, runtimeLayer)
   const configLayer = Layer.succeed(RlmConfig, { ...defaultConfig, ...options.config })
   return Layer.provideMerge(base, configLayer)
@@ -672,7 +681,7 @@ describe("Scheduler integration", () => {
     const layers = Layer.mergeAll(
       makeFakeRlmModelLayer([{ text: "```js\nprint('hanging')\n```" }]),
       hangingSandboxLayer,
-      Layer.fresh(RlmRuntimeLive)
+      makeRuntimeWithBridgeStoreLayer()
     )
 
     const result = await Effect.runPromise(
@@ -736,7 +745,7 @@ describe("Scheduler integration", () => {
       submitAnswer("recovered")
     ], modelMetrics)
 
-    const layers = Layer.mergeAll(model, failOnceSandboxLayer, Layer.fresh(RlmRuntimeLive))
+    const layers = Layer.mergeAll(model, failOnceSandboxLayer, makeRuntimeWithBridgeStoreLayer())
 
     const result = await Effect.runPromise(
       complete({ query: "compute", context: "ctx" }).pipe(
@@ -764,7 +773,7 @@ describe("Scheduler integration", () => {
     ])
 
     const layers = Layer.provide(
-      Layer.mergeAll(model, alwaysFailSandboxLayer, Layer.fresh(RlmRuntimeLive)),
+      Layer.mergeAll(model, alwaysFailSandboxLayer, makeRuntimeWithBridgeStoreLayer()),
       Layer.succeed(RlmConfig, { ...defaultConfig, maxIterations: 2 })
     )
 
@@ -798,7 +807,7 @@ describe("Scheduler integration", () => {
       submitAnswer("ok")
     ], modelMetrics)
 
-    const layers = Layer.mergeAll(model, failOnceSandboxLayer, Layer.fresh(RlmRuntimeLive))
+    const layers = Layer.mergeAll(model, failOnceSandboxLayer, makeRuntimeWithBridgeStoreLayer())
 
     await Effect.runPromise(
       complete({ query: "compute", context: "ctx" }).pipe(
@@ -831,7 +840,7 @@ describe("Scheduler integration", () => {
       submitAnswer("ok")
     ])
 
-    const layers = Layer.mergeAll(model, failOnceSandboxLayer, Layer.fresh(RlmRuntimeLive))
+    const layers = Layer.mergeAll(model, failOnceSandboxLayer, makeRuntimeWithBridgeStoreLayer())
 
     const events = await Effect.runPromise(
       stream({ query: "compute", context: "ctx" }).pipe(
@@ -883,7 +892,7 @@ describe("Scheduler integration", () => {
       submitAnswer("ok")
     ], modelMetrics)
 
-    const layers = Layer.mergeAll(model, primitiveFailOnceSandboxLayer, Layer.fresh(RlmRuntimeLive))
+    const layers = Layer.mergeAll(model, primitiveFailOnceSandboxLayer, makeRuntimeWithBridgeStoreLayer())
 
     const result = await Effect.runPromise(
       complete({ query: "compute", context: "ctx" }).pipe(
@@ -923,7 +932,7 @@ describe("Scheduler integration", () => {
       [submitAnswer("unreachable")]
     )
 
-    const runtimeLayer = Layer.fresh(RlmRuntimeLive)
+    const runtimeLayer = makeRuntimeWithBridgeStoreLayer()
     const layers = Layer.mergeAll(model, failingSandboxLayer, runtimeLayer)
 
     const result = await Effect.runPromise(
@@ -951,11 +960,11 @@ describe("Scheduler tool dispatch (e2e with real sandbox)", () => {
     readonly config?: Partial<RlmConfigService>
   }) => {
     const model = makeFakeRlmModelLayer(options.responses, options.modelMetrics)
-    // Mirror rlmBunLayer composition: RlmRuntimeLive → BridgeHandlerLive → SandboxBunLive
+    // Mirror rlmBunLayer composition: fresh RlmRuntime + BridgeStore → BridgeHandler → SandboxBunLive
     const perCallLayer = Layer.fresh(
       Layer.provideMerge(
         SandboxBunLive,
-        Layer.provideMerge(BridgeHandlerLive, RlmRuntimeLive)
+        Layer.provideMerge(BridgeHandlerLive, runtimeWithBridgeStoreLayer)
       )
     )
     const base = Layer.mergeAll(model, perCallLayer)

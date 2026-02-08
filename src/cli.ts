@@ -1,32 +1,11 @@
-import { AnthropicClient } from "@effect/ai-anthropic"
-import { GoogleClient } from "@effect/ai-google"
-import { OpenAiClient } from "@effect/ai-openai"
-import { FetchHttpClient } from "@effect/platform"
 import { BunRuntime } from "@effect/platform-bun"
-import { Effect, Layer, Match, Redacted, Stream } from "effect"
-import { Rlm, rlmBunLayer } from "./Rlm"
-import { RlmConfig, type RlmProvider } from "./RlmConfig"
-import type { RlmModel } from "./RlmModel"
-import { makeAnthropicRlmModel, makeGoogleRlmModel, makeOpenAiRlmModel } from "./RlmModel"
+import { Effect, Match, Stream } from "effect"
+import { type CliArgs, buildCliLayer } from "./CliLayer"
+import { Rlm } from "./Rlm"
+import type { RlmProvider } from "./RlmConfig"
 import { formatEvent, type RenderOptions } from "./RlmRenderer"
 
 // --- Arg parsing ---
-
-interface CliArgs {
-  query: string
-  context: string
-  contextFile?: string
-  provider: RlmProvider
-  model: string
-  subModel?: string
-  subDelegationEnabled?: boolean
-  subDelegationDepthThreshold?: number
-  maxIterations?: number
-  maxDepth?: number
-  maxLlmCalls?: number
-  quiet: boolean
-  noColor: boolean
-}
 
 const PROVIDERS = ["anthropic", "openai", "google"] as const
 
@@ -218,101 +197,12 @@ const main = (cliArgs: CliArgs) =>
     process.stdout.write(result.answer + "\n")
   })
 
-// --- Layer construction ---
-
-const buildRlmModelLayer = (cliArgs: CliArgs): Layer.Layer<RlmModel, never, never> => {
-  const httpLayer = FetchHttpClient.layer
-  const subLlmDelegation = {
-    enabled: cliArgs.subDelegationEnabled ?? cliArgs.subModel !== undefined,
-    depthThreshold: cliArgs.subDelegationDepthThreshold ?? 1
-  }
-
-  if (cliArgs.provider === "openai") {
-    const clientLayer = OpenAiClient.layer({
-      apiKey: Redacted.make(Bun.env.OPENAI_API_KEY!)
-    })
-
-    const modelLayer = makeOpenAiRlmModel({
-      primaryModel: cliArgs.model,
-      ...(cliArgs.subModel !== undefined ? { subModel: cliArgs.subModel } : {}),
-      subLlmDelegation
-    })
-
-    return Layer.provide(modelLayer, Layer.provide(clientLayer, httpLayer))
-  }
-
-  if (cliArgs.provider === "google") {
-    const clientLayer = GoogleClient.layer({
-      apiKey: Redacted.make(Bun.env.GOOGLE_API_KEY!)
-    })
-
-    const modelLayer = makeGoogleRlmModel({
-      primaryModel: cliArgs.model,
-      ...(cliArgs.subModel !== undefined ? { subModel: cliArgs.subModel } : {}),
-      subLlmDelegation
-    })
-
-    return Layer.provide(modelLayer, Layer.provide(clientLayer, httpLayer))
-  }
-
-  const clientLayer = AnthropicClient.layer({
-    apiKey: Redacted.make(Bun.env.ANTHROPIC_API_KEY!)
-  })
-
-  const modelLayer = makeAnthropicRlmModel({
-    primaryModel: cliArgs.model,
-    ...(cliArgs.subModel !== undefined ? { subModel: cliArgs.subModel } : {}),
-    subLlmDelegation
-  })
-
-  return Layer.provide(modelLayer, Layer.provide(clientLayer, httpLayer))
-}
-
-const buildLayer = (cliArgs: CliArgs): Layer.Layer<Rlm, never, never> => {
-  const subLlmDelegation = {
-    enabled: cliArgs.subDelegationEnabled ?? cliArgs.subModel !== undefined,
-    depthThreshold: cliArgs.subDelegationDepthThreshold ?? 1
-  }
-
-  const configLayer = Layer.succeed(RlmConfig, {
-    maxIterations: cliArgs.maxIterations ?? 50,
-    maxDepth: cliArgs.maxDepth ?? 1,
-    maxLlmCalls: cliArgs.maxLlmCalls ?? 200,
-    maxTotalTokens: null,
-    concurrency: 4,
-    enableLlmQueryBatched: true,
-    maxBatchQueries: 32,
-    eventBufferCapacity: 4096,
-    maxExecutionOutputChars: 8_000,
-    primaryTarget: {
-      provider: cliArgs.provider,
-      model: cliArgs.model
-    },
-    ...(cliArgs.subModel !== undefined
-      ? {
-          subTarget: {
-            provider: cliArgs.provider,
-            model: cliArgs.subModel
-          }
-        }
-      : {}),
-    subLlmDelegation
-  })
-
-  const modelLayer = buildRlmModelLayer(cliArgs)
-
-  return Layer.provide(
-    rlmBunLayer,
-    Layer.mergeAll(modelLayer, configLayer)
-  )
-}
-
 // --- Entry point ---
 
 const cliArgs = parseArgs()
 if (cliArgs) {
   main(cliArgs).pipe(
-    Effect.provide(buildLayer(cliArgs)),
+    Effect.provide(buildCliLayer(cliArgs)),
     BunRuntime.runMain
   )
 }

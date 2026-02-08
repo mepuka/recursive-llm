@@ -4,6 +4,7 @@ import { complete, stream } from "../src/Rlm"
 import { RlmConfig, type RlmConfigService } from "../src/RlmConfig"
 import { BudgetExhaustedError, OutputValidationError } from "../src/RlmError"
 import { RlmRuntimeLive } from "../src/Runtime"
+import { BridgeStoreLive } from "../src/scheduler/BridgeStore"
 import { makeFakeRlmModelLayer, type FakeModelMetrics, type FakeModelResponse } from "./helpers/FakeRlmModel"
 import { makeFakeSandboxFactoryLayer, type FakeSandboxMetrics } from "./helpers/FakeSandboxFactory"
 
@@ -35,8 +36,11 @@ const makeLayers = (options: {
 }) => {
   const model = makeFakeRlmModelLayer(options.responses, options.modelMetrics)
   const sandbox = makeFakeSandboxFactoryLayer(options.sandboxMetrics)
-  const runtimeLayer = Layer.fresh(RlmRuntimeLive)
-  const base = Layer.mergeAll(model, sandbox, runtimeLayer)
+  const runtimeWithBridgeStore = Layer.fresh(Layer.merge(
+    RlmRuntimeLive,
+    Layer.provide(BridgeStoreLive, RlmRuntimeLive)
+  ))
+  const base = Layer.mergeAll(model, sandbox, runtimeWithBridgeStore)
   const configLayer = Layer.succeed(RlmConfig, { ...defaultConfig, ...options.config })
   return Layer.provideMerge(base, configLayer)
 }
