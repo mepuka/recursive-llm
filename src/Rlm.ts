@@ -14,10 +14,12 @@ import { renderSubmitAnswer } from "./SubmitTool"
 import type { RlmToolAny } from "./RlmTool"
 import { BridgeStoreLive } from "./scheduler/BridgeStore"
 import { JSONSchema } from "effect"
+import type { ContextMetadata } from "./ContextMetadata"
 
 export interface CompleteOptionsBase {
   readonly query: string
   readonly context: string
+  readonly contextMetadata?: ContextMetadata
   readonly depth?: number
   readonly tools?: ReadonlyArray<RlmToolAny>
 }
@@ -41,6 +43,9 @@ export interface RlmService {
 const toSchedulerOptions = (options: CompleteOptionsBase & { readonly outputSchema?: Schema.Schema<any, any, never> }): RunSchedulerOptions => ({
   query: options.query,
   context: options.context,
+  ...(options.contextMetadata !== undefined
+    ? { contextMetadata: options.contextMetadata }
+    : {}),
   ...(options.depth !== undefined ? { depth: options.depth } : {}),
   ...(options.tools !== undefined && options.tools.length > 0 ? { tools: options.tools } : {}),
   ...(options.outputSchema !== undefined

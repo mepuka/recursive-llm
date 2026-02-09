@@ -3,6 +3,7 @@ import type { SandboxInstance, VariableMetadata } from "./Sandbox"
 import type { BridgeRequestId, CallId } from "./RlmTypes"
 import { TranscriptEntry } from "./RlmTypes"
 import type { RlmToolAny } from "./RlmTool"
+import type { ContextMetadata } from "./ContextMetadata"
 
 export interface VariableSnapshot {
   readonly variables: ReadonlyArray<VariableMetadata>
@@ -16,6 +17,7 @@ export interface CallContext {
   readonly depth: number
   readonly query: string
   readonly context: string
+  readonly contextMetadata?: ContextMetadata
   readonly callScope: Scope.CloseableScope
   readonly sandbox: SandboxInstance
   readonly parentBridgeRequestId?: BridgeRequestId
@@ -32,6 +34,7 @@ export interface MakeCallContextOptions {
   readonly depth: number
   readonly query: string
   readonly context: string
+  readonly contextMetadata?: ContextMetadata
   readonly callScope: Scope.CloseableScope
   readonly sandbox: SandboxInstance
   readonly parentBridgeRequestId?: BridgeRequestId

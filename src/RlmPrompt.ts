@@ -1,5 +1,6 @@
 import * as Prompt from "@effect/ai/Prompt"
 import type { TranscriptEntry } from "./RlmTypes"
+import { formatContextHint, type ContextMetadata } from "./ContextMetadata"
 
 export const MAX_OUTPUT_CHARS = 4_000
 export const CONTEXT_PREVIEW_CHARS = 200
@@ -37,10 +38,37 @@ export const truncateExecutionOutput = (output: string, maxChars = MAX_OUTPUT_CH
 export interface BuildReplPromptOptions {
   readonly systemPrompt: string
   readonly query: string
-  readonly contextLength: number
-  readonly contextPreview: string
+  readonly contextMetadata?: ContextMetadata
+  readonly contextLength?: number
+  readonly contextPreview?: string
   readonly transcript: ReadonlyArray<TranscriptEntry>
   readonly enablePromptCaching?: boolean
+}
+
+const formatLegacyContextHint = (
+  contextLength: number,
+  contextPreview: string,
+  tense: "present" | "past"
+): string =>
+  tense === "present"
+    ? `[Context available in __vars.context (${contextLength} chars). Preview: ${contextPreview}...]`
+    : `[Context was available in __vars.context (${contextLength} chars). Preview: ${contextPreview}...]`
+
+const toPastTenseHint = (hint: string): string =>
+  hint.replace("[Context available in __vars.context", "[Context was available in __vars.context")
+
+const resolveContextHint = (
+  options: Pick<BuildReplPromptOptions, "contextMetadata" | "contextLength" | "contextPreview">,
+  tense: "present" | "past"
+): string | undefined => {
+  if (options.contextMetadata !== undefined) {
+    const hint = formatContextHint(options.contextMetadata)
+    return tense === "present" ? hint : toPastTenseHint(hint)
+  }
+
+  const contextLength = options.contextLength ?? 0
+  if (contextLength <= 0) return undefined
+  return formatLegacyContextHint(contextLength, options.contextPreview ?? "", tense)
 }
 
 export const buildReplPrompt = (options: BuildReplPromptOptions): Prompt.Prompt => {
@@ -53,12 +81,17 @@ export const buildReplPrompt = (options: BuildReplPromptOptions): Prompt.Prompt 
   }, enablePromptCaching))
 
   const isFirstIteration = options.transcript.length === 0
-  const safeguard = isFirstIteration && options.contextLength > 0
-    ? "You have not seen the context yet. Explore it with code first — do not call SUBMIT() immediately.\n\n"
+  const contextHint = resolveContextHint(options, "present")
+  const hasContext = contextHint !== undefined
+  const hasMetadata = options.contextMetadata !== undefined
+  const safeguard = isFirstIteration && hasContext
+    ? hasMetadata
+      ? "You have not seen the full context yet. Use __vars.contextMeta to understand the data shape, then start processing.\n\n"
+      : "You have not seen the context yet. Explore it with code first — do not call SUBMIT() immediately.\n\n"
     : ""
 
-  const userContent = options.contextLength > 0
-    ? `${safeguard}${options.query}\n\n[Context available in __vars.context (${options.contextLength} chars). Preview: ${options.contextPreview}...]`
+  const userContent = contextHint !== undefined
+    ? `${safeguard}${options.query}\n\n${contextHint}`
     : options.query
   messages.push(withPromptCacheOptions({
     role: "user",
@@ -118,8 +151,9 @@ export const buildOneShotPrompt = (options: BuildOneShotPromptOptions): Prompt.P
 export interface BuildExtractPromptOptions {
   readonly systemPrompt: string
   readonly query: string
-  readonly contextLength: number
-  readonly contextPreview: string
+  readonly contextMetadata?: ContextMetadata
+  readonly contextLength?: number
+  readonly contextPreview?: string
   readonly transcript: ReadonlyArray<TranscriptEntry>
   readonly enablePromptCaching?: boolean
 }
@@ -133,8 +167,9 @@ export const buildExtractPrompt = (options: BuildExtractPromptOptions): Prompt.P
     content: options.systemPrompt
   }, enablePromptCaching))
 
-  const userContent = options.contextLength > 0
-    ? `${options.query}\n\n[Context was available in __vars.context (${options.contextLength} chars). Preview: ${options.contextPreview}...]`
+  const contextHint = resolveContextHint(options, "past")
+  const userContent = contextHint !== undefined
+    ? `${options.query}\n\n${contextHint}`
     : options.query
   messages.push({ role: "user", content: userContent })
 

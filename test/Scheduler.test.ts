@@ -11,6 +11,7 @@ import { BridgeRequestId, CallId, RlmCommand } from "../src/RlmTypes"
 import { runScheduler } from "../src/Scheduler"
 import * as RlmTool from "../src/RlmTool"
 import { BridgeStoreLive } from "../src/scheduler/BridgeStore"
+import { analyzeContext } from "../src/ContextMetadata"
 import { makeFakeRlmModelLayer, type FakeModelMetrics, type FakeModelResponse } from "./helpers/FakeRlmModel"
 import { makeFakeSandboxFactoryLayer, type FakeSandboxMetrics } from "./helpers/FakeSandboxFactory"
 import { makeCustomSandboxFactoryLayer } from "./helpers/CustomSandboxFactory"
@@ -1221,5 +1222,57 @@ describe("Scheduler tool dispatch (e2e with real sandbox)", () => {
     )
     expect(execCompleted).toBeDefined()
     expect(execCompleted!.output).toBe("what is the answer|the answer is 42")
+  }, 15_000)
+
+  test("context metadata is injected into __vars.contextMeta and included in first prompt", async () => {
+    const csvContext = "id,name\n1,Alice\n2,Bob"
+    const modelMetrics: FakeModelMetrics = { calls: 0, prompts: [], depths: [] }
+
+    const events = await Effect.runPromise(
+      stream({
+        query: "inspect metadata",
+        context: csvContext,
+        contextMetadata: analyzeContext(csvContext, "people.csv")
+      }).pipe(
+        Stream.runCollect,
+        Effect.provide(makeRealSandboxLayers({
+          responses: [
+            { text: "```js\nprint(JSON.stringify(__vars.contextMeta))\n```" },
+            submitAnswer("done")
+          ],
+          modelMetrics
+        })),
+        Effect.timeout("10 seconds")
+      )
+    )
+
+    const eventList = Chunk.toReadonlyArray(events)
+    const execCompleted = eventList.find(
+      (e): e is Extract<typeof e, { _tag: "CodeExecutionCompleted" }> =>
+        e._tag === "CodeExecutionCompleted"
+    )
+    expect(execCompleted).toBeDefined()
+
+    const contextMeta = JSON.parse(execCompleted!.output) as {
+      readonly fileName?: string
+      readonly format?: string
+      readonly lines?: number
+      readonly recordCount?: number
+      readonly fields?: ReadonlyArray<string>
+    }
+    expect(contextMeta.fileName).toBe("people.csv")
+    expect(contextMeta.format).toBe("csv")
+    expect(contextMeta.lines).toBe(3)
+    expect(contextMeta.recordCount).toBe(2)
+    expect(contextMeta.fields).toEqual(["id", "name"])
+
+    const firstPrompt = modelMetrics.prompts[0]!
+    const firstUserMessage = firstPrompt.content.find((m) => m.role === "user")
+    const firstUserText = firstUserMessage?.role === "user"
+      ? (firstUserMessage.content as ReadonlyArray<{ readonly text: string }>)[0]!.text
+      : ""
+    expect(firstUserText).toContain("Source: people.csv")
+    expect(firstUserText).toContain("Format: CSV")
+    expect(firstUserText).toContain("Fields: id, name")
   }, 15_000)
 })

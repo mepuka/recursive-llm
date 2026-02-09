@@ -83,10 +83,11 @@ describe("SystemPrompt", () => {
     expect(prompt).toContain("LLM calls remaining: 19")
   })
 
-  test("REPL prompt instructs to access __vars.context and __vars.query", () => {
+  test("REPL prompt instructs to access __vars.context, __vars.query, and __vars.contextMeta", () => {
     const prompt = buildReplSystemPrompt(baseOptions)
     expect(prompt).toContain("__vars.context")
     expect(prompt).toContain("__vars.query")
+    expect(prompt).toContain("__vars.contextMeta")
   })
 
   test("REPL prompt does NOT contain actual context content", () => {

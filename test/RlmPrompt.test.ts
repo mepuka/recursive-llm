@@ -9,6 +9,7 @@ import {
   MAX_ONESHOT_CONTEXT_CHARS
 } from "../src/RlmPrompt"
 import { TranscriptEntry } from "../src/RlmTypes"
+import { analyzeContext } from "../src/ContextMetadata"
 
 const hasEphemeralCacheControl = (message: unknown): boolean => {
   if (typeof message !== "object" || message === null) return false
@@ -84,6 +85,29 @@ describe("buildReplPrompt", () => {
     expect(textContent).toContain("The quick brown fox")
     // Should NOT contain the full context
     expect(textContent).not.toContain("x".repeat(5000))
+  })
+
+  test("metadata hint includes file format details when contextMetadata is provided", () => {
+    const contextMetadata = analyzeContext(
+      "{\"author\":\"a\",\"text\":\"hello\",\"authorProfile\":{\"displayName\":\"A\"}}\n{\"author\":\"b\",\"text\":\"world\"}",
+      "feed.ndjson"
+    )
+    const prompt = buildReplPrompt({
+      systemPrompt: "system",
+      query: "summarize",
+      contextMetadata,
+      transcript: []
+    })
+    const userMsg = prompt.content[1]!
+    expect(userMsg.role).toBe("user")
+    const textContent = userMsg.role === "user"
+      ? (userMsg.content as ReadonlyArray<{ readonly text: string }>)[0]!.text
+      : ""
+
+    expect(textContent).toContain("Source: feed.ndjson")
+    expect(textContent).toContain("Format: NDJSON")
+    expect(textContent).toContain("Fields:")
+    expect(textContent).toContain("authorProfile.displayName")
   })
 
   test("with transcript → alternating assistant/user messages", () => {
@@ -209,6 +233,22 @@ describe("buildReplPrompt iteration-0 safeguard", () => {
     expect(textContent).toContain("You have not seen the context yet")
   })
 
+  test("empty transcript + metadata context > 0 → safeguard references __vars.contextMeta", () => {
+    const contextMetadata = analyzeContext("id,name\n1,Alice\n2,Bob", "people.csv")
+    const prompt = buildReplPrompt({
+      systemPrompt: "system",
+      query: "summarize",
+      contextMetadata,
+      transcript: []
+    })
+    const userMsg = prompt.content[1]!
+    const textContent = userMsg.role === "user"
+      ? (userMsg.content as ReadonlyArray<{ readonly text: string }>)[0]!.text
+      : ""
+    expect(textContent).toContain("You have not seen the full context yet")
+    expect(textContent).toContain("__vars.contextMeta")
+  })
+
   test("empty transcript + context = 0 → no safeguard", () => {
     const prompt = buildReplPrompt({
       systemPrompt: "system",
@@ -325,6 +365,23 @@ describe("buildExtractPrompt", () => {
       : ""
     expect(textContent).toContain("Context was available")
     expect(textContent).toContain("500 chars")
+  })
+
+  test("metadata hint in extract prompt includes source and format", () => {
+    const contextMetadata = analyzeContext("id,name\n1,Alice\n2,Bob", "people.csv")
+    const prompt = buildExtractPrompt({
+      systemPrompt: "system",
+      query: "summarize",
+      contextMetadata,
+      transcript: []
+    })
+    const userMsg = prompt.content[1]!
+    const textContent = userMsg.role === "user"
+      ? (userMsg.content as ReadonlyArray<{ readonly text: string }>)[0]!.text
+      : ""
+    expect(textContent).toContain("Context was available in __vars.context")
+    expect(textContent).toContain("Source: people.csv")
+    expect(textContent).toContain("Format: CSV")
   })
 
   test("empty output shows '(no output)' hint", () => {

@@ -23,8 +23,7 @@ import {
   buildReplPrompt,
   buildOneShotPrompt,
   buildExtractPrompt,
-  truncateExecutionOutput,
-  CONTEXT_PREVIEW_CHARS
+  truncateExecutionOutput
 } from "./RlmPrompt"
 import { buildReplSystemPrompt, buildOneShotSystemPrompt, buildExtractSystemPrompt } from "./SystemPrompt"
 import { extractSubmitAnswer, renderSubmitAnswer, SUBMIT_TOOL_NAME, submitToolkit } from "./SubmitTool"
@@ -36,12 +35,14 @@ import { getCallStateOption, getCallStateOrWarn, deleteCallState, setCallState }
 import { BridgeStore } from "./scheduler/BridgeStore"
 import { publishEvent, publishSchedulerWarning } from "./scheduler/Events"
 import { enqueue, enqueueOrWarn } from "./scheduler/Queue"
+import { analyzeContext, type ContextMetadata } from "./ContextMetadata"
 
 import type { RlmToolAny } from "./RlmTool"
 
 export interface RunSchedulerOptions {
   readonly query: string
   readonly context: string
+  readonly contextMetadata?: ContextMetadata
   readonly depth?: number
   readonly rootCallId?: CallId
   readonly tools?: ReadonlyArray<RlmToolAny>
@@ -88,6 +89,19 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
   const failBridgeDeferred = (bridgeRequestId: BridgeRequestId, error: unknown) =>
     bridgeStore.fail(bridgeRequestId, error).pipe(Effect.asVoid)
 
+  const deriveContextMetadata = (command: Extract<RlmCommand, { readonly _tag: "StartCall" }>): ContextMetadata | undefined => {
+    if (command.callId === rootCallId) {
+      if (options.contextMetadata !== undefined) return options.contextMetadata
+      return command.context.length > 0
+        ? analyzeContext(command.context)
+        : undefined
+    }
+
+    return command.context.length > 0
+      ? analyzeContext(command.context)
+      : undefined
+  }
+
   // --- handleStartCall ---
 
   const handleStartCall = (command: Extract<RlmCommand, { readonly _tag: "StartCall" }>) =>
@@ -112,11 +126,16 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
             : {})
         }).pipe(Effect.provideService(Scope.Scope, callScope))
 
+        const contextMetadata = deriveContextMetadata(command)
+
         const state = yield* makeCallContext({
           callId: command.callId,
           depth: command.depth,
           query: command.query,
           context: command.context,
+          ...(contextMetadata !== undefined
+            ? { contextMetadata }
+            : {}),
           sandbox,
           callScope,
           ...(command.parentBridgeRequestId !== undefined
@@ -135,6 +154,25 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
           context: command.context,
           query: command.query
         })
+        if (contextMetadata !== undefined) {
+          yield* vars.inject("contextMeta", {
+            ...(contextMetadata.fileName !== undefined
+              ? { fileName: contextMetadata.fileName }
+              : {}),
+            format: contextMetadata.format,
+            chars: contextMetadata.chars,
+            lines: contextMetadata.lines,
+            ...(contextMetadata.fields !== undefined
+              ? { fields: contextMetadata.fields }
+              : {}),
+            ...(contextMetadata.recordCount !== undefined
+              ? { recordCount: contextMetadata.recordCount }
+              : {}),
+            ...(contextMetadata.sampleRecord !== undefined
+              ? { sampleRecord: contextMetadata.sampleRecord }
+              : {})
+          })
+        }
 
         yield* setCallState(command.callId, state)
 
@@ -234,8 +272,9 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
             : {})
         }),
         query: callState.query,
-        contextLength: callState.context.length,
-        contextPreview: callState.context.slice(0, CONTEXT_PREVIEW_CHARS),
+        ...(callState.contextMetadata !== undefined || callState.context.length > 0
+          ? { contextMetadata: callState.contextMetadata ?? analyzeContext(callState.context) }
+          : {}),
         transcript,
         enablePromptCaching: config.enablePromptCaching
       })
@@ -382,8 +421,9 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
           const extractPrompt = buildExtractPrompt({
             systemPrompt: buildExtractSystemPrompt(callState.outputJsonSchema),
             query: callState.query,
-            contextLength: callState.context.length,
-            contextPreview: callState.context.slice(0, CONTEXT_PREVIEW_CHARS),
+            ...(callState.contextMetadata !== undefined || callState.context.length > 0
+              ? { contextMetadata: callState.contextMetadata ?? analyzeContext(callState.context) }
+              : {}),
             transcript,
             enablePromptCaching: config.enablePromptCaching
           })
