@@ -7,7 +7,8 @@ const baseArgs: CliArgs = {
   provider: "anthropic",
   model: "model-a",
   quiet: false,
-  noColor: false
+  noColor: false,
+  nlpTools: false
 }
 
 describe("CliLayer config mapping", () => {
@@ -66,5 +67,15 @@ describe("CliLayer config mapping", () => {
 
     expect(config.subLlmDelegation.enabled).toBe(false)
     expect(config.subLlmDelegation.depthThreshold).toBe(3)
+  })
+
+  test("uses CLI defaults for max limits", () => {
+    const config = makeCliConfig({
+      ...baseArgs
+    })
+
+    expect(config.maxIterations).toBe(50)
+    expect(config.maxDepth).toBe(1)
+    expect(config.maxLlmCalls).toBe(200)
   })
 })

@@ -22,6 +22,7 @@ export interface CliArgs {
   maxLlmCalls?: number
   quiet: boolean
   noColor: boolean
+  nlpTools: boolean
 }
 
 export const buildRlmModelLayer = (cliArgs: CliArgs): Layer.Layer<RlmModel, never, never> => {
