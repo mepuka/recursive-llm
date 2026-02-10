@@ -1,7 +1,7 @@
 import { AnthropicClient } from "@effect/ai-anthropic"
 import { GoogleClient } from "@effect/ai-google"
 import { OpenAiClient } from "@effect/ai-openai"
-import { FetchHttpClient } from "@effect/platform"
+import { FetchHttpClient, HttpClient, HttpClientRequest } from "@effect/platform"
 import { Layer, Redacted } from "effect"
 import { Rlm, rlmBunLayer } from "./Rlm"
 import { RlmConfig, type RlmConfigService, type RlmProvider } from "./RlmConfig"
@@ -51,8 +51,23 @@ export const buildRlmModelLayer = (cliArgs: CliArgs): Layer.Layer<RlmModel, neve
   }
 
   if (cliArgs.provider === "google") {
+    const useVertexAi = Bun.env.GOOGLE_API_URL !== undefined
     const clientLayer = GoogleClient.layer({
-      apiKey: Redacted.make(Bun.env.GOOGLE_API_KEY!)
+      apiKey: Redacted.make(Bun.env.GOOGLE_API_KEY!),
+      ...(useVertexAi ? {
+        apiUrl: Bun.env.GOOGLE_API_URL,
+        // Vertex AI uses /v1/publishers/google/models/{model}:method
+        // Effect AI generates /v1beta/models/{model}:method — rewrite the path
+        transformClient: (client: HttpClient.HttpClient) =>
+          HttpClient.mapRequest(client, (req) => {
+            const url = new URL(req.url)
+            url.pathname = url.pathname.replace(
+              /\/v1beta\/models\//,
+              "/v1/publishers/google/models/"
+            )
+            return HttpClientRequest.setUrl(req, url.toString())
+          })
+      } : {})
     })
 
     const modelLayer = makeGoogleRlmModel({

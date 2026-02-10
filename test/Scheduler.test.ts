@@ -648,7 +648,10 @@ describe("Scheduler integration", () => {
         Effect.either,
         Effect.provide(
           makeLayers({
-            responses: [submitAnswer("ok")],
+            responses: [
+              { text: "```js\nprint('inspecting')\n```" },
+              submitAnswer("ok")
+            ],
             modelMetrics
           })
         )

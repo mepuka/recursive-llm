@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { Effect, Exit, Fiber, Layer, Scope } from "effect"
+import { Duration, Effect, Exit, Fiber, Layer, Scope } from "effect"
 import { BridgeHandler } from "../src/BridgeHandler"
 import { SandboxError } from "../src/RlmError"
 import { SandboxConfig, SandboxFactory } from "../src/Sandbox"
@@ -504,4 +504,74 @@ describe("SandboxBun", () => {
     expect(bridgeCalls[0]!.method).toBe("add")
     expect(bridgeCalls[1]!.method).toBe("multiply")
   })
+
+  test("activity-aware timeout extends deadline on bridge calls", async () => {
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function*() {
+          const factory = yield* SandboxFactory
+          const sandbox = yield* factory.create({ callId: "test" as CallId, depth: 0 })
+          // 3 sequential llm_query calls, each takes ~200ms via bridge handler delay.
+          // Total exec time ~600ms, well past the 300ms executeTimeoutMs.
+          // Activity-aware timeout should extend deadline on each bridge call.
+          return yield* sandbox.execute(`
+            const r1 = await llm_query("q1", "ctx")
+            const r2 = await llm_query("q2", "ctx")
+            const r3 = await llm_query("q3", "ctx")
+            print(r1 + "," + r2 + "," + r3)
+          `)
+        })
+      ).pipe(
+        Effect.provide(
+          makeTestLayer(
+            ({ args }) =>
+              Effect.succeed(`answer-${args[0]}`).pipe(
+                Effect.delay(Duration.millis(200))
+              ),
+            { executeTimeoutMs: 300 }
+          )
+        ),
+        Effect.timeout("15 seconds")
+      )
+    )
+
+    expect(result).toBe("answer-q1,answer-q2,answer-q3")
+  }, 20_000)
+
+  test("timeout fires after bridge activity stops and sandbox hangs", async () => {
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function*() {
+          const factory = yield* SandboxFactory
+          const sandbox = yield* factory.create({ callId: "test" as CallId, depth: 0 })
+          // One bridge call (extends deadline), then infinite hang.
+          // Timeout should fire 300ms after bridge activity ends.
+          return yield* sandbox.execute(`
+            const r = await llm_query("q1", "ctx")
+            await new Promise(() => {})
+          `).pipe(Effect.either)
+        })
+      ).pipe(
+        Effect.provide(
+          makeTestLayer(
+            ({ args }) =>
+              Effect.succeed(`answer-${args[0]}`).pipe(
+                Effect.delay(Duration.millis(50))
+              ),
+            { executeTimeoutMs: 300 }
+          )
+        ),
+        Effect.timeout("10 seconds")
+      )
+    )
+
+    expect(result).not.toBeUndefined()
+    if (result && "_tag" in result) {
+      expect(result._tag).toBe("Left")
+      if (result._tag === "Left") {
+        expect(result.left).toBeInstanceOf(SandboxError)
+        expect(result.left.message).toContain("timed out")
+      }
+    }
+  }, 15_000)
 })

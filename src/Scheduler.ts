@@ -3,9 +3,11 @@ import { consumeIteration, recordTokens, reserveLlmCall, snapshot, withLlmPermit
 import {
   appendTranscript,
   attachExecutionOutput,
+  hasCodeExecuted,
   incrementConsecutiveStalls,
   incrementIteration,
   makeCallContext,
+  markCodeExecuted,
   readIteration,
   readTranscript,
   resetConsecutiveStalls
@@ -359,40 +361,50 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
       })
       const isSubCall = callState.parentBridgeRequestId !== undefined
       const outputMode = callState.outputJsonSchema !== undefined ? "structured" as const : "plain" as const
-      const toolkit = buildSubmitToolkit(outputMode)
-      const response = yield* withLlmPermit(
-        rlmModel.generateText({
-          prompt,
-          depth: callState.depth,
-          isSubCall,
-          toolkit,
-          toolChoice: "auto",
-          disableToolCallResolution: true
-        })
-      ).pipe(
-        Effect.catchAll((error) =>
-          Effect.gen(function*() {
-            yield* publishSchedulerWarning({
-              code: "TOOLKIT_DEGRADED",
-              message: `Tool-enabled generation failed; retrying this iteration without tool calling (${formatExecutionError(error)})`,
-              callId: callState.callId,
-              commandTag: command._tag
+
+      // Gate SUBMIT tool: only expose when code has been executed (model has done real work).
+      // For no-context or trivial-context calls (< 200 chars), SUBMIT is always available
+      // since there's no meaningful data to explore first.
+      const submitReady = (yield* hasCodeExecuted(callState)) || callState.context.length < 200
+
+      const response = submitReady
+        ? yield* withLlmPermit(
+            rlmModel.generateText({
+              prompt,
+              depth: callState.depth,
+              isSubCall,
+              toolkit: buildSubmitToolkit(outputMode),
+              toolChoice: "auto",
+              disableToolCallResolution: true
             })
-
-            // Fallback call consumes another LLM budget slot.
-            yield* reserveLlmCall(callState.callId)
-
-            return yield* withLlmPermit(
-              rlmModel.generateText({
-                prompt,
-                depth: callState.depth,
-                isSubCall,
-                toolChoice: "none"
+          ).pipe(
+            Effect.catchAll((error) =>
+              Effect.gen(function*() {
+                yield* publishSchedulerWarning({
+                  code: "TOOLKIT_DEGRADED",
+                  message: `Tool-enabled generation failed; retrying this iteration without tool calling (${formatExecutionError(error)})`,
+                  callId: callState.callId,
+                  commandTag: command._tag
+                })
+                yield* reserveLlmCall(callState.callId)
+                return yield* withLlmPermit(
+                  rlmModel.generateText({
+                    prompt,
+                    depth: callState.depth,
+                    isSubCall,
+                    toolChoice: "none"
+                  })
+                )
               })
             )
-          })
-        )
-      )
+          )
+        : yield* withLlmPermit(
+            rlmModel.generateText({
+              prompt,
+              depth: callState.depth,
+              isSubCall
+            })
+          )
 
       yield* recordTokens(callState.callId, response.usage.totalTokens)
 
@@ -724,6 +736,7 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
         output: command.output
       }))
 
+      yield* markCodeExecuted(callState)
       yield* attachExecutionOutput(
         callState,
         truncateExecutionOutput(command.output, config.maxExecutionOutputChars)

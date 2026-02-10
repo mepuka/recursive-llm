@@ -33,5 +33,8 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 # Finder (MacOS) folder config
 .DS_Store
 
+# RLM run traces
+.rlm/
+
 # Effect source reference
 .reference/

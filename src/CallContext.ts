@@ -27,6 +27,7 @@ export interface CallContext {
   readonly transcript: Ref.Ref<ReadonlyArray<TranscriptEntry>>
   readonly variableSnapshot: Ref.Ref<VariableSnapshot>
   readonly consecutiveStalls: Ref.Ref<number>
+  readonly codeExecuted: Ref.Ref<boolean>
 }
 
 export interface MakeCallContextOptions {
@@ -52,13 +53,15 @@ export const makeCallContext = (options: MakeCallContextOptions): Effect.Effect<
       syncedAtMs: Date.now()
     })
     const consecutiveStalls = yield* Ref.make(0)
+    const codeExecuted = yield* Ref.make(false)
 
     return {
       ...options,
       iteration,
       transcript,
       variableSnapshot,
-      consecutiveStalls
+      consecutiveStalls,
+      codeExecuted
     }
   })
 
@@ -79,6 +82,12 @@ export const resetConsecutiveStalls = (ctx: CallContext): Effect.Effect<void> =>
 
 export const incrementConsecutiveStalls = (ctx: CallContext): Effect.Effect<number> =>
   Ref.updateAndGet(ctx.consecutiveStalls, (n) => n + 1)
+
+export const markCodeExecuted = (ctx: CallContext): Effect.Effect<void> =>
+  Ref.set(ctx.codeExecuted, true)
+
+export const hasCodeExecuted = (ctx: CallContext): Effect.Effect<boolean> =>
+  Ref.get(ctx.codeExecuted)
 
 export const appendTranscript = (
   ctx: CallContext,

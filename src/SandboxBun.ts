@@ -1,4 +1,4 @@
-import { Data, Deferred, Duration, Effect, FiberSet, Layer, Match, Option, Queue, Ref, Runtime, Stream } from "effect"
+import { Clock, Data, Deferred, Duration, Effect, Fiber, FiberSet, Layer, Match, Option, Queue, Ref, Runtime, Stream } from "effect"
 import { BridgeHandler } from "./BridgeHandler"
 import { SandboxError } from "./RlmError"
 import { SandboxConfig, SandboxFactory, type SandboxInstance, type VariableMetadata } from "./Sandbox"
@@ -21,6 +21,7 @@ interface SandboxState {
   readonly pendingRequests: Ref.Ref<Map<string, Deferred.Deferred<unknown, SandboxError>>>
   readonly config: SandboxConfig["Type"]
   readonly callId: CallId
+  readonly executeDeadline: Ref.Ref<number>
 }
 
 // --- Helpers ---
@@ -74,6 +75,73 @@ const forceTerminateProcess = (
 
     yield* killProcess(proc, 9)
     yield* waitForExitWithin(proc, graceMs).pipe(Effect.ignore)
+  })
+
+const executeDeadlineWatchdog = (deadlineRef: Ref.Ref<number>): Effect.Effect<void> =>
+  Effect.suspend(() =>
+    Effect.gen(function*() {
+      const deadline = yield* Ref.get(deadlineRef)
+      const now = yield* Clock.currentTimeMillis
+      const remaining = deadline - now
+      if (remaining <= 0) return
+      yield* Effect.sleep(Duration.millis(remaining))
+      yield* executeDeadlineWatchdog(deadlineRef)
+    })
+  )
+
+const sendExecuteRequest = (
+  state: SandboxState,
+  message: unknown,
+  requestId: string
+) =>
+  Effect.gen(function*() {
+    const h = yield* Ref.get(state.health)
+    if (h !== "alive") return yield* new SandboxError({ message: "Sandbox is dead" })
+
+    if (!checkFrameSize(message, state.config.maxFrameBytes)) {
+      return yield* new SandboxError({ message: "Request exceeds max frame size" })
+    }
+
+    const deferred = yield* Deferred.make<string, SandboxError>()
+    yield* Ref.update(state.pendingRequests, (m) =>
+      new Map([...m, [requestId, deferred as Deferred.Deferred<unknown, SandboxError>]])
+    )
+
+    return yield* Effect.gen(function*() {
+      yield* trySend(state.proc, message)
+
+      // Set initial deadline
+      const now = yield* Clock.currentTimeMillis
+      yield* Ref.set(state.executeDeadline, now + state.config.executeTimeoutMs)
+
+      // Fork watchdog — when it completes (deadline expired), fail the deferred and kill sandbox
+      const watchdog = yield* Effect.fork(
+        executeDeadlineWatchdog(state.executeDeadline).pipe(
+          Effect.andThen(
+            Effect.uninterruptible(
+              Effect.gen(function*() {
+                yield* Deferred.fail(deferred, new SandboxError({ message: `Request ${requestId} timed out` }))
+                yield* Ref.set(state.health, "dead")
+                yield* failAllPending(state.pendingRequests, "Sandbox killed after timeout")
+                yield* forceTerminateProcess(state.proc, state.config.shutdownGraceMs)
+              })
+            )
+          )
+        )
+      )
+
+      return yield* Deferred.await(deferred).pipe(
+        Effect.ensuring(Fiber.interrupt(watchdog))
+      ) as string
+    }).pipe(
+      Effect.ensuring(
+        Ref.update(state.pendingRequests, (m) => {
+          const n = new Map(m)
+          n.delete(requestId)
+          return n
+        })
+      )
+    )
   })
 
 const sendRequest = <A>(
@@ -150,9 +218,14 @@ const dispatchFrame = (
   bridgeSemaphore: Effect.Semaphore,
   config: SandboxConfig["Type"],
   callerCallId: CallId,
-  bridgeFibers: FiberSet.FiberSet<void, SandboxError>
-): Effect.Effect<void, never, never> =>
-  Match.value(frame).pipe(
+  bridgeFibers: FiberSet.FiberSet<void, SandboxError>,
+  executeDeadline: Ref.Ref<number>
+): Effect.Effect<void, never, never> => {
+  const extendDeadline = Clock.currentTimeMillis.pipe(
+    Effect.flatMap((now) => Ref.set(executeDeadline, now + config.executeTimeoutMs))
+  )
+
+  return Match.value(frame).pipe(
     Match.tagsExhaustive({
       ExecResult: (f) =>
         resolveRequest(pendingRequests, f.requestId, "ExecResult", callerCallId,
@@ -181,24 +254,31 @@ const dispatchFrame = (
           }).pipe(Effect.ignore)
         }
 
-        // Fork bridge call handling into FiberSet for automatic cleanup on scope close
-        return FiberSet.run(bridgeFibers)(
-          bridgeSemaphore.withPermits(1)(
-            bridgeHandler.handle({
-              method: f.method,
-              args: f.args,
-              callerCallId
-            }).pipe(
-              Effect.flatMap((result) => {
-                const response = { _tag: "BridgeResult" as const, requestId: f.requestId, result }
-                if (!checkFrameSize(response, config.maxFrameBytes)) {
-                  return trySend(proc, { _tag: "BridgeFailed", requestId: f.requestId, message: "Result too large" })
-                }
-                return trySend(proc, response)
-              }),
-              Effect.catchAll((err) =>
-                trySend(proc, { _tag: "BridgeFailed", requestId: f.requestId, message: String(err) }).pipe(
-                  Effect.ignore
+        // Extend deadline — sandbox is alive and requesting bridge work
+        return extendDeadline.pipe(
+          Effect.flatMap(() =>
+            // Fork bridge call handling into FiberSet for automatic cleanup on scope close
+            FiberSet.run(bridgeFibers)(
+              bridgeSemaphore.withPermits(1)(
+                bridgeHandler.handle({
+                  method: f.method,
+                  args: f.args,
+                  callerCallId
+                }).pipe(
+                  Effect.flatMap((result) => {
+                    const response = { _tag: "BridgeResult" as const, requestId: f.requestId, result }
+                    if (!checkFrameSize(response, config.maxFrameBytes)) {
+                      return trySend(proc, { _tag: "BridgeFailed", requestId: f.requestId, message: "Result too large" })
+                    }
+                    return trySend(proc, response)
+                  }),
+                  Effect.catchAll((err) =>
+                    trySend(proc, { _tag: "BridgeFailed", requestId: f.requestId, message: String(err) }).pipe(
+                      Effect.ignore
+                    )
+                  ),
+                  // Extend deadline after bridge handler completes — sandbox is about to resume
+                  Effect.ensuring(extendDeadline)
                 )
               )
             )
@@ -212,6 +292,7 @@ const dispatchFrame = (
         })
     })
   )
+}
 
 // --- Shutdown ---
 
@@ -254,6 +335,7 @@ const createSandboxInstance = (
     const incomingFrames = yield* Queue.bounded<WorkerToHost>(config.incomingFrameQueueCapacity)
     const bridgeSemaphore = yield* Effect.makeSemaphore(config.maxBridgeConcurrency)
     const bridgeFibers = yield* FiberSet.make<void, SandboxError>()
+    const executeDeadline = yield* Ref.make<number>(0)
     const runtime = yield* Effect.runtime<never>()
     const runFork = Runtime.runFork(runtime)
 
@@ -335,7 +417,7 @@ const createSandboxInstance = (
     yield* Effect.forkScoped(
       Stream.fromQueue(incomingFrames).pipe(
         Stream.runForEach((frame) =>
-          dispatchFrame(frame, pendingRequests, proc, bridgeHandler, bridgeSemaphore, config, options.callId, bridgeFibers)
+          dispatchFrame(frame, pendingRequests, proc, bridgeHandler, bridgeSemaphore, config, options.callId, bridgeFibers, executeDeadline)
         )
       )
     )
@@ -352,16 +434,15 @@ const createSandboxInstance = (
         : {})
     })
 
-    const state: SandboxState = { proc, health, pendingRequests, config, callId: options.callId }
+    const state: SandboxState = { proc, health, pendingRequests, config, callId: options.callId, executeDeadline }
 
     return {
       execute: (code: string) => {
         const requestId = crypto.randomUUID()
-        return sendRequest<string>(
+        return sendExecuteRequest(
           state,
           { _tag: "ExecRequest", requestId, code },
-          requestId,
-          config.executeTimeoutMs
+          requestId
         )
       },
       setVariable: (name: string, value: unknown) => {
