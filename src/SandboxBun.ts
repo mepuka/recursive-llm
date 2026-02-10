@@ -125,6 +125,23 @@ const sendRequest = <A>(
 
 // --- Frame dispatch ---
 
+const resolveRequest = <A>(
+  pendingRequests: Ref.Ref<Map<string, Deferred.Deferred<unknown, SandboxError>>>,
+  requestId: string,
+  tag: string,
+  callerCallId: CallId,
+  resolve: (deferred: Deferred.Deferred<unknown, SandboxError>) => Effect.Effect<void>
+): Effect.Effect<void> =>
+  Effect.gen(function*() {
+    const pending = yield* Ref.get(pendingRequests)
+    const deferred = pending.get(requestId)
+    if (deferred) {
+      yield* resolve(deferred)
+    } else {
+      yield* Effect.logDebug(`[sandbox:${callerCallId}] Stale ${tag} for request ${requestId.slice(0, 8)} (likely timed out)`)
+    }
+  })
+
 const dispatchFrame = (
   frame: WorkerToHost,
   pendingRequests: Ref.Ref<Map<string, Deferred.Deferred<unknown, SandboxError>>>,
@@ -138,47 +155,23 @@ const dispatchFrame = (
   Match.value(frame).pipe(
     Match.tagsExhaustive({
       ExecResult: (f) =>
-        Effect.gen(function*() {
-          const pending = yield* Ref.get(pendingRequests)
-          const deferred = pending.get(f.requestId)
-          if (deferred) yield* Deferred.succeed(deferred, f.output)
-        }),
+        resolveRequest(pendingRequests, f.requestId, "ExecResult", callerCallId,
+          (d) => Deferred.succeed(d, f.output)),
       ExecError: (f) =>
-        Effect.gen(function*() {
-          const pending = yield* Ref.get(pendingRequests)
-          const deferred = pending.get(f.requestId)
-          if (deferred) {
-            yield* Deferred.fail(deferred, new SandboxError({
-              message: f.message
-            }))
-          }
-        }),
+        resolveRequest(pendingRequests, f.requestId, "ExecError", callerCallId,
+          (d) => Deferred.fail(d, new SandboxError({ message: f.message }))),
       SetVarAck: (f) =>
-        Effect.gen(function*() {
-          const pending = yield* Ref.get(pendingRequests)
-          const deferred = pending.get(f.requestId)
-          if (deferred) yield* Deferred.succeed(deferred, undefined)
-        }),
+        resolveRequest(pendingRequests, f.requestId, "SetVarAck", callerCallId,
+          (d) => Deferred.succeed(d, undefined)),
       SetVarError: (f) =>
-        Effect.gen(function*() {
-          const pending = yield* Ref.get(pendingRequests)
-          const deferred = pending.get(f.requestId)
-          if (deferred) {
-            yield* Deferred.fail(deferred, new SandboxError({ message: f.message }))
-          }
-        }),
+        resolveRequest(pendingRequests, f.requestId, "SetVarError", callerCallId,
+          (d) => Deferred.fail(d, new SandboxError({ message: f.message }))),
       GetVarResult: (f) =>
-        Effect.gen(function*() {
-          const pending = yield* Ref.get(pendingRequests)
-          const deferred = pending.get(f.requestId)
-          if (deferred) yield* Deferred.succeed(deferred, f.value)
-        }),
+        resolveRequest(pendingRequests, f.requestId, "GetVarResult", callerCallId,
+          (d) => Deferred.succeed(d, f.value)),
       ListVarsResult: (f) =>
-        Effect.gen(function*() {
-          const pending = yield* Ref.get(pendingRequests)
-          const deferred = pending.get(f.requestId)
-          if (deferred) yield* Deferred.succeed(deferred, f.variables)
-        }),
+        resolveRequest(pendingRequests, f.requestId, "ListVarsResult", callerCallId,
+          (d) => Deferred.succeed(d, f.variables)),
       BridgeCall: (f) => {
         if (config.sandboxMode === "strict") {
           return trySend(proc, {

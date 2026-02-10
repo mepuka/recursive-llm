@@ -27,6 +27,7 @@ export interface RlmConfigService {
   readonly subTarget?: RlmModelTarget
   readonly subLlmDelegation: SubLlmDelegationConfig
   readonly subModelContextChars?: number
+  readonly bridgeTimeoutMs?: number
   readonly bridgeToolRetryCount?: number
   readonly bridgeLlmQueryRetryCount?: number
   readonly bridgeRetryBaseDelayMs?: number
@@ -56,6 +57,7 @@ export class RlmConfig extends Context.Reference<RlmConfig>()(
         enabled: false,
         depthThreshold: 1
       },
+      bridgeTimeoutMs: 300_000,
       bridgeToolRetryCount: 1,
       bridgeLlmQueryRetryCount: 1,
       bridgeRetryBaseDelayMs: 50,

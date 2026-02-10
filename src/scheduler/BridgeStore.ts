@@ -64,17 +64,13 @@ export const BridgeStoreLive: Layer.Layer<BridgeStore, never, RlmRuntime> = Laye
           return true
         }),
       remove: (bridgeRequestId) =>
-        Effect.gen(function*() {
-          const before = yield* Ref.get(runtime.bridgePending)
-          if (!before.has(bridgeRequestId)) {
-            return false
+        Ref.modify(runtime.bridgePending, (current) => {
+          if (!current.has(bridgeRequestId)) {
+            return [false, current] as const
           }
-          yield* Ref.update(runtime.bridgePending, (current) => {
-            const next = new Map(current)
-            next.delete(bridgeRequestId)
-            return next
-          })
-          return true
+          const next = new Map(current)
+          next.delete(bridgeRequestId)
+          return [true, next] as const
         }),
       failAll: (reason) =>
         Effect.gen(function*() {

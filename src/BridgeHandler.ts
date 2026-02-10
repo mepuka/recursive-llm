@@ -1,5 +1,6 @@
-import { Context, Deferred, Effect, Exit, Layer, Queue } from "effect"
+import { Context, Deferred, Duration, Effect, Exit, Layer, Queue } from "effect"
 import { SandboxError } from "./RlmError"
+import { RlmConfig } from "./RlmConfig"
 import { RlmRuntime } from "./Runtime"
 import { BridgeRequestId, RlmCommand, type CallId } from "./RlmTypes"
 import { BridgeStore } from "./scheduler/BridgeStore"
@@ -15,11 +16,12 @@ export class BridgeHandler extends Context.Tag("@recursive-llm/BridgeHandler")<
   }
 >() {}
 
-export const BridgeHandlerLive: Layer.Layer<BridgeHandler, never, RlmRuntime | BridgeStore> = Layer.effect(
+export const BridgeHandlerLive: Layer.Layer<BridgeHandler, never, RlmRuntime | BridgeStore | RlmConfig> = Layer.effect(
   BridgeHandler,
   Effect.gen(function*() {
     const runtime = yield* RlmRuntime
     const bridgeStore = yield* BridgeStore
+    const config = yield* RlmConfig
 
     return BridgeHandler.of({
       handle: ({ method, args, callerCallId }) => {
@@ -44,7 +46,14 @@ export const BridgeHandlerLive: Layer.Layer<BridgeHandler, never, RlmRuntime | B
             return yield* new SandboxError({ message: "Scheduler queue closed" })
           }
 
-          return yield* Deferred.await(deferred)
+          return yield* Deferred.await(deferred).pipe(
+            Effect.timeoutFail({
+              duration: Duration.millis(config.bridgeTimeoutMs ?? 300_000),
+              onTimeout: () => new SandboxError({
+                message: `Bridge call ${method}(${bridgeRequestId}) timed out after ${config.bridgeTimeoutMs ?? 300_000}ms`
+              })
+            })
+          )
         }).pipe(
           Effect.ensuring(bridgeStore.remove(bridgeRequestId).pipe(Effect.ignore))
         )
