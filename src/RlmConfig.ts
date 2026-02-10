@@ -17,6 +17,7 @@ export interface RlmConfigService {
   readonly maxDepth: number
   readonly maxLlmCalls: number
   readonly maxTotalTokens: number | null
+  readonly commandQueueCapacity?: number
   readonly concurrency: number
   readonly enableLlmQueryBatched: boolean
   readonly maxBatchQueries: number
@@ -43,6 +44,7 @@ export class RlmConfig extends Context.Reference<RlmConfig>()(
       maxDepth: 1,
       maxLlmCalls: 20,
       maxTotalTokens: null,
+      commandQueueCapacity: 8_192,
       concurrency: 4,
       enableLlmQueryBatched: true,
       maxBatchQueries: 32,

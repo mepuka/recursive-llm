@@ -1390,6 +1390,37 @@ describe("Scheduler tool dispatch (e2e with real sandbox)", () => {
     expect(lastUserText).toContain("sub-answer")
   }, 15_000)
 
+  test("llm_query rejects empty query arguments before model invocation", async () => {
+    const events = await Effect.runPromise(
+      stream({
+        query: "empty llm_query guard",
+        context: "ctx"
+      }).pipe(
+        Stream.runCollect,
+        Effect.provide(makeRealSandboxLayers({
+          responses: [
+            { text: "```js\ntry {\n  await llm_query('', 'sub-context')\n} catch (e) {\n  print('caught: ' + e.message)\n}\n```" },
+            submitAnswer("done")
+          ],
+          config: {
+            maxDepth: 0
+          }
+        })),
+        Effect.timeout("10 seconds")
+      )
+    )
+
+    const eventList = Chunk.toReadonlyArray(events)
+    const execCompleted = eventList.find(
+      (event): event is Extract<typeof event, { _tag: "CodeExecutionCompleted" }> =>
+        event._tag === "CodeExecutionCompleted"
+    )
+
+    expect(execCompleted).toBeDefined()
+    expect(execCompleted!.output).toContain("llm_query requires a non-empty query string as the first argument")
+    expect(eventList.some((event) => event._tag === "CallFailed")).toBe(false)
+  }, 15_000)
+
   test("llm_query_batched preserves result order and routes as sub-calls", async () => {
     const modelMetrics: FakeModelMetrics = {
       calls: 0,
@@ -1426,6 +1457,34 @@ describe("Scheduler tool dispatch (e2e with real sandbox)", () => {
       ? (lastUserMsg.content as ReadonlyArray<{ readonly text: string }>)[0]!.text
       : ""
     expect(lastUserText).toContain("[\"first-result\",\"second-result\"]")
+  }, 15_000)
+
+  test("llm_query_batched rejects empty query items before dispatch", async () => {
+    const events = await Effect.runPromise(
+      stream({
+        query: "batch query validation",
+        context: "ctx"
+      }).pipe(
+        Stream.runCollect,
+        Effect.provide(makeRealSandboxLayers({
+          responses: [
+            { text: "```js\ntry {\n  await llm_query_batched(['q1', ''], ['c1', 'c2'])\n} catch (e) {\n  print('caught: ' + e.message)\n}\n```" },
+            submitAnswer("done")
+          ]
+        })),
+        Effect.timeout("10 seconds")
+      )
+    )
+
+    const eventList = Chunk.toReadonlyArray(events)
+    const execCompleted = eventList.find(
+      (event): event is Extract<typeof event, { _tag: "CodeExecutionCompleted" }> =>
+        event._tag === "CodeExecutionCompleted"
+    )
+
+    expect(execCompleted).toBeDefined()
+    expect(execCompleted!.output).toContain("llm_query_batched query at index 1 must be non-empty")
+    expect(eventList.some((event) => event._tag === "CallFailed")).toBe(false)
   }, 15_000)
 
   test("llm_query_batched fails fast on budget exhaustion", async () => {

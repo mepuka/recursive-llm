@@ -860,6 +860,13 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
             )
             return
           }
+          if (value.trim().length === 0) {
+            yield* failBridgeDeferred(
+              command.bridgeRequestId,
+              `llm_query_batched query at index ${index} must be non-empty`
+            )
+            return
+          }
           queries.push(value)
         }
 
@@ -949,13 +956,31 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
         return
       }
 
+      const llmQueryArg = command.args[0]
+      if (typeof llmQueryArg !== "string" || llmQueryArg.trim().length === 0) {
+        yield* failBridgeDeferred(
+          command.bridgeRequestId,
+          "llm_query requires a non-empty query string as the first argument"
+        )
+        return
+      }
+
+      const llmContextArg = command.args[1]
+      if (llmContextArg !== undefined && typeof llmContextArg !== "string") {
+        yield* failBridgeDeferred(
+          command.bridgeRequestId,
+          "llm_query context must be a string when provided"
+        )
+        return
+      }
+
       if (callState.depth + 1 >= config.maxDepth) {
         // At max depth: one-shot model call (no REPL protocol) with budget reservation
         yield* Effect.forkIn(
           Effect.gen(function*() {
             const oneShotResponseText = yield* runOneShotSubCall(
-              String(command.args[0]),
-              String(command.args[1] ?? ""),
+              llmQueryArg,
+              llmContextArg ?? "",
               callState.depth + 1
             )
             yield* resolveBridgeDeferred(command.bridgeRequestId, oneShotResponseText)
@@ -976,8 +1001,8 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
           enqueue(RlmCommand.StartCall({
             callId: subCallId,
             depth: callState.depth + 1,
-            query: String(command.args[0]),
-            context: String(command.args[1] ?? ""),
+            query: llmQueryArg,
+            context: llmContextArg ?? "",
             parentBridgeRequestId: command.bridgeRequestId
           }))
         )

@@ -140,6 +140,42 @@ describe("CLI normalization", () => {
     ).rejects.toThrow("Error: --sub-delegation-depth-threshold must be an integer >= 1")
   })
 
+  test("fails when max iterations is less than one", async () => {
+    await expect(
+      normalize(
+        {
+          ...baseParsed,
+          maxIterations: Option.some(0)
+        },
+        ["query", "--max-iterations", "0"]
+      )
+    ).rejects.toThrow("Error: --max-iterations must be an integer >= 1")
+  })
+
+  test("fails when max depth is negative", async () => {
+    await expect(
+      normalize(
+        {
+          ...baseParsed,
+          maxDepth: Option.some(-1)
+        },
+        ["query", "--max-depth", "-1"]
+      )
+    ).rejects.toThrow("Error: --max-depth must be an integer >= 0")
+  })
+
+  test("fails when max llm calls is less than one", async () => {
+    await expect(
+      normalize(
+        {
+          ...baseParsed,
+          maxLlmCalls: Option.some(0)
+        },
+        ["query", "--max-llm-calls", "0"]
+      )
+    ).rejects.toThrow("Error: --max-llm-calls must be an integer >= 1")
+  })
+
   test("fails when provider api key is missing", async () => {
     await expect(
       normalize(

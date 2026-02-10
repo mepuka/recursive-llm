@@ -93,7 +93,7 @@ const sendExecuteRequest = (
   state: SandboxState,
   message: unknown,
   requestId: string
-) =>
+): Effect.Effect<string, SandboxError> =>
   Effect.gen(function*() {
     const h = yield* Ref.get(state.health)
     if (h !== "alive") return yield* new SandboxError({ message: "Sandbox is dead" })
@@ -107,42 +107,40 @@ const sendExecuteRequest = (
       new Map([...m, [requestId, deferred as Deferred.Deferred<unknown, SandboxError>]])
     )
 
-    return yield* Effect.gen(function*() {
-      yield* trySend(state.proc, message)
+    yield* trySend(state.proc, message)
 
-      // Set initial deadline
-      const now = yield* Clock.currentTimeMillis
-      yield* Ref.set(state.executeDeadline, now + state.config.executeTimeoutMs)
+    // Set initial deadline
+    const now = yield* Clock.currentTimeMillis
+    yield* Ref.set(state.executeDeadline, now + state.config.executeTimeoutMs)
 
-      // Fork watchdog — when it completes (deadline expired), fail the deferred and kill sandbox
-      const watchdog = yield* Effect.fork(
-        executeDeadlineWatchdog(state.executeDeadline).pipe(
-          Effect.andThen(
-            Effect.uninterruptible(
-              Effect.gen(function*() {
-                yield* Deferred.fail(deferred, new SandboxError({ message: `Request ${requestId} timed out` }))
-                yield* Ref.set(state.health, "dead")
-                yield* failAllPending(state.pendingRequests, "Sandbox killed after timeout")
-                yield* forceTerminateProcess(state.proc, state.config.shutdownGraceMs)
-              })
-            )
+    // Fork watchdog — when it completes (deadline expired), fail the deferred and kill sandbox
+    const watchdog = yield* Effect.fork(
+      executeDeadlineWatchdog(state.executeDeadline).pipe(
+        Effect.andThen(
+          Effect.uninterruptible(
+            Effect.gen(function*() {
+              yield* Deferred.fail(deferred, new SandboxError({ message: `Request ${requestId} timed out` }))
+              yield* Ref.set(state.health, "dead")
+              yield* failAllPending(state.pendingRequests, "Sandbox killed after timeout")
+              yield* forceTerminateProcess(state.proc, state.config.shutdownGraceMs)
+            })
           )
         )
       )
-
-      return yield* Deferred.await(deferred).pipe(
-        Effect.ensuring(Fiber.interrupt(watchdog))
-      ) as string
-    }).pipe(
-      Effect.ensuring(
-        Ref.update(state.pendingRequests, (m) => {
-          const n = new Map(m)
-          n.delete(requestId)
-          return n
-        })
-      )
     )
-  })
+
+    return yield* Deferred.await(deferred).pipe(
+      Effect.ensuring(Fiber.interrupt(watchdog))
+    )
+  }).pipe(
+    Effect.ensuring(
+      Ref.update(state.pendingRequests, (m) => {
+        const n = new Map(m)
+        n.delete(requestId)
+        return n
+      })
+    )
+  )
 
 const sendRequest = <A>(
   state: SandboxState,
@@ -255,8 +253,9 @@ const dispatchFrame = (
         }
 
         // Extend deadline — sandbox is alive and requesting bridge work
-        return extendDeadline.pipe(
-          Effect.flatMap(() =>
+        return Effect.flatMap(
+          extendDeadline,
+          () =>
             // Fork bridge call handling into FiberSet for automatic cleanup on scope close
             FiberSet.run(bridgeFibers)(
               bridgeSemaphore.withPermits(1)(
@@ -282,7 +281,6 @@ const dispatchFrame = (
                 )
               )
             )
-          )
         ).pipe(Effect.asVoid)
       },
       WorkerLog: (f) =>

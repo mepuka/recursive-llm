@@ -1,7 +1,7 @@
 import * as KeyValueStore from "@effect/platform/KeyValueStore"
-import * as BunKeyValueStore from "@effect/platform-bun/BunKeyValueStore"
 import type * as PlatformError from "@effect/platform/Error"
 import { Context, Effect, Layer, Option } from "effect"
+import { appendFile, mkdir, writeFile } from "node:fs/promises"
 import * as path from "node:path"
 import type { ContextMetadata } from "./ContextMetadata"
 import { RlmRuntime } from "./Runtime"
@@ -279,19 +279,37 @@ export const RunTraceWriterBun = (
       const varsDirectory = path.join(runDirectory, "vars")
 
       return yield* Effect.gen(function*() {
-        const rootStore = yield* Effect.provide(
-          KeyValueStore.KeyValueStore,
-          BunKeyValueStore.layerFileSystem(runDirectory)
-        )
-        const varsStore = yield* Effect.provide(
-          KeyValueStore.KeyValueStore,
-          BunKeyValueStore.layerFileSystem(varsDirectory)
-        )
-        return makeRunTraceWriter({
-          rootStore,
-          varsStore,
-          maxSnapshotBytes: options.maxSnapshotBytes
-        })
+        const fsWrite = <A>(
+          operation: () => Promise<A>
+        ): Effect.Effect<A, PlatformError.PlatformError> =>
+          Effect.tryPromise({
+            try: operation,
+            catch: (error) => error as PlatformError.PlatformError
+          })
+
+        yield* fsWrite(() => mkdir(varsDirectory, { recursive: true }))
+
+        return {
+          writeMeta: (meta) =>
+            fsWrite(() =>
+              writeFile(path.join(runDirectory, META_FILE), safeJsonStringify(meta))
+            ).pipe(Effect.asVoid),
+          appendEvent: (event) =>
+            fsWrite(() =>
+              appendFile(path.join(runDirectory, TRANSCRIPT_FILE), `${buildEventLine(event)}\n`)
+            ).pipe(Effect.asVoid),
+          writeVarSnapshot: (snapshot) =>
+            fsWrite(() =>
+              writeFile(
+                path.join(varsDirectory, buildSnapshotKey(snapshot)),
+                buildSnapshotPayload(snapshot, options.maxSnapshotBytes)
+              )
+            ).pipe(Effect.asVoid),
+          writeResult: (payload) =>
+            fsWrite(() =>
+              writeFile(path.join(runDirectory, RESULT_FILE), safeJsonStringify(payload))
+            ).pipe(Effect.asVoid)
+        } satisfies RunTraceWriterService
       }).pipe(
         Effect.catchAll((error) =>
           Effect.gen(function*() {

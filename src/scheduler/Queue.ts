@@ -15,7 +15,7 @@ export const enqueue = Effect.fnUntraced(function*(command: RlmCommand) {
 
   if (!offerExit.value) {
     return yield* new UnknownRlmError({
-      message: `Scheduler queue refused ${command._tag}`
+      message: `Scheduler queue overloaded while enqueueing ${command._tag}`
     })
   }
 })
@@ -25,7 +25,7 @@ export const enqueueOrWarn = Effect.fnUntraced(function*(command: RlmCommand) {
   if (Exit.isFailure(enqueueExit)) {
     yield* publishSchedulerWarning({
       code: "QUEUE_CLOSED",
-      message: `Dropped command ${command._tag} because scheduler queue is closed`,
+      message: `Dropped command ${command._tag} because scheduler queue is closed or overloaded`,
       callId: command.callId,
       commandTag: command._tag
     })

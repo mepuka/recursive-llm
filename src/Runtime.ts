@@ -23,9 +23,10 @@ export const RlmRuntimeLive = Layer.scoped(
   RlmRuntime,
   Effect.gen(function*() {
     const config = yield* RlmConfig
+    const commandQueueCapacity = Math.max(1, config.commandQueueCapacity ?? 8_192)
 
     const commands = yield* Effect.acquireRelease(
-      Queue.unbounded<RlmCommand>(),
+      Queue.dropping<RlmCommand>(commandQueueCapacity),
       (q) => Queue.shutdown(q)
     )
     const events = yield* Effect.acquireRelease(

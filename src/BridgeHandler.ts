@@ -32,7 +32,8 @@ export const BridgeHandlerLive: Layer.Layer<BridgeHandler, never, RlmRuntime | B
           yield* bridgeStore.register(bridgeRequestId, deferred)
 
           // Route through scheduler for budget enforcement.
-          // Queue.offer on shutdown interrupts (not errors), so wrap with Effect.exit.
+          // Queue.offer may fail (shutdown/interruption) or return false (dropping queue full),
+          // so capture both outcomes explicitly.
           const offerExit = yield* Effect.exit(
             Queue.offer(runtime.commands, RlmCommand.HandleBridgeCall({
               callId: callerCallId,
@@ -44,6 +45,10 @@ export const BridgeHandlerLive: Layer.Layer<BridgeHandler, never, RlmRuntime | B
           if (Exit.isFailure(offerExit)) {
             yield* bridgeStore.fail(bridgeRequestId, new SandboxError({ message: "Scheduler queue closed" }))
             return yield* new SandboxError({ message: "Scheduler queue closed" })
+          }
+          if (!offerExit.value) {
+            yield* bridgeStore.fail(bridgeRequestId, new SandboxError({ message: "Scheduler queue overloaded" }))
+            return yield* new SandboxError({ message: "Scheduler queue overloaded" })
           }
 
           return yield* Deferred.await(deferred).pipe(

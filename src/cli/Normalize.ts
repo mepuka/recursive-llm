@@ -94,6 +94,18 @@ export const normalizeCliArgs = (
       return yield* failCliInput("Error: --sub-delegation-depth-threshold must be an integer >= 1")
     }
 
+    if (maxIterations !== undefined && maxIterations < 1) {
+      return yield* failCliInput("Error: --max-iterations must be an integer >= 1")
+    }
+
+    if (maxDepth !== undefined && maxDepth < 0) {
+      return yield* failCliInput("Error: --max-depth must be an integer >= 0")
+    }
+
+    if (maxLlmCalls !== undefined && maxLlmCalls < 1) {
+      return yield* failCliInput("Error: --max-llm-calls must be an integer >= 1")
+    }
+
     if (subDelegationEnabled === true && subModel === undefined) {
       return yield* failCliInput("Error: --sub-delegation-enabled requires --sub-model")
     }

@@ -103,6 +103,7 @@ export const makeCliConfig = (cliArgs: CliArgs): RlmConfigService => {
     maxDepth: cliArgs.maxDepth ?? 1,
     maxLlmCalls: cliArgs.maxLlmCalls ?? 200,
     maxTotalTokens: null,
+    commandQueueCapacity: 8_192,
     concurrency: 4,
     enableLlmQueryBatched: true,
     maxBatchQueries: 32,
