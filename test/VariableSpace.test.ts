@@ -33,8 +33,7 @@ describe("VariableSpace", () => {
         const snapshotRef = yield* Ref.make<VariableSnapshot>({
           variables: [],
           snapshotIteration: 0,
-          syncedAtMs: Date.now(),
-          freshness: "fresh"
+          syncedAtMs: Date.now()
         })
         const iterationRef = yield* Ref.make(0)
         const vars = makeVariableSpace(sandbox, snapshotRef, iterationRef)
@@ -58,8 +57,7 @@ describe("VariableSpace", () => {
         const snapshotRef = yield* Ref.make<VariableSnapshot>({
           variables: [],
           snapshotIteration: 0,
-          syncedAtMs: Date.now(),
-          freshness: "fresh"
+          syncedAtMs: Date.now()
         })
         const iterationRef = yield* Ref.make(3)
         const vars = makeVariableSpace(sandbox, snapshotRef, iterationRef)
@@ -72,7 +70,6 @@ describe("VariableSpace", () => {
     )
 
     expect(result.synced.snapshotIteration).toBe(3)
-    expect(result.synced.freshness).toBe("fresh")
     expect(result.synced.variables.map((v) => v.name).sort()).toEqual(["alpha", "beta"])
     expect(result.cached).toEqual(result.synced)
   })

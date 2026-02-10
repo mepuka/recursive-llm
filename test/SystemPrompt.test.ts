@@ -9,6 +9,13 @@ describe("SystemPrompt", () => {
     maxDepth: 1,
     budget: { iterationsRemaining: 9, llmCallsRemaining: 19 }
   }
+  const makeTool = (name: string) => ({
+    name,
+    description: `${name} description`,
+    parameterNames: ["arg"],
+    parametersJsonSchema: { type: "object" },
+    returnsJsonSchema: { type: "object" }
+  })
 
   test("REPL prompt does not contain FINAL(...) instructions", () => {
     const prompt = buildReplSystemPrompt(baseOptions)
@@ -24,7 +31,19 @@ describe("SystemPrompt", () => {
     const prompt = buildReplSystemPrompt(baseOptions)
     expect(prompt).toContain("SUBMIT invocation schema for this run")
     expect(prompt).toContain("\"required\":[\"answer\"]")
+    expect(prompt).toContain("\"required\":[\"variable\"]")
     expect(prompt).toContain("\"additionalProperties\":false")
+  })
+
+  test("REPL prompt documents SUBMIT variable finalization option", () => {
+    const plainPrompt = buildReplSystemPrompt(baseOptions)
+    expect(plainPrompt).toContain("SUBMIT({ variable: \"finalAnswer\" })")
+
+    const structuredPrompt = buildReplSystemPrompt({
+      ...baseOptions,
+      outputJsonSchema: { type: "object", properties: { ok: { type: "boolean" } } }
+    })
+    expect(structuredPrompt).toContain("SUBMIT({ variable: \"finalValue\" })")
   })
 
   test("REPL prompt contains llm_query when depth < maxDepth", () => {
@@ -119,22 +138,80 @@ describe("SystemPrompt", () => {
     expect(prompt).toContain("Search the web")
   })
 
-  test("REPL prompt includes NLP guidance when NLP tools are available", () => {
+  test("REPL prompt includes workflow-oriented NLP guidance when NLP tools are available", () => {
     const prompt = buildReplSystemPrompt({
       ...baseOptions,
-      tools: [{
-        name: "DocumentStats",
-        description: "Compute document statistics",
-        parameterNames: ["text"],
-        parametersJsonSchema: { type: "object" },
-        returnsJsonSchema: { type: "object" }
-      }]
+      tools: [
+        makeTool("DocumentStats"),
+        makeTool("LearnCustomEntities"),
+        makeTool("ExtractKeywords"),
+        makeTool("TextSimilarity"),
+        makeTool("CreateCorpus"),
+        makeTool("LearnCorpus"),
+        makeTool("QueryCorpus"),
+        makeTool("DeleteCorpus")
+      ]
     })
-    expect(prompt).toContain("### Use NLP tools for:")
+    expect(prompt).toContain("### NLP Tools")
+    expect(prompt).toContain("Core Text Processing")
     expect(prompt).toContain("DocumentStats")
-    expect(prompt).toContain("ChunkBySentences")
-    expect(prompt).toContain("RankByRelevance")
-    expect(prompt).toContain("ExtractEntities")
+    expect(prompt).toContain("Entity Extraction and Learning")
+    expect(prompt).toContain("LearnCustomEntities")
+    expect(prompt).toContain("Keyword and Feature Extraction")
+    expect(prompt).toContain("ExtractKeywords")
+    expect(prompt).toContain("Similarity, Ranking, and Fuzzy Matching")
+    expect(prompt).toContain("TextSimilarity")
+    expect(prompt).toContain("Corpus Retrieval (Stateful BM25)")
+    expect(prompt).toContain("CreateCorpus")
+    expect(prompt).toContain("LearnCorpus")
+    expect(prompt).toContain("QueryCorpus")
+    expect(prompt).toContain("DeleteCorpus")
+    expect(prompt).toContain("init_corpus(documents, options?)")
+    expect(prompt).toContain("init_corpus_from_context(options?)")
+  })
+
+  test("REPL prompt includes context-specific retrieval guidance for large structured context with corpus tools", () => {
+    const prompt = buildReplSystemPrompt({
+      ...baseOptions,
+      contextMetadata: {
+        format: "ndjson",
+        chars: 60_000,
+        lines: 500,
+        recordCount: 180
+      },
+      tools: [
+        makeTool("CreateCorpus"),
+        makeTool("LearnCorpus"),
+        makeTool("QueryCorpus"),
+        makeTool("CorpusStats"),
+        makeTool("DeleteCorpus")
+      ]
+    })
+
+    expect(prompt).toContain("### Context-Specific Guidance")
+    expect(prompt).toContain("about 180 records")
+    expect(prompt).toContain("prefer a retrieval-first pattern")
+    expect(prompt).toContain("init_corpus_from_context")
+    expect(prompt).toContain("CreateCorpus")
+    expect(prompt).toContain("QueryCorpus")
+  })
+
+  test("REPL prompt omits context-specific retrieval guidance when corpus workflow tools are missing", () => {
+    const prompt = buildReplSystemPrompt({
+      ...baseOptions,
+      contextMetadata: {
+        format: "ndjson",
+        chars: 60_000,
+        lines: 500,
+        recordCount: 180
+      },
+      tools: [
+        makeTool("CreateCorpus"),
+        makeTool("QueryCorpus")
+      ]
+    })
+
+    expect(prompt).not.toContain("### Context-Specific Guidance")
   })
 
   test("REPL prompt omits tool section when no tools", () => {
@@ -289,6 +366,8 @@ describe("buildExtractSystemPrompt", () => {
     expect(prompt).toContain("SUBMIT")
     expect(prompt).toContain("ran out of iterations")
     expect(prompt).toContain('SUBMIT({ answer: "your answer" })')
+    expect(prompt).toContain('SUBMIT({ variable: "finalAnswer" })')
+    expect(prompt).toContain("SUBMIT invocation schema for this run")
     expect(prompt).not.toContain('FINAL("your answer")')
   })
 
@@ -298,7 +377,9 @@ describe("buildExtractSystemPrompt", () => {
     expect(prompt).toContain("valid JSON matching this schema")
     expect(prompt).toContain('"result"')
     expect(prompt).toContain("SUBMIT({ value: ... })")
+    expect(prompt).toContain('SUBMIT({ variable: "finalValue" })')
     expect(prompt).toContain("\"required\":[\"value\"]")
+    expect(prompt).toContain("\"required\":[\"variable\"]")
     expect(prompt).not.toContain("Fallback only if tool calling is unavailable")
     expect(prompt).not.toContain("FINAL(`{...}`)")
   })

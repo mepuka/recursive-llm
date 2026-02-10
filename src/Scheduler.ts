@@ -3,11 +3,14 @@ import { consumeIteration, recordTokens, reserveLlmCall, snapshot, withLlmPermit
 import {
   appendTranscript,
   attachExecutionOutput,
+  incrementConsecutiveStalls,
   incrementIteration,
   makeCallContext,
   readIteration,
-  readTranscript
+  readTranscript,
+  resetConsecutiveStalls
 } from "./CallContext"
+import type { CallContext } from "./CallContext"
 import { extractCodeBlock } from "./CodeExtractor"
 import { RlmConfig } from "./RlmConfig"
 import { RlmModel } from "./RlmModel"
@@ -26,7 +29,13 @@ import {
   truncateExecutionOutput
 } from "./RlmPrompt"
 import { buildReplSystemPrompt, buildOneShotSystemPrompt, buildExtractSystemPrompt } from "./SystemPrompt"
-import { extractSubmitAnswer, renderSubmitAnswer, SUBMIT_TOOL_NAME, submitToolkit } from "./SubmitTool"
+import {
+  extractSubmitAnswer,
+  renderSubmitAnswer,
+  SUBMIT_TOOL_NAME,
+  submitToolkit,
+  type SubmitPayload
+} from "./SubmitTool"
 import { SandboxConfig, SandboxFactory } from "./Sandbox"
 import { RlmRuntime } from "./Runtime"
 import { BridgeRequestId, CallId, type FinalAnswerPayload, RlmCommand, RlmEvent } from "./RlmTypes"
@@ -80,6 +89,8 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
   const bridgeLlmQueryRetryPolicy = Schedule.exponential(Duration.millis(bridgeRetryBaseDelayMs)).pipe(
     Schedule.compose(Schedule.recurs(bridgeLlmQueryRetryCount))
   )
+  const stallConsecutiveLimit = Math.max(1, config.stallConsecutiveLimit ?? 3)
+  const stallResponseMaxChars = Math.max(0, config.stallResponseMaxChars ?? 24)
 
   const resultDeferred = yield* Deferred.make<FinalAnswerPayload, RlmError>()
 
@@ -100,6 +111,53 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
     return command.context.length > 0
       ? analyzeContext(command.context)
       : undefined
+  }
+
+  const resolveSubmitPayload = (
+    callState: CallContext,
+    payload: SubmitPayload,
+    rawResponse: string
+  ): Effect.Effect<FinalAnswerPayload, OutputValidationError> => {
+    if (payload.source !== "variable") {
+      return Effect.succeed(payload)
+    }
+
+    return Effect.gen(function*() {
+      const resolvedValue = yield* callState.sandbox.getVariable(payload.variable).pipe(
+        Effect.mapError((error) =>
+          new OutputValidationError({
+            message: `Failed to read SUBMIT variable "${payload.variable}": ${error.message}`,
+            raw: rawResponse
+          })
+        )
+      )
+
+      if (resolvedValue === undefined) {
+        return yield* new OutputValidationError({
+          message: `SUBMIT variable "${payload.variable}" was not found in __vars.`,
+          raw: rawResponse
+        })
+      }
+
+      if (callState.outputJsonSchema !== undefined) {
+        return {
+          source: "value",
+          value: resolvedValue
+        } satisfies FinalAnswerPayload
+      }
+
+      if (typeof resolvedValue !== "string") {
+        return yield* new OutputValidationError({
+          message: `SUBMIT variable "${payload.variable}" must resolve to a string in plain-output mode.`,
+          raw: rawResponse
+        })
+      }
+
+      return {
+        source: "answer",
+        answer: resolvedValue
+      } satisfies FinalAnswerPayload
+    })
   }
 
   // --- handleStartCall ---
@@ -266,6 +324,9 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
           ...(callState.outputJsonSchema !== undefined
             ? { outputJsonSchema: callState.outputJsonSchema }
             : {}),
+          ...(callState.contextMetadata !== undefined
+            ? { contextMetadata: callState.contextMetadata }
+            : {}),
           sandboxMode: sandboxConfig.sandboxMode,
           ...(config.subModelContextChars !== undefined
             ? { subModelContextChars: config.subModelContextChars }
@@ -355,9 +416,22 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
             commandTag: command._tag
           })
         }
+        const resolvedSubmit = yield* resolveSubmitPayload(callState, submitAnswer.value, response.text).pipe(
+          Effect.catchAll((error) =>
+            Effect.gen(function*() {
+              yield* enqueueOrWarn(RlmCommand.FailCall({
+                callId: command.callId,
+                error
+              }))
+              return undefined
+            })
+          )
+        )
+        if (resolvedSubmit === undefined) return
+
         yield* enqueueOrWarn(RlmCommand.Finalize({
           callId: callState.callId,
-          payload: submitAnswer.value
+          payload: resolvedSubmit
         }))
         return
       }
@@ -375,6 +449,7 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
 
       // No SUBMIT — continue REPL via code or additional reasoning turns.
       if (code !== null) {
+        yield* resetConsecutiveStalls(callState)
         yield* appendTranscript(callState, response.text)
         yield* incrementIteration(callState)
         yield* enqueueOrWarn(RlmCommand.ExecuteCode({ callId: callState.callId, code }))
@@ -382,8 +457,32 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
       }
 
       // Neither SUBMIT nor code block — add to transcript and loop.
+      const trimmedResponse = response.text.trim()
+      let stallCount = 0
+      if (trimmedResponse.length <= stallResponseMaxChars) {
+        stallCount = yield* incrementConsecutiveStalls(callState)
+      } else {
+        yield* resetConsecutiveStalls(callState)
+      }
+
       yield* appendTranscript(callState, response.text)
       yield* incrementIteration(callState)
+
+      if (stallCount >= stallConsecutiveLimit) {
+        yield* publishSchedulerWarning({
+          code: "STALL_DETECTED_EARLY_EXTRACT",
+          message: `Detected ${stallCount} consecutive near-empty responses (<= ${stallResponseMaxChars} chars); triggering extract fallback early.`,
+          callId: callState.callId,
+          commandTag: command._tag
+        })
+        const nextIteration = yield* readIteration(callState)
+        return yield* new BudgetExhaustedError({
+          resource: "iterations",
+          callId: callState.callId,
+          remaining: Math.max(0, config.maxIterations - nextIteration)
+        })
+      }
+
       yield* enqueueOrWarn(RlmCommand.GenerateStep({ callId: callState.callId }))
     }).pipe(
       Effect.catchTag("BudgetExhaustedError", (err) =>
@@ -442,7 +541,7 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
               Effect.gen(function*() {
                 yield* publishSchedulerWarning({
                   code: "TOOLKIT_DEGRADED",
-                  message: `Tool-enabled extract failed; retrying extract without tool calling (${formatExecutionError(error)})`,
+                  message: `Tool-enabled extract failed; retrying extract without tool calling (${formatExecutionError(error)}). Text-mode fallback does not parse textual SUBMIT({ variable: ... }) instructions.`,
                   callId: callState.callId,
                   commandTag: command._tag
                 })
@@ -484,9 +583,22 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
             outputMode: callState.outputJsonSchema !== undefined ? "structured" : "plain"
           })
           if (submitAnswer._tag === "Found") {
+            const resolvedSubmit = yield* resolveSubmitPayload(callState, submitAnswer.value, response.text).pipe(
+              Effect.catchAll((error) =>
+                Effect.gen(function*() {
+                  yield* enqueueOrWarn(RlmCommand.FailCall({
+                    callId: command.callId,
+                    error
+                  }))
+                  return undefined
+                })
+              )
+            )
+            if (resolvedSubmit === undefined) return
+
             yield* enqueueOrWarn(RlmCommand.Finalize({
               callId: callState.callId,
-              payload: submitAnswer.value
+              payload: resolvedSubmit
             }))
             return
           }
@@ -584,7 +696,14 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
 
       const vars = makeCallVariableSpace(callState)
       yield* vars.sync.pipe(
-        Effect.catchAll(() => Effect.void)
+        Effect.catchAll((error) =>
+          publishSchedulerWarning({
+            code: "VARIABLE_SYNC_FAILED",
+            message: `Failed to refresh sandbox variable snapshot after code execution: ${formatExecutionError(error)}. Continuing with cached snapshot.`,
+            callId: command.callId,
+            commandTag: command._tag
+          })
+        )
       )
 
       yield* enqueueOrWarn(RlmCommand.GenerateStep({ callId: command.callId }))
@@ -618,9 +737,8 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
         )
 
       // Guard: call state may be deleted if call already finalized
-      const states = yield* Ref.get(runtime.callStates)
-      const callState = states.get(command.callId)
-      if (!callState) {
+      const callStateOption = yield* getCallStateOption(command.callId)
+      if (Option.isNone(callStateOption)) {
         yield* publishSchedulerWarning({
           code: "STALE_COMMAND_DROPPED",
           message: `Dropped stale command ${command._tag} for inactive call ${command.callId}`,
@@ -630,6 +748,7 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
         yield* failBridgeDeferred(command.bridgeRequestId, "Call no longer active")
         return
       }
+      const callState = callStateOption.value
 
       yield* publishEvent(RlmEvent.BridgeCallReceived({
         completionId: runtime.completionId,
@@ -836,8 +955,10 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
 
   const handleFailCall = (command: Extract<RlmCommand, { readonly _tag: "FailCall" }>) =>
     Effect.gen(function*() {
-      const states = yield* Ref.get(runtime.callStates)
-      const callState = states.get(command.callId)
+      const callStateOption = yield* getCallStateOption(command.callId)
+      const callState = Option.isSome(callStateOption)
+        ? callStateOption.value
+        : undefined
       const depth = callState?.depth ?? 0
 
       yield* publishEvent(RlmEvent.CallFailed({

@@ -9,7 +9,6 @@ export interface VariableSnapshot {
   readonly variables: ReadonlyArray<VariableMetadata>
   readonly snapshotIteration: number
   readonly syncedAtMs: number
-  readonly freshness: "fresh" | "stale"
 }
 
 export interface CallContext {
@@ -27,6 +26,7 @@ export interface CallContext {
   readonly iteration: Ref.Ref<number>
   readonly transcript: Ref.Ref<ReadonlyArray<TranscriptEntry>>
   readonly variableSnapshot: Ref.Ref<VariableSnapshot>
+  readonly consecutiveStalls: Ref.Ref<number>
 }
 
 export interface MakeCallContextOptions {
@@ -49,15 +49,16 @@ export const makeCallContext = (options: MakeCallContextOptions): Effect.Effect<
     const variableSnapshot = yield* Ref.make<VariableSnapshot>({
       variables: [],
       snapshotIteration: 0,
-      syncedAtMs: Date.now(),
-      freshness: "fresh"
+      syncedAtMs: Date.now()
     })
+    const consecutiveStalls = yield* Ref.make(0)
 
     return {
       ...options,
       iteration,
       transcript,
-      variableSnapshot
+      variableSnapshot,
+      consecutiveStalls
     }
   })
 
@@ -70,14 +71,26 @@ export const incrementIteration = (ctx: CallContext): Effect.Effect<number> =>
 export const readTranscript = (ctx: CallContext): Effect.Effect<ReadonlyArray<TranscriptEntry>> =>
   Ref.get(ctx.transcript)
 
+export const readConsecutiveStalls = (ctx: CallContext): Effect.Effect<number> =>
+  Ref.get(ctx.consecutiveStalls)
+
+export const resetConsecutiveStalls = (ctx: CallContext): Effect.Effect<void> =>
+  Ref.set(ctx.consecutiveStalls, 0)
+
+export const incrementConsecutiveStalls = (ctx: CallContext): Effect.Effect<number> =>
+  Ref.updateAndGet(ctx.consecutiveStalls, (n) => n + 1)
+
 export const appendTranscript = (
   ctx: CallContext,
   assistantResponse: string
-): Effect.Effect<void> =>
-  Ref.update(ctx.transcript, (entries) => [
+): Effect.Effect<void> => {
+  const trimmed = assistantResponse.trim()
+  if (trimmed === "") return Effect.void
+  return Ref.update(ctx.transcript, (entries) => [
     ...entries,
-    new TranscriptEntry({ assistantResponse })
+    new TranscriptEntry({ assistantResponse: trimmed })
   ])
+}
 
 export const attachExecutionOutput = (
   ctx: CallContext,

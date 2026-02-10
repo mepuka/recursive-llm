@@ -88,8 +88,9 @@ describe("RlmPrompt properties", () => {
             contextPreview,
             transcript
           })
-          const executionOutputs = entries.filter((entry) => entry.executionOutput !== undefined).length
-          return prompt.content.length === 2 + entries.length + executionOutputs
+          const nonEmpty = entries.filter((entry) => entry.assistantResponse.trim() !== "")
+          const executionOutputs = nonEmpty.filter((entry) => entry.executionOutput !== undefined).length
+          return prompt.content.length === 2 + nonEmpty.length + executionOutputs
         }
       )
     )

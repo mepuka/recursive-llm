@@ -52,6 +52,17 @@ describe("extractSubmitAnswer", () => {
     })
   })
 
+  test("plain mode accepts SUBMIT variable payload", () => {
+    const response = makeResponse({
+      toolCalls: [{ name: "SUBMIT", params: { variable: "finalAnswer" } }]
+    })
+    const extracted = extractSubmitAnswer(response, { outputMode: "plain" })
+    expect(extracted).toEqual({
+      _tag: "Found",
+      value: { source: "variable", variable: "finalAnswer" }
+    })
+  })
+
   test("plain mode rejects SUBMIT value payload", () => {
     const response = makeResponse({
       toolCalls: [{ name: "SUBMIT", params: { value: { ok: true } } }]
@@ -71,6 +82,17 @@ describe("extractSubmitAnswer", () => {
     })
   })
 
+  test("structured mode accepts SUBMIT variable payload", () => {
+    const response = makeResponse({
+      toolCalls: [{ name: "SUBMIT", params: { variable: "finalValue" } }]
+    })
+    const extracted = extractSubmitAnswer(response, { outputMode: "structured" })
+    expect(extracted).toEqual({
+      _tag: "Found",
+      value: { source: "variable", variable: "finalValue" }
+    })
+  })
+
   test("structured mode rejects SUBMIT answer payload", () => {
     const response = makeResponse({
       toolCalls: [{ name: "SUBMIT", params: { answer: "42" } }]
@@ -82,6 +104,14 @@ describe("extractSubmitAnswer", () => {
   test("rejects ambiguous payloads containing answer and value", () => {
     const response = makeResponse({
       toolCalls: [{ name: "SUBMIT", params: { answer: "42", value: 42 } }]
+    })
+    const extracted = extractSubmitAnswer(response, { outputMode: "plain" })
+    expect(extracted._tag).toBe("Invalid")
+  })
+
+  test("rejects empty SUBMIT variable names", () => {
+    const response = makeResponse({
+      toolCalls: [{ name: "SUBMIT", params: { variable: "" } }]
     })
     const extracted = extractSubmitAnswer(response, { outputMode: "plain" })
     expect(extracted._tag).toBe("Invalid")

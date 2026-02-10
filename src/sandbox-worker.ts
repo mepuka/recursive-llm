@@ -54,6 +54,8 @@ const makeStrictScope = (
   __vars: unknown,
   llm_query: (query: string, context?: string) => Promise<unknown>,
   llm_query_batched: (queries: ReadonlyArray<string>, contexts?: ReadonlyArray<string>) => Promise<unknown>,
+  init_corpus: (documents: unknown, options?: unknown) => Promise<unknown>,
+  init_corpus_from_context: (options?: unknown) => Promise<unknown>,
   tools?: Record<string, (...args: unknown[]) => Promise<unknown>>
 ) => {
   const scope: Record<string, unknown> = {
@@ -62,6 +64,8 @@ const makeStrictScope = (
     __vars,
     llm_query,
     llm_query_batched,
+    init_corpus,
+    init_corpus_from_context,
     undefined,
     // Tool functions
     ...tools,
@@ -239,6 +243,238 @@ async function executeCode(requestId: string, code: string): Promise<void> {
     })
   }
 
+  interface CorpusDocument {
+    readonly id: string
+    readonly text: string
+  }
+
+  interface InitCorpusOptions {
+    readonly corpusId?: string
+    readonly batchSize?: number
+    readonly dedupeById?: boolean
+    readonly maxDocuments?: number
+    readonly textField?: string
+  }
+
+  const toObject = (value: unknown): Record<string, unknown> =>
+    typeof value === "object" && value !== null
+      ? value as Record<string, unknown>
+      : {}
+
+  const toNonEmptyString = (value: unknown): string | undefined =>
+    typeof value === "string" && value.trim().length > 0
+      ? value.trim()
+      : undefined
+
+  const toPositiveInteger = (value: unknown, fallback: number): number =>
+    typeof value === "number" && Number.isFinite(value) && Number.isInteger(value) && value > 0
+      ? value
+      : fallback
+
+  const toolOrThrow = (toolName: string): ((...args: unknown[]) => Promise<unknown>) => {
+    const fn = toolFunctions[toolName]
+    if (fn) return fn
+    throw new Error(`Required NLP tool "${toolName}" is unavailable in this run`)
+  }
+
+  const pickTextFromRecord = (record: Record<string, unknown>, textField?: string): string => {
+    if (textField !== undefined) {
+      const explicit = record[textField]
+      if (typeof explicit === "string") return explicit
+    }
+
+    const candidateFields = ["text", "content", "body", "message", "summary", "title"]
+    for (const field of candidateFields) {
+      const value = record[field]
+      if (typeof value === "string") return value
+    }
+
+    const firstString = Object.values(record).find((value) => typeof value === "string")
+    if (typeof firstString === "string") return firstString
+
+    try {
+      return JSON.stringify(record)
+    } catch {
+      return String(record)
+    }
+  }
+
+  const toCorpusDocument = (
+    value: unknown,
+    index: number,
+    textField?: string
+  ): CorpusDocument | undefined => {
+    if (typeof value === "string") {
+      const text = value.trim()
+      if (text.length === 0) return undefined
+      return { id: String(index), text }
+    }
+
+    const record = toObject(value)
+    if (Object.keys(record).length === 0) return undefined
+
+    const rawId = record.id ?? record._id
+    const id =
+      typeof rawId === "string" || typeof rawId === "number" || typeof rawId === "bigint"
+        ? String(rawId)
+        : String(index)
+
+    const text = pickTextFromRecord(record, textField).trim()
+    if (text.length === 0) return undefined
+
+    return { id, text }
+  }
+
+  const parseDelimitedRecords = (context: string, delimiter: "," | "\t"): Array<Record<string, unknown>> => {
+    const lines = context
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0)
+
+    if (lines.length < 2) return []
+
+    const header = lines[0]!.split(delimiter).map((cell) => cell.trim())
+    const rows = lines.slice(1)
+    const records: Array<Record<string, unknown>> = []
+    for (const row of rows) {
+      const cells = row.split(delimiter)
+      const record: Record<string, unknown> = {}
+      for (let i = 0; i < header.length; i += 1) {
+        const key = header[i]
+        if (!key || key.length === 0) continue
+        record[key] = (cells[i] ?? "").trim()
+      }
+      records.push(record)
+    }
+    return records
+  }
+
+  const inferCorpusId = (createResult: unknown, requestedCorpusId?: string): string => {
+    if (requestedCorpusId !== undefined) return requestedCorpusId
+
+    const fromResult = toObject(createResult).corpusId
+    if (typeof fromResult === "string" && fromResult.length > 0) {
+      return fromResult
+    }
+
+    throw new Error("CreateCorpus did not return a corpusId; provide options.corpusId explicitly")
+  }
+
+  const learnIntoCorpus = async (
+    rawDocuments: ReadonlyArray<unknown>,
+    options?: InitCorpusOptions
+  ): Promise<{
+    corpusId: string
+    documentsLearned: number
+    batches: number
+    batchSize: number
+    dedupeById: boolean
+  }> => {
+    const normalizedOptions = toObject(options)
+    const requestedCorpusId = toNonEmptyString(normalizedOptions.corpusId)
+    const textField = toNonEmptyString(normalizedOptions.textField)
+    const batchSize = toPositiveInteger(normalizedOptions.batchSize, 500)
+    const dedupeById = normalizedOptions.dedupeById !== false
+    const maxDocuments = toPositiveInteger(normalizedOptions.maxDocuments, Number.MAX_SAFE_INTEGER)
+
+    const normalizedDocuments = rawDocuments
+      .map((value, index) => toCorpusDocument(value, index, textField))
+      .filter((value): value is CorpusDocument => value !== undefined)
+      .slice(0, maxDocuments)
+
+    if (normalizedDocuments.length === 0) {
+      throw new Error("No corpus documents were produced from input")
+    }
+
+    const createCorpus = toolOrThrow("CreateCorpus")
+    const learnCorpus = toolOrThrow("LearnCorpus")
+
+    const createResult = requestedCorpusId !== undefined
+      ? await createCorpus(requestedCorpusId)
+      : await createCorpus()
+
+    const corpusId = inferCorpusId(createResult, requestedCorpusId)
+
+    let batches = 0
+    for (let index = 0; index < normalizedDocuments.length; index += batchSize) {
+      const batch = normalizedDocuments.slice(index, index + batchSize)
+      await learnCorpus(corpusId, batch, dedupeById)
+      batches += 1
+    }
+
+    vars.set("contextCorpusId", corpusId)
+
+    return {
+      corpusId,
+      documentsLearned: normalizedDocuments.length,
+      batches,
+      batchSize,
+      dedupeById
+    }
+  }
+
+  const init_corpus = async (
+    documents: unknown,
+    options?: unknown
+  ): Promise<unknown> => {
+    if (!Array.isArray(documents)) {
+      throw new Error("init_corpus requires an array of documents")
+    }
+
+    return learnIntoCorpus(documents, options as InitCorpusOptions | undefined)
+  }
+
+  const init_corpus_from_context = async (options?: unknown): Promise<unknown> => {
+    const context = vars.get("context")
+    if (typeof context !== "string" || context.trim().length === 0) {
+      throw new Error("__vars.context is empty; nothing to index")
+    }
+
+    const normalizedOptions = toObject(options)
+    const contextMeta = toObject(vars.get("contextMeta"))
+    const format = toNonEmptyString(contextMeta.format)
+
+    let sourceDocuments: Array<unknown> = []
+
+    if (format === "ndjson") {
+      sourceDocuments = context
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0)
+        .map((line) => {
+          try {
+            return JSON.parse(line)
+          } catch {
+            return undefined
+          }
+        })
+        .filter((value) => value !== undefined)
+    } else if (format === "json-array") {
+      const parsed = JSON.parse(context)
+      if (!Array.isArray(parsed)) {
+        throw new Error("__vars.contextMeta.format is json-array but parsed context is not an array")
+      }
+      sourceDocuments = parsed
+    } else if (format === "csv") {
+      sourceDocuments = parseDelimitedRecords(context, ",")
+    } else if (format === "tsv") {
+      sourceDocuments = parseDelimitedRecords(context, "\t")
+    } else if (format === "json") {
+      sourceDocuments = [JSON.parse(context)]
+    } else {
+      sourceDocuments = context
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0)
+    }
+
+    if (sourceDocuments.length === 0) {
+      throw new Error("No records found in __vars.context for corpus initialization")
+    }
+
+    return learnIntoCorpus(sourceDocuments, normalizedOptions as InitCorpusOptions)
+  }
+
   try {
     if (sandboxMode === "strict") {
       for (const blocked of STRICT_BLOCKLIST) {
@@ -250,20 +486,72 @@ async function executeCode(requestId: string, code: string): Promise<void> {
 
     // AsyncFunction constructor to allow top-level await in code
     const AsyncFunction = Object.getPrototypeOf(async function() {}).constructor
-    const toolNames = Object.keys(toolFunctions)
-    const toolValues = Object.values(toolFunctions)
+    const injectedHelpers = {
+      init_corpus,
+      init_corpus_from_context
+    }
+    const injectedFunctions = {
+      ...toolFunctions,
+      ...injectedHelpers
+    }
+    const toolNames = Object.keys(injectedFunctions)
+    const toolValues = Object.values(injectedFunctions)
 
     if (sandboxMode === "strict") {
-      const strictScope = makeStrictScope(print, __vars, llm_query, llm_query_batched, toolFunctions)
-      const fn = new AsyncFunction("print", "__vars", "llm_query", "llm_query_batched", "__strictScope", ...toolNames, `
+      const strictScope = makeStrictScope(
+        print,
+        __vars,
+        llm_query,
+        llm_query_batched,
+        init_corpus,
+        init_corpus_from_context,
+        injectedFunctions
+      )
+      const fn = new AsyncFunction(
+        "print",
+        "__vars",
+        "llm_query",
+        "llm_query_batched",
+        "init_corpus",
+        "init_corpus_from_context",
+        "__strictScope",
+        ...toolNames,
+        `
         with (__strictScope) {
           ${code}
         }
-      `)
-      await fn(print, __vars, llm_query, llm_query_batched, strictScope, ...toolValues)
+      `
+      )
+      await fn(
+        print,
+        __vars,
+        llm_query,
+        llm_query_batched,
+        init_corpus,
+        init_corpus_from_context,
+        strictScope,
+        ...toolValues
+      )
     } else {
-      const fn = new AsyncFunction("print", "__vars", "llm_query", "llm_query_batched", ...toolNames, code)
-      await fn(print, __vars, llm_query, llm_query_batched, ...toolValues)
+      const fn = new AsyncFunction(
+        "print",
+        "__vars",
+        "llm_query",
+        "llm_query_batched",
+        "init_corpus",
+        "init_corpus_from_context",
+        ...toolNames,
+        code
+      )
+      await fn(
+        print,
+        __vars,
+        llm_query,
+        llm_query_batched,
+        init_corpus,
+        init_corpus_from_context,
+        ...toolValues
+      )
     }
 
     safeSend({
@@ -304,7 +592,15 @@ function handleMessage(message: unknown): void {
       // Create tool bridge functions from tool descriptors
       toolFunctions = {}
       const jsIdentifierRe = /^[a-zA-Z_$][a-zA-Z0-9_$]*$/
-      const reservedBindings = new Set(["print", "__vars", "llm_query", "llm_query_batched", "__strictScope"])
+      const reservedBindings = new Set([
+        "print",
+        "__vars",
+        "llm_query",
+        "llm_query_batched",
+        "init_corpus",
+        "init_corpus_from_context",
+        "__strictScope"
+      ])
       if (Array.isArray(msg.tools)) {
         for (const tool of msg.tools) {
           const toolName = String(tool.name)

@@ -8,6 +8,8 @@ export type SchedulerWarningCode =
   | "CALL_SCOPE_CLEANUP"
   | "MIXED_SUBMIT_AND_CODE"
   | "TOOLKIT_DEGRADED"
+  | "VARIABLE_SYNC_FAILED"
+  | "STALL_DETECTED_EARLY_EXTRACT"
 
 export interface SchedulerWarning {
   readonly code: SchedulerWarningCode

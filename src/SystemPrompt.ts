@@ -1,3 +1,4 @@
+import type { ContextMetadata } from "./ContextMetadata"
 import { buildSubmitInvocationSchema } from "./SubmitTool"
 
 export interface ToolDescriptor {
@@ -22,26 +23,106 @@ export interface ReplSystemPromptOptions {
   readonly outputJsonSchema?: object
   readonly sandboxMode?: "permissive" | "strict"
   readonly subModelContextChars?: number
+  readonly contextMetadata?: ContextMetadata
 }
+
+// Keep this in sync with effect-nlp's exported tool names (currently 19 tools).
+const NLP_TOOL_NAMES = new Set([
+  "BowCosineSimilarity",
+  "ChunkBySentences",
+  "CorpusStats",
+  "CreateCorpus",
+  "DeleteCorpus",
+  "DocumentStats",
+  "ExtractEntities",
+  "ExtractKeywords",
+  "LearnCorpus",
+  "LearnCustomEntities",
+  "NGrams",
+  "PhoneticMatch",
+  "QueryCorpus",
+  "RankByRelevance",
+  "Sentences",
+  "TextSimilarity",
+  "Tokenize",
+  "TransformText",
+  "TverskySimilarity"
+])
+
+const CORE_TEXT_PROCESSING_TOOLS: ReadonlyArray<string> = [
+  "DocumentStats",
+  "ChunkBySentences",
+  "Tokenize",
+  "Sentences",
+  "TransformText"
+]
+
+const ENTITY_AND_PATTERN_TOOLS: ReadonlyArray<string> = [
+  "ExtractEntities",
+  "LearnCustomEntities"
+]
+
+const KEYWORD_AND_FEATURE_TOOLS: ReadonlyArray<string> = [
+  "ExtractKeywords",
+  "NGrams"
+]
+
+const SIMILARITY_AND_MATCHING_TOOLS: ReadonlyArray<string> = [
+  "TextSimilarity",
+  "BowCosineSimilarity",
+  "TverskySimilarity",
+  "PhoneticMatch",
+  "RankByRelevance"
+]
+
+const CORPUS_TOOLS: ReadonlyArray<string> = [
+  "CreateCorpus",
+  "LearnCorpus",
+  "QueryCorpus",
+  "CorpusStats",
+  "DeleteCorpus"
+]
+
+const CORPUS_WORKFLOW_TOOLS: ReadonlyArray<string> = [
+  "CreateCorpus",
+  "LearnCorpus",
+  "QueryCorpus"
+]
+
+const STRUCTURED_CONTEXT_FORMATS = new Set<ContextMetadata["format"]>([
+  "ndjson",
+  "json-array",
+  "csv",
+  "tsv"
+])
 
 export const buildReplSystemPrompt = (options: ReplSystemPromptOptions): string => {
   const isStrict = options.sandboxMode === "strict"
   const canRecurse = !isStrict && options.depth < options.maxDepth
   const submitInvocationSchema = buildSubmitInvocationSchema(options.outputJsonSchema)
-  const nlpToolNames = new Set([
-    "DocumentStats",
-    "ChunkBySentences",
-    "RankByRelevance",
-    "ExtractEntities",
-    "Tokenize",
-    "Sentences",
-    "ExtractKeywords",
-    "TextSimilarity",
-    "TransformText"
-  ])
-  const availableNlpTools = (options.tools ?? []).filter((tool) =>
-    nlpToolNames.has(tool.name)
+  const availableTools = options.tools ?? []
+  const availableToolNames = new Set(availableTools.map((tool) => tool.name))
+  const hasAnyTool = (toolNames: ReadonlyArray<string>): boolean =>
+    toolNames.some((name) => availableToolNames.has(name))
+  const hasAllTools = (toolNames: ReadonlyArray<string>): boolean =>
+    toolNames.every((name) => availableToolNames.has(name))
+  const pushNlpToolLine = (lines: Array<string>, toolName: string, text: string): void => {
+    if (availableToolNames.has(toolName)) lines.push(text)
+  }
+  const availableNlpTools = availableTools.filter((tool) =>
+    NLP_TOOL_NAMES.has(tool.name)
   )
+  const hasCoreTextTools = hasAnyTool(CORE_TEXT_PROCESSING_TOOLS)
+  const hasEntityTools = hasAnyTool(ENTITY_AND_PATTERN_TOOLS)
+  const hasKeywordFeatureTools = hasAnyTool(KEYWORD_AND_FEATURE_TOOLS)
+  const hasSimilarityTools = hasAnyTool(SIMILARITY_AND_MATCHING_TOOLS)
+  const hasCorpusTools = hasAnyTool(CORPUS_TOOLS)
+  const hasCorpusWorkflow = hasAllTools(CORPUS_WORKFLOW_TOOLS)
+  const hasLargeStructuredContext = !isStrict &&
+    options.contextMetadata !== undefined &&
+    STRUCTURED_CONTEXT_FORMATS.has(options.contextMetadata.format) &&
+    (options.contextMetadata.recordCount ?? 0) > 50 &&
+    hasCorpusWorkflow
   const lines: Array<string> = []
 
   lines.push("You are a recursive problem-solving agent with access to a code sandbox.")
@@ -94,12 +175,25 @@ export const buildReplSystemPrompt = (options: ReplSystemPromptOptions): string 
   }
   lines.push("4. Aggregate near the end and verify before submitting.")
   lines.push("")
+  if (hasLargeStructuredContext) {
+    const recordCount = options.contextMetadata?.recordCount ?? 0
+    const format = options.contextMetadata?.format ?? "structured"
+    lines.push("### Context-Specific Guidance")
+    lines.push(`Detected ${format} context with about ${recordCount} records.`)
+    lines.push("For selective retrieval tasks, prefer a retrieval-first pattern over scanning every record:")
+    lines.push("1. Parse records from `__vars.context`.")
+    lines.push("2. Build one corpus: `CreateCorpus` + batched `LearnCorpus` (~500 records per call), or call `init_corpus_from_context({ corpusId, batchSize })`.")
+    lines.push("3. Run `QueryCorpus` to shortlist candidates, then use `llm_query` on just the shortlist.")
+    lines.push("4. Use `CorpusStats` for diagnostics and `DeleteCorpus` when finished.")
+    lines.push("")
+  }
   lines.push("## Final Answer")
   lines.push("When done, call SUBMIT with your verified answer.")
   lines.push(options.outputJsonSchema
-    ? "- For structured output: `SUBMIT({ value: {...} })`."
-    : "- For plain-text output: `SUBMIT({ answer: \"your answer\" })`.")
-  lines.push("- Use exactly one field in SUBMIT: `answer` OR `value`.")
+    ? "- For structured output: `SUBMIT({ value: {...} })` or `SUBMIT({ variable: \"finalValue\" })`."
+    : "- For plain-text output: `SUBMIT({ answer: \"your answer\" })` or `SUBMIT({ variable: \"finalAnswer\" })`.")
+  lines.push("- Use exactly one field in SUBMIT: `answer` OR `value` OR `variable`.")
+  lines.push("- For very large final outputs, store the result in `__vars` and submit with `variable` to avoid output truncation.")
   lines.push("- `SUBMIT` ends execution immediately. You MUST have seen execution output confirming your results before calling it.")
   lines.push("- Do NOT include SUBMIT() inside a code block — place it as standalone text.")
   lines.push(`- SUBMIT invocation schema for this run: ${JSON.stringify(submitInvocationSchema)}`)
@@ -154,56 +248,149 @@ export const buildReplSystemPrompt = (options: ReplSystemPromptOptions): string 
     lines.push("- String heuristics for summarization/paraphrase")
     lines.push("- Topic classification from naive word frequency alone")
     lines.push("- Large heuristic blocks where one llm_query() call is simpler")
+    if (hasCorpusWorkflow) {
+      lines.push("- Scanning every structured record with `llm_query_batched` when `QueryCorpus` can prefilter candidates")
+      lines.push("- Rebuilding the same corpus every iteration instead of creating once and querying repeatedly")
+      lines.push("- Forgetting to release large corpora after use (`DeleteCorpus`)")
+    }
     lines.push("")
-    lines.push("## Example: Large-Context Semantic Analysis")
-    lines.push("Query: \"What are the main political themes in these posts?\"")
-    lines.push("")
-    lines.push("Iteration 1:")
-    lines.push("```js")
-    lines.push("// Inspect and plan inline; execute immediately")
-    lines.push("const data = __vars.context")
-    lines.push("print(typeof data)")
-    lines.push("print(data.length)")
-    lines.push("const chunkSize = Math.max(2000, Math.ceil(data.length / 6))")
-    lines.push("__vars.chunks = []")
-    lines.push("for (let i = 0; i < data.length; i += chunkSize) {")
-    lines.push("  __vars.chunks.push(data.slice(i, i + chunkSize))")
-    lines.push("}")
-    lines.push("print(`chunks=${__vars.chunks.length}, chunkSize~${chunkSize}`)")
-    lines.push("```")
-    lines.push("")
-    lines.push("Iteration 2:")
-    lines.push("```js")
-    lines.push("const analyses = await llm_query_batched(")
-    lines.push("  __vars.chunks.map(() => \"Identify main political themes in this chunk. Return short bullet points.\"),")
-    lines.push("  __vars.chunks")
-    lines.push(")")
-    lines.push("__vars.analyses = analyses")
-    lines.push("print(analyses.join('\\n---\\n'))")
-    lines.push("```")
-    lines.push("")
-    lines.push("Iteration 3:")
-    lines.push("```js")
-    lines.push("const synthesis = await llm_query(")
-    lines.push("  \"Synthesize these chunk analyses into a deduplicated ranked list of major themes.\",")
-    lines.push("  __vars.analyses.join('\\n\\n')")
-    lines.push(")")
-    lines.push("print(synthesis)")
-    lines.push("```")
-    lines.push("")
-    lines.push("Then: `SUBMIT({ answer: synthesis })`")
-    lines.push("")
+    if (hasCorpusWorkflow) {
+      lines.push("## Example: Retrieval-First Analysis for Structured Context")
+      lines.push("Query: \"What are the most discussed transfer rumors in this feed?\"")
+      lines.push("")
+      lines.push("Iteration 1:")
+      lines.push("```js")
+      lines.push("const boot = await init_corpus_from_context({ corpusId: \"context\", batchSize: 500 })")
+      lines.push("print(JSON.stringify(boot))")
+      lines.push("const hits = await QueryCorpus(\"context\", \"transfer window rumors\", 30, true)")
+      lines.push("__vars.hits = hits.ranked")
+      lines.push("print(`hits=${hits.returned}/${hits.totalDocuments}`)")
+      lines.push("```")
+      lines.push("")
+      lines.push("Iteration 2:")
+      lines.push("```js")
+      lines.push("const topTexts = __vars.hits.slice(0, 15).map((item) => item.text)")
+      lines.push("const analyses = await llm_query_batched(")
+      lines.push("  topTexts.map(() => \"Summarize this post's transfer claim and sentiment.\"),")
+      lines.push("  topTexts")
+      lines.push(")")
+      lines.push("__vars.analyses = analyses")
+      lines.push("print(analyses.join('\\n---\\n'))")
+      lines.push("```")
+      lines.push("")
+      lines.push("Iteration 3:")
+      lines.push("```js")
+      lines.push("const synthesis = await llm_query(")
+      lines.push("  \"Synthesize the strongest transfer themes across these analyses.\",")
+      lines.push("  __vars.analyses.join('\\n\\n')")
+      lines.push(")")
+      lines.push("await DeleteCorpus(\"context\")")
+      lines.push("print(synthesis)")
+      lines.push("```")
+      lines.push("")
+      lines.push("Then: `SUBMIT({ answer: synthesis })`")
+      lines.push("")
+    } else {
+      lines.push("## Example: Large-Context Semantic Analysis")
+      lines.push("Query: \"What are the main political themes in these posts?\"")
+      lines.push("")
+      lines.push("Iteration 1:")
+      lines.push("```js")
+      lines.push("// Inspect and plan inline; execute immediately")
+      lines.push("const data = __vars.context")
+      lines.push("print(typeof data)")
+      lines.push("print(data.length)")
+      lines.push("const chunkSize = Math.max(2000, Math.ceil(data.length / 6))")
+      lines.push("__vars.chunks = []")
+      lines.push("for (let i = 0; i < data.length; i += chunkSize) {")
+      lines.push("  __vars.chunks.push(data.slice(i, i + chunkSize))")
+      lines.push("}")
+      lines.push("print(`chunks=${__vars.chunks.length}, chunkSize~${chunkSize}`)")
+      lines.push("```")
+      lines.push("")
+      lines.push("Iteration 2:")
+      lines.push("```js")
+      lines.push("const analyses = await llm_query_batched(")
+      lines.push("  __vars.chunks.map(() => \"Identify main political themes in this chunk. Return short bullet points.\"),")
+      lines.push("  __vars.chunks")
+      lines.push(")")
+      lines.push("__vars.analyses = analyses")
+      lines.push("print(analyses.join('\\n---\\n'))")
+      lines.push("```")
+      lines.push("")
+      lines.push("Iteration 3:")
+      lines.push("```js")
+      lines.push("const synthesis = await llm_query(")
+      lines.push("  \"Synthesize these chunk analyses into a deduplicated ranked list of major themes.\",")
+      lines.push("  __vars.analyses.join('\\n\\n')")
+      lines.push(")")
+      lines.push("print(synthesis)")
+      lines.push("```")
+      lines.push("")
+      lines.push("Then: `SUBMIT({ answer: synthesis })`")
+      lines.push("")
+    }
   }
 
   if (!isStrict && options.tools && options.tools.length > 0) {
     lines.push("## Available Tools")
     if (availableNlpTools.length > 0) {
-      lines.push("### Use NLP tools for:")
-      lines.push("- Quick document profiling before planning (`DocumentStats`).")
-      lines.push("- Sentence-aligned chunking before `llm_query_batched` (`ChunkBySentences`).")
-      lines.push("- Relevance filtering before expensive semantic calls (`RankByRelevance`).")
-      lines.push("- Named entity extraction with offsets (`ExtractEntities`).")
-      lines.push("- Prefer these tools over custom regex heuristics when the tool already matches the task.")
+      lines.push("### NLP Tools")
+      lines.push("Use NLP tools when they match the task instead of re-implementing behavior with ad-hoc regexes.")
+      lines.push("")
+
+      if (hasCoreTextTools) {
+        lines.push("**Core Text Processing**")
+        pushNlpToolLine(lines, "DocumentStats", "- `DocumentStats(text)` — quick profile before planning.")
+        pushNlpToolLine(lines, "ChunkBySentences", "- `ChunkBySentences(text, maxChunkChars)` — sentence-aligned chunking.")
+        pushNlpToolLine(lines, "Tokenize", "- `Tokenize(text)` — token-level linguistic features (POS/lemma/stem).")
+        pushNlpToolLine(lines, "Sentences", "- `Sentences(text)` — sentence segmentation with offsets.")
+        pushNlpToolLine(lines, "TransformText", "- `TransformText(text, operations)` — normalization / cleanup pipeline.")
+        lines.push("")
+      }
+
+      if (hasEntityTools) {
+        lines.push("**Entity Extraction and Learning**")
+        pushNlpToolLine(lines, "ExtractEntities", "- `ExtractEntities(text, includeCustom?)` — named entities with offsets.")
+        pushNlpToolLine(lines, "LearnCustomEntities", "- `LearnCustomEntities(groupName?, mode?, entities[])` — teach domain entity patterns; learned patterns persist during this call.")
+        lines.push("")
+      }
+
+      if (hasKeywordFeatureTools) {
+        lines.push("**Keyword and Feature Extraction**")
+        pushNlpToolLine(lines, "ExtractKeywords", "- `ExtractKeywords(text, topN?)` — TF-IDF keywords.")
+        pushNlpToolLine(lines, "NGrams", "- `NGrams(text, size, mode?, topN?)` — n-gram fingerprints for near-duplicate/variant matching.")
+        lines.push("")
+      }
+
+      if (hasSimilarityTools) {
+        lines.push("**Similarity, Ranking, and Fuzzy Matching**")
+        pushNlpToolLine(lines, "TextSimilarity", "- `TextSimilarity(text1, text2)` — BM25-based semantic similarity score.")
+        pushNlpToolLine(lines, "BowCosineSimilarity", "- `BowCosineSimilarity(text1, text2)` — bag-of-words cosine baseline.")
+        pushNlpToolLine(lines, "TverskySimilarity", "- `TverskySimilarity(text1, text2, alpha?, beta?)` — asymmetric containment similarity.")
+        pushNlpToolLine(lines, "PhoneticMatch", "- `PhoneticMatch(text1, text2, algorithm?, minTokenLength?)` — phonetic overlap for spelling variants.")
+        pushNlpToolLine(lines, "RankByRelevance", "- `RankByRelevance(texts, query, topN?)` — stateless ranking for small in-memory candidate sets.")
+        lines.push("")
+      }
+
+      if (hasCorpusTools) {
+      lines.push("**Corpus Retrieval (Stateful BM25)**")
+      pushNlpToolLine(lines, "CreateCorpus", "- `CreateCorpus(corpusId?, bm25Config?)` — create a named retrieval corpus.")
+      pushNlpToolLine(lines, "LearnCorpus", "- `LearnCorpus(corpusId, documents, dedupeById?)` — learn corpus docs incrementally (batch large datasets).")
+      pushNlpToolLine(lines, "QueryCorpus", "- `QueryCorpus(corpusId, query, topN?, includeText?)` — ranked retrieval against learned corpus.")
+      pushNlpToolLine(lines, "CorpusStats", "- `CorpusStats(corpusId, includeIdf?, includeMatrix?, topIdfTerms?)` — inspect term/IDF internals.")
+      pushNlpToolLine(lines, "DeleteCorpus", "- `DeleteCorpus(corpusId)` — release corpus memory when done.")
+      if (hasCorpusWorkflow) {
+        lines.push("- Retrieval-first pattern: create once -> learn in batches -> query repeatedly -> delete at end.")
+        lines.push("- Use corpus retrieval before expensive `llm_query_batched` passes over very large record sets.")
+        lines.push("- Helpers available in the sandbox:")
+        lines.push("  - `init_corpus(documents, options?)` — batch-learn an array of documents and set `__vars.contextCorpusId`.")
+        lines.push("  - `init_corpus_from_context(options?)` — parse `__vars.context` via `__vars.contextMeta`, learn corpus, and set `__vars.contextCorpusId`.")
+      }
+      lines.push("")
+    }
+
+      lines.push("- Prefer built-in NLP tools over custom heuristics when a tool already matches the task.")
     }
     for (const tool of options.tools) {
       const params = tool.parameterNames.join(", ")
@@ -223,8 +410,8 @@ export const buildReplSystemPrompt = (options: ReplSystemPromptOptions): string 
 
   if (options.outputJsonSchema) {
     lines.push("## Output Format")
-    lines.push("Respond with exactly one SUBMIT tool call using `value`.")
-    lines.push("The `value` payload MUST be valid JSON matching this schema:")
+    lines.push("Respond with exactly one SUBMIT tool call using `value` or `variable`.")
+    lines.push("If using `value`, the payload MUST be valid JSON matching this schema:")
     lines.push(JSON.stringify(options.outputJsonSchema, null, 2))
     lines.push(`SUBMIT invocation schema for this run: ${JSON.stringify(submitInvocationSchema)}`)
     lines.push("")
@@ -250,15 +437,17 @@ export const buildExtractSystemPrompt = (outputJsonSchema?: object): string => {
   lines.push("Review the conversation above and extract the final answer to the original query.")
   lines.push("You MUST finalize using exactly one SUBMIT tool call.")
   lines.push("Do NOT output code blocks, FINAL(), or commentary.")
+  lines.push("If your best final output already exists in `__vars`, you may finalize via `SUBMIT({ variable: \"name\" })`.")
+  lines.push("Note: variable references are resolved through tool calls; text-only fallback parsing does not resolve textual SUBMIT snippets.")
   lines.push(`SUBMIT invocation schema for this run: ${JSON.stringify(submitInvocationSchema)}`)
   lines.push("")
 
   if (outputJsonSchema) {
-    lines.push("Call `SUBMIT({ value: ... })` and nothing else.")
+    lines.push("Call `SUBMIT({ value: ... })` or `SUBMIT({ variable: \"finalValue\" })` and nothing else.")
     lines.push("Your answer MUST be valid JSON matching this schema:")
     lines.push(JSON.stringify(outputJsonSchema, null, 2))
   } else {
-    lines.push("Call `SUBMIT({ answer: \"your answer\" })` and nothing else.")
+    lines.push("Call `SUBMIT({ answer: \"your answer\" })` or `SUBMIT({ variable: \"finalAnswer\" })` and nothing else.")
   }
 
   return lines.join("\n")

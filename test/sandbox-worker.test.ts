@@ -273,6 +273,140 @@ describe("sandbox-worker", () => {
     expect(execResult.output).toBe("caught: service unavailable")
   })
 
+  test("init_corpus helper batches documents via CreateCorpus/LearnCorpus bridge calls", async () => {
+    handle = spawnWorker()
+    handle.proc.send({
+      _tag: "Init",
+      callId: "test-call",
+      depth: 0,
+      tools: [
+        { name: "CreateCorpus", parameterNames: ["corpusId"] },
+        { name: "LearnCorpus", parameterNames: ["corpusId", "documents", "dedupeById"] }
+      ]
+    })
+    await Bun.sleep(100)
+
+    handle.proc.send({
+      _tag: "ExecRequest",
+      requestId: "exec-init-corpus",
+      code: `
+        const summary = await init_corpus(
+          [{ id: "a", text: "alpha" }, { id: "b", text: "beta" }],
+          { corpusId: "boot", batchSize: 2 }
+        )
+        print(summary.corpusId + "|" + summary.documentsLearned + "|" + summary.batches)
+      `
+    })
+
+    const createCall = await handle.waitForMessage()
+    expect(createCall._tag).toBe("BridgeCall")
+    expect(createCall.method).toBe("CreateCorpus")
+    expect(createCall.args).toEqual(["boot"])
+
+    handle.proc.send({
+      _tag: "BridgeResult",
+      requestId: createCall.requestId,
+      result: { corpusId: "boot" }
+    })
+
+    const learnCall = await handle.waitForMessage()
+    expect(learnCall._tag).toBe("BridgeCall")
+    expect(learnCall.method).toBe("LearnCorpus")
+    expect(learnCall.args).toEqual([
+      "boot",
+      [{ id: "a", text: "alpha" }, { id: "b", text: "beta" }],
+      true
+    ])
+
+    handle.proc.send({
+      _tag: "BridgeResult",
+      requestId: learnCall.requestId,
+      result: { learned: 2 }
+    })
+
+    const execResult = await handle.waitForMessage()
+    expect(execResult._tag).toBe("ExecResult")
+    expect(execResult.output).toBe("boot|2|1")
+  })
+
+  test("init_corpus_from_context helper parses ndjson context and stores contextCorpusId", async () => {
+    handle = spawnWorker()
+    handle.proc.send({
+      _tag: "Init",
+      callId: "test-call",
+      depth: 0,
+      tools: [
+        { name: "CreateCorpus", parameterNames: ["corpusId"] },
+        { name: "LearnCorpus", parameterNames: ["corpusId", "documents", "dedupeById"] }
+      ]
+    })
+    await Bun.sleep(100)
+
+    handle.proc.send({
+      _tag: "SetVar",
+      requestId: "set-context",
+      name: "context",
+      value: "{\"id\":1,\"text\":\"hello\"}\n{\"id\":2,\"text\":\"world\"}"
+    })
+    await handle.waitForMessage()
+
+    handle.proc.send({
+      _tag: "SetVar",
+      requestId: "set-meta",
+      name: "contextMeta",
+      value: { format: "ndjson" }
+    })
+    await handle.waitForMessage()
+
+    handle.proc.send({
+      _tag: "ExecRequest",
+      requestId: "exec-init-from-context",
+      code: `
+        const summary = await init_corpus_from_context({ corpusId: "feed", batchSize: 10 })
+        print(summary.documentsLearned)
+      `
+    })
+
+    const createCall = await handle.waitForMessage()
+    expect(createCall._tag).toBe("BridgeCall")
+    expect(createCall.method).toBe("CreateCorpus")
+    expect(createCall.args).toEqual(["feed"])
+
+    handle.proc.send({
+      _tag: "BridgeResult",
+      requestId: createCall.requestId,
+      result: { corpusId: "feed" }
+    })
+
+    const learnCall = await handle.waitForMessage()
+    expect(learnCall._tag).toBe("BridgeCall")
+    expect(learnCall.method).toBe("LearnCorpus")
+    expect(learnCall.args).toEqual([
+      "feed",
+      [{ id: "1", text: "hello" }, { id: "2", text: "world" }],
+      true
+    ])
+
+    handle.proc.send({
+      _tag: "BridgeResult",
+      requestId: learnCall.requestId,
+      result: { learned: 2 }
+    })
+
+    const execResult = await handle.waitForMessage()
+    expect(execResult._tag).toBe("ExecResult")
+    expect(execResult.output).toBe("2")
+
+    handle.proc.send({
+      _tag: "GetVarRequest",
+      requestId: "get-context-corpus-id",
+      name: "contextCorpusId"
+    })
+    const getCorpusId = await handle.waitForMessage()
+    expect(getCorpusId._tag).toBe("GetVarResult")
+    expect(getCorpusId.value).toBe("feed")
+  })
+
   test("strict mode disables llm_query bridge calls", async () => {
     handle = spawnWorker()
     handle.proc.send({ _tag: "Init", callId: "test-call", depth: 0, sandboxMode: "strict" })

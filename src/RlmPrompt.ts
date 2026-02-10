@@ -101,7 +101,9 @@ export const buildReplPrompt = (options: BuildReplPromptOptions): Prompt.Prompt 
   let lastCacheableTranscriptMessageIndex: number | undefined
 
   for (const entry of options.transcript) {
-    messages.push({ role: "assistant", content: entry.assistantResponse })
+    const trimmedResponse = entry.assistantResponse.trim()
+    if (trimmedResponse === "") continue
+    messages.push({ role: "assistant", content: trimmedResponse })
     if (entry.executionOutput !== undefined) {
       const outputText = entry.executionOutput === ""
         ? "(no output — did you forget to print?)"
@@ -176,7 +178,9 @@ export const buildExtractPrompt = (options: BuildExtractPromptOptions): Prompt.P
   let lastCacheableTranscriptMessageIndex: number | undefined
 
   for (const entry of options.transcript) {
-    messages.push({ role: "assistant", content: entry.assistantResponse })
+    const trimmedResponse = entry.assistantResponse.trim()
+    if (trimmedResponse === "") continue
+    messages.push({ role: "assistant", content: trimmedResponse })
     if (entry.executionOutput !== undefined) {
       const outputText = entry.executionOutput === ""
         ? "(no output)"

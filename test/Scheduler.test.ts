@@ -157,6 +157,60 @@ describe("Scheduler integration", () => {
     expect(lastUserText).toContain("llm_query()")
   })
 
+  test("variable snapshot sync failure emits warning and loop continues", async () => {
+    const model = makeFakeRlmModelLayer([
+      { text: "```js\nprint('sync')\n```" },
+      submitAnswer("ok")
+    ])
+
+    const failingSyncSandboxLayer = Layer.succeed(
+      SandboxFactory,
+      SandboxFactory.of({
+        create: () => {
+          const vars = new Map<string, unknown>()
+          return Effect.succeed({
+            execute: () => Effect.succeed("executed"),
+            setVariable: (name: string, value: unknown) =>
+              Effect.sync(() => {
+                vars.set(name, value)
+              }),
+            getVariable: (name: string) => Effect.succeed(vars.get(name)),
+            listVariables: () => Effect.fail(new SandboxError({ message: "listVariables unavailable" }))
+          })
+        }
+      })
+    )
+
+    const layers = Layer.mergeAll(
+      model,
+      failingSyncSandboxLayer,
+      makeRuntimeWithBridgeStoreLayer(),
+      Layer.succeed(RlmConfig, defaultConfig)
+    )
+
+    const events = await Effect.runPromise(
+      stream({
+        query: "sync warning",
+        context: "ctx"
+      }).pipe(
+        Stream.runCollect,
+        Effect.provide(layers)
+      )
+    )
+
+    const eventList = Chunk.toReadonlyArray(events)
+    const warning = eventList.find((event) =>
+      event._tag === "SchedulerWarning" && event.code === "VARIABLE_SYNC_FAILED"
+    )
+    expect(warning).toBeDefined()
+
+    const finalized = eventList.find(
+      (event): event is Extract<typeof event, { _tag: "CallFinalized" }> =>
+        event._tag === "CallFinalized"
+    )
+    expect(finalized?.answer).toBe("ok")
+  })
+
   test("SUBMIT tool call finalizes immediately (no sandbox execution)", async () => {
     const sandboxMetrics: FakeSandboxMetrics = {
       createCalls: 0,
@@ -381,6 +435,36 @@ describe("Scheduler integration", () => {
     expect(modelMetrics.disableToolCallResolutions?.[1]).toBe(true)
   })
 
+  test("extract fallback resolves SUBMIT variable tool calls", async () => {
+    const result = await Effect.runPromise(
+      complete({
+        query: "from-query-variable",
+        context: "ctx"
+      }).pipe(
+        Effect.either,
+        Effect.provide(
+          makeLayers({
+            responses: [
+              { text: "I need one more pass." },
+              {
+                toolCalls: [{
+                  name: "SUBMIT",
+                  params: { variable: "query" }
+                }]
+              }
+            ],
+            config: { maxIterations: 1 }
+          })
+        )
+      )
+    )
+
+    expect(result._tag).toBe("Right")
+    if (result._tag === "Right") {
+      expect(result.right).toBe("from-query-variable")
+    }
+  })
+
   test("extract path degrades to text mode when forced SUBMIT tool path fails", async () => {
     const modelMetrics: FakeModelMetrics = {
       calls: 0,
@@ -416,6 +500,181 @@ describe("Scheduler integration", () => {
     }
     expect(modelMetrics.toolChoices).toEqual(["auto", { tool: "SUBMIT" }, "none"])
     expect(modelMetrics.disableToolCallResolutions).toEqual([true, true, undefined])
+  })
+
+  test("extract text-mode fallback does not parse textual SUBMIT variable snippets", async () => {
+    const result = await Effect.runPromise(
+      complete({
+        query: "compute",
+        context: "ctx"
+      }).pipe(
+        Effect.either,
+        Effect.provide(
+          makeLayers({
+            responses: [
+              { text: "I need one more pass." },
+              { error: "Failed to decode tool call parameters for tool 'SUBMIT'" },
+              { text: 'SUBMIT({ variable: "query" })' }
+            ],
+            config: { maxIterations: 1 }
+          })
+        )
+      )
+    )
+
+    expect(result._tag).toBe("Left")
+    if (result._tag === "Left") {
+      expect(result.left._tag).toBe("NoFinalAnswerError")
+    }
+  })
+
+  test("consecutive near-empty responses trigger early extract fallback", async () => {
+    const modelMetrics: FakeModelMetrics = {
+      calls: 0,
+      prompts: [],
+      depths: [],
+      toolChoices: [],
+      disableToolCallResolutions: []
+    }
+
+    const events = await Effect.runPromise(
+      stream({
+        query: "stall detector",
+        context: "ctx"
+      }).pipe(
+        Stream.runCollect,
+        Effect.provide(
+          makeLayers({
+            responses: [
+              { text: "hmm" },
+              { text: "ok" },
+              { text: "..." },
+              submitAnswer("early-extracted")
+            ],
+            modelMetrics,
+            config: {
+              maxIterations: 10,
+              stallConsecutiveLimit: 3,
+              stallResponseMaxChars: 3
+            }
+          })
+        )
+      )
+    )
+
+    const eventList = Chunk.toReadonlyArray(events)
+    const finalized = eventList.find(
+      (event): event is Extract<typeof event, { _tag: "CallFinalized" }> =>
+        event._tag === "CallFinalized" && event.depth === 0
+    )
+    expect(finalized).toBeDefined()
+    expect(finalized?.answer).toBe("early-extracted")
+
+    const warning = eventList.find(
+      (event): event is Extract<typeof event, { _tag: "SchedulerWarning" }> =>
+        event._tag === "SchedulerWarning" && event.code === "STALL_DETECTED_EARLY_EXTRACT"
+    )
+    expect(warning).toBeDefined()
+    expect(modelMetrics.toolChoices).toEqual(["auto", "auto", "auto", { tool: "SUBMIT" }])
+  })
+
+  test("non-stall response resets consecutive stall counter", async () => {
+    const modelMetrics: FakeModelMetrics = {
+      calls: 0,
+      prompts: [],
+      depths: [],
+      toolChoices: [],
+      disableToolCallResolutions: []
+    }
+
+    const result = await Effect.runPromise(
+      complete({
+        query: "stall reset",
+        context: "ctx"
+      }).pipe(
+        Effect.either,
+        Effect.provide(
+          makeLayers({
+            responses: [
+              { text: "hmm" },
+              { text: "This is a sufficiently long planning note that should reset stalling." },
+              { text: "ok" },
+              { text: "yo" },
+              submitAnswer("normal-submit")
+            ],
+            modelMetrics,
+            config: {
+              maxIterations: 10,
+              stallConsecutiveLimit: 3,
+              stallResponseMaxChars: 3
+            }
+          })
+        )
+      )
+    )
+
+    expect(result._tag).toBe("Right")
+    if (result._tag === "Right") {
+      expect(result.right).toBe("normal-submit")
+    }
+    expect(modelMetrics.toolChoices).toEqual(["auto", "auto", "auto", "auto", "auto"])
+  })
+
+  test("threads large structured context metadata into REPL system prompt for corpus guidance", async () => {
+    const modelMetrics: FakeModelMetrics = { calls: 0, prompts: [], depths: [] }
+    const makeNoopTool = (name: string) =>
+      RlmTool.make(name, {
+        description: `${name} noop`,
+        parameters: { arg: Schema.String },
+        returns: Schema.String,
+        handler: () => Effect.succeed("ok")
+      })
+
+    const ndjsonContext = Array.from({ length: 80 }, (_, index) =>
+      JSON.stringify({ id: index, text: `post-${index}` })
+    ).join("\n")
+
+    const result = await Effect.runPromise(
+      complete({
+        query: "find trends",
+        context: ndjsonContext,
+        contextMetadata: analyzeContext(ndjsonContext, "feed.ndjson"),
+        tools: [
+          makeNoopTool("CreateCorpus"),
+          makeNoopTool("LearnCorpus"),
+          makeNoopTool("QueryCorpus")
+        ]
+      }).pipe(
+        Effect.either,
+        Effect.provide(
+          makeLayers({
+            responses: [submitAnswer("ok")],
+            modelMetrics
+          })
+        )
+      )
+    )
+
+    expect(result._tag).toBe("Right")
+    if (result._tag === "Right") {
+      expect(result.right).toBe("ok")
+    }
+
+    const firstPrompt = modelMetrics.prompts[0]!
+    const firstSystemMessage = firstPrompt.content.find((message) => message.role === "system")
+    let firstSystemText = ""
+    if (firstSystemMessage?.role === "system") {
+      const content = firstSystemMessage.content
+      if (typeof content === "string") {
+        firstSystemText = content
+      } else {
+        firstSystemText = (content[0] as { readonly text: string } | undefined)?.text ?? ""
+      }
+    }
+
+    expect(firstSystemText).toContain("### Context-Specific Guidance")
+    expect(firstSystemText).toContain("CreateCorpus")
+    expect(firstSystemText).toContain("QueryCorpus")
   })
 
   test("no code block and no SUBMIT → loops to next GenerateStep", async () => {

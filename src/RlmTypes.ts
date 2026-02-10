@@ -134,6 +134,8 @@ export type RlmEvent = Data.TaggedEnum<{
       | "CALL_SCOPE_CLEANUP"
       | "MIXED_SUBMIT_AND_CODE"
       | "TOOLKIT_DEGRADED"
+      | "VARIABLE_SYNC_FAILED"
+      | "STALL_DETECTED_EARLY_EXTRACT"
     readonly message: string
     readonly callId?: CallId
     readonly commandTag?: RlmCommand["_tag"]

@@ -18,9 +18,15 @@ const SubmitValueField = Schema.Unknown.annotations({
   examples: [{ result: 42 }, ["item-1", "item-2"]]
 })
 
+const SubmitVariableField = Schema.String.pipe(Schema.minLength(1)).annotations({
+  description: "Variable name in __vars containing the final answer/value.",
+  examples: ["finalAnswer", "finalValue"]
+})
+
 const SubmitToolParameters = {
   answer: Schema.optional(SubmitAnswerField),
-  value: Schema.optional(SubmitValueField)
+  value: Schema.optional(SubmitValueField),
+  variable: Schema.optional(SubmitVariableField)
 }
 
 const SubmitToolDefinition = Tool.make(SUBMIT_TOOL_NAME, {
@@ -34,23 +40,49 @@ const SubmitToolDefinition = Tool.make(SUBMIT_TOOL_NAME, {
 export const buildSubmitInvocationSchema = (outputJsonSchema?: object): object =>
   outputJsonSchema !== undefined
     ? {
-        type: "object",
-        additionalProperties: false,
-        required: ["value"],
-        properties: {
-          value: outputJsonSchema
-        }
+        oneOf: [{
+          type: "object",
+          additionalProperties: false,
+          required: ["value"],
+          properties: {
+            value: outputJsonSchema
+          }
+        }, {
+          type: "object",
+          additionalProperties: false,
+          required: ["variable"],
+          properties: {
+            variable: {
+              type: "string",
+              minLength: 1,
+              description: "Name of a __vars key containing the final structured value."
+            }
+          }
+        }]
       }
     : {
-        type: "object",
-        additionalProperties: false,
-        required: ["answer"],
-        properties: {
-          answer: {
-            type: "string",
-            description: "Plain-text final answer."
+        oneOf: [{
+          type: "object",
+          additionalProperties: false,
+          required: ["answer"],
+          properties: {
+            answer: {
+              type: "string",
+              description: "Plain-text final answer."
+            }
           }
-        }
+        }, {
+          type: "object",
+          additionalProperties: false,
+          required: ["variable"],
+          properties: {
+            variable: {
+              type: "string",
+              minLength: 1,
+              description: "Name of a __vars key containing the final plain-text answer."
+            }
+          }
+        }]
       }
 
 const SubmitToolkit = Toolkit.make(SubmitToolDefinition)
@@ -75,7 +107,12 @@ const SubmitStructuredPayload = Schema.Struct({
   value: SubmitValueField
 })
 
+const SubmitVariablePayload = Schema.Struct({
+  variable: SubmitVariableField
+})
+
 export type SubmitAnswer = FinalAnswerPayload
+export type SubmitPayload = SubmitAnswer | { readonly source: "variable"; readonly variable: string }
 
 export const renderSubmitAnswer = (answer: SubmitAnswer): string => {
   if (answer.source === "answer") {
@@ -92,7 +129,7 @@ export const renderSubmitAnswer = (answer: SubmitAnswer): string => {
 export type SubmitAnswerExtraction =
   | {
       readonly _tag: "Found"
-      readonly value: SubmitAnswer
+      readonly value: SubmitPayload
     }
   | {
       readonly _tag: "Missing"
@@ -113,12 +150,26 @@ const SubmitParseOptions = {
 const decodeSubmitPayload = (
   params: unknown,
   outputMode: "plain" | "structured"
-): Either.Either<SubmitAnswer, string> => {
+): Either.Either<SubmitPayload, string> => {
+  if (typeof params === "object" && params !== null && "variable" in params) {
+    const variableDecoded = Schema.decodeUnknownEither(SubmitVariablePayload)(params, SubmitParseOptions)
+    if (Either.isLeft(variableDecoded)) {
+      return Either.left(
+        `Variable output requires \`SUBMIT({ variable: "name" })\` with a non-empty variable name and no extra fields. ${formatParseError(variableDecoded.left)}`
+      )
+    }
+
+    return Either.right({
+      source: "variable",
+      variable: variableDecoded.right.variable
+    })
+  }
+
   if (outputMode === "structured") {
     const decoded = Schema.decodeUnknownEither(SubmitStructuredPayload)(params, SubmitParseOptions)
     if (Either.isLeft(decoded)) {
       return Either.left(
-        `Structured output requires \`SUBMIT({ value: ... })\` with no extra fields. ${formatParseError(decoded.left)}`
+        `Structured output requires \`SUBMIT({ value: ... })\` OR \`SUBMIT({ variable: "name" })\` with no extra fields. ${formatParseError(decoded.left)}`
       )
     }
     return Either.right({
@@ -130,7 +181,7 @@ const decodeSubmitPayload = (
   const decoded = Schema.decodeUnknownEither(SubmitPlainPayload)(params, SubmitParseOptions)
   if (Either.isLeft(decoded)) {
     return Either.left(
-      `Plain-text output requires \`SUBMIT({ answer: \"...\" })\` with no extra fields. ${formatParseError(decoded.left)}`
+      `Plain-text output requires \`SUBMIT({ answer: \"...\" })\` OR \`SUBMIT({ variable: "name" })\` with no extra fields. ${formatParseError(decoded.left)}`
     )
   }
 

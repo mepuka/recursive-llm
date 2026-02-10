@@ -38,8 +38,7 @@ export const makeVariableSpace = (
     const snapshot: VariableSnapshot = {
       variables,
       snapshotIteration: iteration,
-      syncedAtMs: Date.now(),
-      freshness: "fresh"
+      syncedAtMs: Date.now()
     }
     yield* Ref.set(snapshotRef, snapshot)
     return snapshot
