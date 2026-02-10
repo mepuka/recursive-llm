@@ -151,6 +151,9 @@ export const buildReplSystemPrompt = (options: ReplSystemPromptOptions): string 
   lines.push("- ALWAYS use `print()` to see results — nothing is displayed unless you print it. `console.log` goes to stderr and you will NOT see it.")
   lines.push(`- Top-level \`await\` is supported for async calls${canRecurse ? " (tools, llm_query)" : ""}.`)
   lines.push("- Only the FIRST code block in your response is executed. Do not include multiple code blocks.")
+  if (canRecurse) {
+    lines.push("- `llm_query()`, `llm_query_batched()`, and all tool functions are sandbox functions. Call them ONLY inside ```js code blocks with `await`. Do NOT invoke them as external tool calls.")
+  }
   lines.push("")
   lines.push("## Persistent State")
   lines.push("Each code block runs in a fresh scope — local variables (`let`, `const`) do NOT survive between executions.")
@@ -189,13 +192,18 @@ export const buildReplSystemPrompt = (options: ReplSystemPromptOptions): string 
   }
   lines.push("## Final Answer")
   lines.push("When done, call SUBMIT with your verified answer.")
-  lines.push(options.outputJsonSchema
-    ? "- For structured output: `SUBMIT({ value: {...} })` or `SUBMIT({ variable: \"finalValue\" })`."
-    : "- For plain-text output: `SUBMIT({ answer: \"your answer\" })` or `SUBMIT({ variable: \"finalAnswer\" })`.")
-  lines.push("- Use exactly one field in SUBMIT: `answer` OR `value` OR `variable`.")
+  if (options.outputJsonSchema) {
+    lines.push("- For structured output: `SUBMIT({ value: {...} })` or `SUBMIT({ variable: \"finalValue\" })`.")
+    lines.push("- Do NOT use `SUBMIT({ answer: ... })` — this run expects structured output via `value` or `variable`.")
+  } else {
+    lines.push("- For plain-text output: `SUBMIT({ answer: \"your answer\" })` or `SUBMIT({ variable: \"finalAnswer\" })`.")
+    lines.push("- Do NOT use `SUBMIT({ value: ... })` — this run expects plain text via `answer` or `variable`.")
+  }
+  lines.push("- Use exactly one field in SUBMIT. Do NOT combine fields.")
   lines.push("- For very large final outputs, store the result in `__vars` and submit with `variable` to avoid output truncation.")
-  lines.push("- `SUBMIT` ends execution immediately. You MUST have seen execution output confirming your results before calling it.")
-  lines.push("- Do NOT include SUBMIT() inside a code block — place it as standalone text.")
+  lines.push("- Do NOT call SUBMIT until you have seen execution output confirming your results. SUBMIT ends execution immediately — there is no next iteration.")
+  lines.push("- Do NOT include SUBMIT() inside a ```js code block — it is a standalone tool call, not a function.")
+  lines.push("- Do NOT call SUBMIT on the first iteration. You must explore the data first.")
   lines.push(`- SUBMIT invocation schema for this run: ${JSON.stringify(submitInvocationSchema)}`)
   lines.push("")
   lines.push("## Rules")
@@ -209,6 +217,15 @@ export const buildReplSystemPrompt = (options: ReplSystemPromptOptions): string 
   if (canRecurse) {
     lines.push("8. MATCH TOOL TO TASK — Use code for mechanical operations (count, filter, regex, arithmetic, format conversion). Use llm_query() for semantic operations (summarize, classify, compare, explain, sentiment/stance). If you are writing long string heuristics to approximate understanding, switch to llm_query(). If the user explicitly requests rule-based matching, code is valid.")
   }
+  lines.push("")
+  lines.push("## Common Mistakes — DO NOT")
+  lines.push("- Do NOT produce an empty response or a response with only whitespace.")
+  lines.push("- Do NOT call SUBMIT() before you have completed your analysis and verified the output with code.")
+  if (canRecurse) {
+    lines.push("- Do NOT call llm_query() or llm_query_batched() as tool calls. They are JavaScript functions — call them with `await` inside a ```js code block.")
+  }
+  lines.push("- Do NOT write prose summaries between iterations — only write a ```js code block OR a standalone SUBMIT() call, not both, not neither.")
+  lines.push("- Do NOT repeat the same failing code. If something fails twice, change your approach.")
   lines.push("")
 
   if (canRecurse) {

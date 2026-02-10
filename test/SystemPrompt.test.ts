@@ -298,9 +298,9 @@ describe("SystemPrompt", () => {
     expect(prompt).toContain("ALWAYS use `print()`")
   })
 
-  test("REPL prompt contains MUST have seen execution output", () => {
+  test("REPL prompt contains SUBMIT safety guardrail", () => {
     const prompt = buildReplSystemPrompt(baseOptions)
-    expect(prompt).toContain("MUST have seen execution output")
+    expect(prompt).toContain("Do NOT call SUBMIT until you have seen execution output")
   })
 
   test("REPL prompt contains HANDLE ERRORS rule", () => {
