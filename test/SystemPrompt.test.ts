@@ -93,7 +93,10 @@ describe("SystemPrompt", () => {
       maxDepth: 1,
       subModelContextChars: 12_345
     })
-    expect(prompt).toContain("~12345 characters")
+    expect(prompt).toContain("~12345 chars")
+    expect(prompt).toContain("~24 short records")
+    expect(prompt).toContain("Math.ceil(totalChars / 12345)")
+    expect(prompt).toContain("llm_query_batched")
   })
 
   test("REPL prompt contains budget numbers", () => {
@@ -419,6 +422,145 @@ describe("SystemPrompt", () => {
     })
     expect(prompt).not.toContain("### Context-Specific Guidance")
     expect(prompt).not.toContain("llm_query")
+  })
+
+  test("corpus guidance includes document shape, batch size, and BM25 scores when corpus tools present", () => {
+    const prompt = buildReplSystemPrompt({
+      ...baseOptions,
+      tools: [
+        makeTool("CreateCorpus"),
+        makeTool("LearnCorpus"),
+        makeTool("QueryCorpus"),
+        makeTool("CorpusStats"),
+        makeTool("DeleteCorpus")
+      ]
+    })
+    expect(prompt).toContain("Document shape")
+    expect(prompt).toContain("500 documents per LearnCorpus")
+    expect(prompt).toContain("BM25 relevance")
+  })
+
+  test("corpus guidance includes decision tree when RankByRelevance is present", () => {
+    const prompt = buildReplSystemPrompt({
+      ...baseOptions,
+      tools: [
+        makeTool("CreateCorpus"),
+        makeTool("LearnCorpus"),
+        makeTool("QueryCorpus"),
+        makeTool("CorpusStats"),
+        makeTool("DeleteCorpus"),
+        makeTool("RankByRelevance")
+      ]
+    })
+    expect(prompt).toContain("Decision tree")
+    expect(prompt).toContain("RankByRelevance")
+  })
+
+  test("corpus guidance omits decision tree when RankByRelevance is absent", () => {
+    const prompt = buildReplSystemPrompt({
+      ...baseOptions,
+      tools: [
+        makeTool("CreateCorpus"),
+        makeTool("LearnCorpus"),
+        makeTool("QueryCorpus"),
+        makeTool("CorpusStats"),
+        makeTool("DeleteCorpus")
+      ]
+    })
+    expect(prompt).not.toContain("Decision tree")
+  })
+
+  test("corpus guidance omits decision tree when only TextSimilarity is present without RankByRelevance", () => {
+    const prompt = buildReplSystemPrompt({
+      ...baseOptions,
+      tools: [
+        makeTool("CreateCorpus"),
+        makeTool("LearnCorpus"),
+        makeTool("QueryCorpus"),
+        makeTool("CorpusStats"),
+        makeTool("DeleteCorpus"),
+        makeTool("TextSimilarity")
+      ]
+    })
+    expect(prompt).not.toContain("Decision tree")
+  })
+
+  test("sub-model capacity shows approx records per call", () => {
+    const prompt = buildReplSystemPrompt({
+      ...baseOptions,
+      depth: 0,
+      maxDepth: 1,
+      subModelContextChars: 50_000
+    })
+    expect(prompt).toContain("~50000 chars")
+    expect(prompt).toContain("~100 short records")
+    expect(prompt).toContain("Math.ceil(totalChars / 50000)")
+  })
+
+  test("error recovery patterns present when canRecurse", () => {
+    const prompt = buildReplSystemPrompt({
+      ...baseOptions,
+      depth: 0,
+      maxDepth: 1
+    })
+    expect(prompt).toContain("### Error recovery patterns")
+    expect(prompt).toContain("try/catch")
+    expect(prompt).toContain("Malformed NDJSON")
+    expect(prompt).toContain("Truncated output")
+  })
+
+  test("error recovery patterns absent when depth >= maxDepth", () => {
+    const prompt = buildReplSystemPrompt({
+      ...baseOptions,
+      depth: 1,
+      maxDepth: 1
+    })
+    expect(prompt).not.toContain("### Error recovery patterns")
+  })
+
+  test("new worked examples present when canRecurse", () => {
+    const prompt = buildReplSystemPrompt({
+      ...baseOptions,
+      depth: 0,
+      maxDepth: 1
+    })
+    expect(prompt).toContain("## Example: Code-Filter Then Semantic Analysis")
+    expect(prompt).toContain("## Example: Incremental Buffer Accumulation")
+    expect(prompt).toContain("renewable energy")
+    expect(prompt).toContain("__vars.buffer")
+    expect(prompt).toContain("__vars.nextIndex")
+  })
+
+  test("new worked examples absent in strict mode", () => {
+    const prompt = buildReplSystemPrompt({
+      ...baseOptions,
+      depth: 0,
+      maxDepth: 1,
+      sandboxMode: "strict"
+    })
+    expect(prompt).not.toContain("## Example: Code-Filter Then Semantic Analysis")
+    expect(prompt).not.toContain("## Example: Incremental Buffer Accumulation")
+  })
+
+  test("auto-detect note present when hasLargeStructuredContext", () => {
+    const prompt = buildReplSystemPrompt({
+      ...baseOptions,
+      contextMetadata: {
+        format: "ndjson",
+        chars: 60_000,
+        lines: 500,
+        recordCount: 180
+      },
+      tools: [
+        makeTool("CreateCorpus"),
+        makeTool("LearnCorpus"),
+        makeTool("QueryCorpus"),
+        makeTool("CorpusStats"),
+        makeTool("DeleteCorpus")
+      ]
+    })
+    expect(prompt).toContain("auto-detects format")
+    expect(prompt).toContain("NDJSON, JSON array, CSV, and TSV")
   })
 
   test("non-structured contextMetadata format omits context-specific guidance", () => {
