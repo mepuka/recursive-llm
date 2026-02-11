@@ -30,6 +30,6 @@
     "@effect/printer": "^0.47.0",
     "@effect/printer-ansi": "^0.47.0",
     "effect": "^3.19.16",
-    "effect-nlp": "file:../effect-nlp"
+    "effect-nlp": "file:./effect-nlp"
   }
 }
