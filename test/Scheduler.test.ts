@@ -1906,6 +1906,34 @@ describe("Scheduler tool dispatch (e2e with real sandbox)", () => {
     expect(execCompleted!.output).toContain("Failed to parse JSON")
   }, 15_000)
 
+  test("llm_query with responseFormat rejects markdown-wrapped JSON from model in strict mode", async () => {
+    const events = await Effect.runPromise(
+      stream({
+        query: "strict json test",
+        context: "ctx"
+      }).pipe(
+        Stream.runCollect,
+        Effect.map(Chunk.toArray),
+        Effect.provide(makeRealSandboxLayers({
+          responses: [
+            { text: "```js\ntry {\n  const result = await llm_query('Extract', 'data', { responseFormat: { type: 'json', schema: { type: 'object', properties: { x: { type: 'number' } }, required: ['x'] } } })\n  print('got: ' + JSON.stringify(result))\n} catch (e) {\n  print('error: ' + e.message)\n}\n```" },
+            { text: "```json\n{\"x\": 1}\n```" },
+            submitAnswer("handled")
+          ],
+          config: { maxDepth: 0 }
+        })),
+        Effect.timeout("10 seconds")
+      )
+    )
+
+    const execCompleted = events.find(
+      (event) => event._tag === "CodeExecutionCompleted"
+    ) as { _tag: "CodeExecutionCompleted"; output: string } | undefined
+    expect(execCompleted).toBeDefined()
+    expect(execCompleted!.output).toContain("error:")
+    expect(execCompleted!.output).toContain("Failed to parse JSON")
+  }, 15_000)
+
   test("llm_query with responseFormat rejects schema validation failures", async () => {
     const events = await Effect.runPromise(
       stream({
@@ -2044,4 +2072,54 @@ describe("Scheduler tool dispatch (e2e with real sandbox)", () => {
     // Sub-call should have been started recursively (not one-shot) at depth 1
     expect(modelMetrics.depths.some((d) => d === 1)).toBe(true)
   }, 20_000)
+
+  test("llm_query named model routes through one-shot sub-call with selected model", async () => {
+    const modelMetrics: FakeModelMetrics = {
+      calls: 0,
+      prompts: [],
+      depths: [],
+      isSubCalls: [],
+      namedModels: []
+    }
+
+    const answer = await Effect.runPromise(
+      complete({
+        query: "named model routing",
+        context: "ctx"
+      }).pipe(
+        Effect.provide(makeRealSandboxLayers({
+          responses: [
+            { text: "```js\nconst result = await llm_query('sub-query', 'sub-context', { model: 'fast' })\nprint(result)\n```" },
+            { text: "named-sub-result" },
+            submitAnswer("done")
+          ],
+          modelMetrics,
+          config: {
+            maxDepth: 3,
+            namedModels: {
+              fast: { provider: "openai", model: "gpt-4o-mini" }
+            }
+          }
+        })),
+        Effect.timeout("10 seconds")
+      )
+    )
+
+    expect(answer).toBe("done")
+    expect(modelMetrics.calls).toBe(3)
+    expect(modelMetrics.depths[1]).toBe(1)
+    expect(modelMetrics.isSubCalls?.[1]).toBe(true)
+    expect(modelMetrics.namedModels?.[1]).toBe("fast")
+
+    const oneShotPrompt = modelMetrics.prompts[1]!
+    const systemText = oneShotPrompt.content
+      .filter((m) => m.role === "system")
+      .map((m) =>
+        m.role === "system"
+          ? (typeof m.content === "string" ? m.content : (m.content as ReadonlyArray<{ readonly text: string }>)[0]?.text ?? "")
+          : ""
+      )
+      .join(" ")
+    expect(systemText).toContain("Answer the query directly and concisely.")
+  }, 15_000)
 })

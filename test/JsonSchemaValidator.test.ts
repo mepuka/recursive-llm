@@ -241,6 +241,26 @@ describe("parseAndValidateJson", () => {
     expect(result).toEqual({ count: 5 })
   })
 
+  test("strict mode rejects surrounding prose", () => {
+    const schema = {
+      type: "object",
+      properties: { count: { type: "number" } },
+      required: ["count"]
+    }
+    const text = 'Here is the result: {"count": 5}'
+    expect(() => parseAndValidateJson(text, schema, { strict: true })).toThrow("Failed to parse JSON")
+  })
+
+  test("strict mode rejects markdown code fences", () => {
+    const schema = {
+      type: "object",
+      properties: { name: { type: "string" } },
+      required: ["name"]
+    }
+    const text = '```json\n{"name":"Alice"}\n```'
+    expect(() => parseAndValidateJson(text, schema, { strict: true })).toThrow("Failed to parse JSON")
+  })
+
   test("throws on invalid JSON", () => {
     expect(() => parseAndValidateJson("not json", { type: "object" })).toThrow("Failed to parse JSON")
   })

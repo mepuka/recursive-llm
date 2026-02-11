@@ -18,6 +18,10 @@ RLMs treat inference as a program — the model writes code, executes it in a sa
 - **Run traces** — Persisted execution traces for debugging and analysis
 - **CLI** — Full-featured command-line interface with 20+ configuration options
 
+## Current Limitations
+
+- **No crash recovery yet** — In-memory sandbox state (`__vars`), in-flight queue state, and live run progress are not resumable after process crash/kill. A fresh run is required.
+
 ## Quickstart
 
 ### Prerequisites

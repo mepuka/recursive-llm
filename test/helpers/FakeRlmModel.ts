@@ -10,6 +10,8 @@ export interface FakeModelMetrics {
   readonly prompts: Array<Prompt.Prompt>
   readonly depths: Array<number>
   readonly isSubCalls?: Array<boolean | undefined>
+  readonly namedModels?: Array<string | undefined>
+  readonly routeSources?: Array<"named" | "sub" | "primary" | undefined>
   readonly toolChoices?: Array<unknown>
   readonly disableToolCallResolutions?: Array<boolean | undefined>
 }
@@ -24,6 +26,8 @@ export interface FakeModelResponse {
     readonly name: string
     readonly params: unknown
   }>
+  readonly inputTokens?: number
+  readonly outputTokens?: number
   readonly totalTokens?: number
 }
 
@@ -49,8 +53,8 @@ const makeMinimalResponse = (response: FakeModelResponse) => {
   parts.push(Response.makePart("finish", {
     reason: "stop" as const,
     usage: new Response.Usage({
-      inputTokens: undefined,
-      outputTokens: undefined,
+      inputTokens: response.inputTokens,
+      outputTokens: response.outputTokens,
       totalTokens: response.totalTokens
     })
   }))
@@ -71,12 +75,16 @@ export const makeFakeRlmModelLayer = (
         prompt,
         depth,
         isSubCall,
+        namedModel,
+        routeSource,
         toolChoice,
         disableToolCallResolution
       }) {
         metrics?.prompts.push(prompt)
         metrics?.depths.push(depth)
         metrics?.isSubCalls?.push(isSubCall)
+        metrics?.namedModels?.push(namedModel)
+        metrics?.routeSources?.push(routeSource)
         metrics?.toolChoices?.push(toolChoice)
         metrics?.disableToolCallResolutions?.push(disableToolCallResolution)
         if (metrics) metrics.calls += 1

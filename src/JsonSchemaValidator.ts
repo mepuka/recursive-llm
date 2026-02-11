@@ -10,6 +10,10 @@ export interface ValidationResult {
   readonly errors: ReadonlyArray<string>
 }
 
+export interface ParseAndValidateJsonOptions {
+  readonly strict?: boolean
+}
+
 type JsonSchemaNode = {
   readonly type?: string | ReadonlyArray<string>
   readonly properties?: Record<string, JsonSchemaNode>
@@ -99,23 +103,30 @@ export const validateJsonSchema = (value: unknown, schema: object): ValidationRe
  *
  * Throws on parse failure or validation failure.
  */
-export const parseAndValidateJson = (text: string, schema: object): unknown => {
+export const parseAndValidateJson = (
+  text: string,
+  schema: object,
+  options?: ParseAndValidateJsonOptions
+): unknown => {
   let jsonText = text.trim()
+  const strict = options?.strict === true
 
-  // Strip markdown code fences
-  const fenceMatch = jsonText.match(/^```(?:json)?\s*\n?([\s\S]*?)\n?\s*```$/m)
-  if (fenceMatch) {
-    jsonText = fenceMatch[1]!.trim()
-  }
+  if (!strict) {
+    // Strip markdown code fences
+    const fenceMatch = jsonText.match(/^```(?:json)?\s*\n?([\s\S]*?)\n?\s*```$/m)
+    if (fenceMatch) {
+      jsonText = fenceMatch[1]!.trim()
+    }
 
-  // Try to extract JSON object/array from surrounding text
-  if (!jsonText.startsWith("{") && !jsonText.startsWith("[")) {
-    const objectMatch = jsonText.match(/(\{[\s\S]*\})/)
-    const arrayMatch = jsonText.match(/(\[[\s\S]*\])/)
-    if (objectMatch) {
-      jsonText = objectMatch[1]!
-    } else if (arrayMatch) {
-      jsonText = arrayMatch[1]!
+    // Try to extract JSON object/array from surrounding text
+    if (!jsonText.startsWith("{") && !jsonText.startsWith("[")) {
+      const objectMatch = jsonText.match(/(\{[\s\S]*\})/)
+      const arrayMatch = jsonText.match(/(\[[\s\S]*\])/)
+      if (objectMatch) {
+        jsonText = objectMatch[1]!
+      } else if (arrayMatch) {
+        jsonText = arrayMatch[1]!
+      }
     }
   }
 

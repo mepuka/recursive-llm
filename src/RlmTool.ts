@@ -37,16 +37,18 @@ export interface RlmToolAny {
   readonly handle: (args: ReadonlyArray<unknown>) => Effect.Effect<unknown, RlmToolError>
 }
 
+interface ToolMakeOptions<P extends Schema.Struct.Fields, A, I> {
+  readonly description: string
+  readonly parameters: P
+  readonly returns: Schema.Schema<A, I, never>
+  readonly usageExamples?: ReadonlyArray<string>
+  readonly timeoutMs?: number
+  readonly handler: (params: Schema.Struct.Type<P>) => Effect.Effect<A, RlmToolError>
+}
+
 export const make = <P extends Schema.Struct.Fields, A, I>(
   name: string,
-  options: {
-    readonly description: string
-    readonly parameters: P
-    readonly returns: Schema.Schema<A, I, never>
-    readonly usageExamples?: ReadonlyArray<string>
-    readonly timeoutMs?: number
-    readonly handler: (params: Schema.Struct.Type<P>) => Effect.Effect<A, RlmToolError>
-  }
+  options: ToolMakeOptions<P, A, I>
 ): RlmToolAny => {
   if (!isValidToolName(name)) {
     throw new Error(
@@ -54,7 +56,11 @@ export const make = <P extends Schema.Struct.Fields, A, I>(
     )
   }
 
-  const paramSchema = Schema.Struct(options.parameters) as unknown as Schema.Schema<Schema.Struct.Type<P>, Schema.Struct.Encoded<P>, never>
+  const paramSchema = Schema.Struct(options.parameters) as unknown as Schema.Schema<
+    Schema.Struct.Type<P>,
+    Schema.Struct.Encoded<P>,
+    never
+  >
   const parameterNames = Object.keys(options.parameters)
   const parametersJsonSchema = JSONSchema.make(paramSchema)
   const returnsJsonSchema = JSONSchema.make(options.returns)
@@ -82,9 +88,9 @@ export const make = <P extends Schema.Struct.Fields, A, I>(
           message: `Parameter validation failed for tool ${name}: ${String(e)}`,
           toolName: name
         })),
-        Effect.flatMap((decoded) => options.handler(decoded as Schema.Struct.Type<P>)),
+        Effect.flatMap((decoded) => options.handler(decoded)),
         Effect.flatMap((result) =>
-          Schema.encode(options.returns)(result as any).pipe(
+          Schema.encode(options.returns)(result).pipe(
             Effect.mapError((e) => new RlmToolError({
               message: `Return value encoding failed for tool ${name}: ${String(e)}`,
               toolName: name

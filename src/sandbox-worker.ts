@@ -1,6 +1,6 @@
 import { WorkerRunner } from "@effect/platform"
 import { BunWorkerRunner } from "@effect/platform-bun"
-import { Effect, Stream } from "effect"
+import { Effect, Schema, Stream } from "effect"
 import {
   RunnerBridgeFailedRequest,
   RunnerBridgeResultRequest,
@@ -747,6 +747,42 @@ const RESERVED_BINDINGS = new Set([
   "__strictScope"
 ])
 
+const InitPayloadSchema = Schema.Struct({
+  callId: Schema.String,
+  depth: Schema.Number,
+  sandboxMode: Schema.optional(Schema.Literal("permissive", "strict")),
+  hasMediaAttachments: Schema.optional(Schema.Boolean),
+  maxFrameBytes: Schema.optional(Schema.Number.pipe(
+    Schema.int(),
+    Schema.positive(),
+    Schema.lessThanOrEqualTo(64 * 1024 * 1024)
+  )),
+  tools: Schema.optional(Schema.Array(Schema.Struct({
+    name: Schema.String,
+    parameterNames: Schema.optional(Schema.Array(Schema.String)),
+    description: Schema.optional(Schema.String)
+  })))
+})
+
+type InitPayload = typeof InitPayloadSchema.Type
+const decodeInitPayload = Schema.decodeUnknownSync(InitPayloadSchema)
+
+const parseInitPayload = (input: unknown): InitPayload | undefined => {
+  const payload = typeof input === "object" && input !== null && "_tag" in input
+    ? Object.fromEntries(
+        Object.entries(input as Record<string, unknown>).filter(([key]) => key !== "_tag")
+      )
+    : input
+
+  try {
+    return decodeInitPayload(payload)
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error)
+    console.error(`[sandbox-worker] Invalid Init payload: ${message}`)
+    return undefined
+  }
+}
+
 const normalizeToolNames = (rawTools: unknown): ReadonlyArray<string> => {
   if (!Array.isArray(rawTools)) return []
   const names: Array<string> = []
@@ -761,7 +797,10 @@ const normalizeToolNames = (rawTools: unknown): ReadonlyArray<string> => {
   return names
 }
 
-const applyInitMessage = (msg: Record<string, unknown>): void => {
+const applyInitMessage = (raw: unknown): void => {
+  const msg = parseInitPayload(raw)
+  if (msg === undefined) return
+
   workerCallId = String(msg.callId ?? "unknown")
   workerDepth = Number(msg.depth ?? 0)
   sandboxMode = msg.sandboxMode === "strict" ? "strict" : "permissive"
@@ -943,7 +982,7 @@ if (hasProcessIpc) {
       WorkerRunner.layerSerialized(SandboxWorkerRunnerRequest, {
         Init: (request: RunnerInitRequest) =>
           Effect.sync(() => {
-            applyInitMessage(request as unknown as Record<string, unknown>)
+            applyInitMessage(request)
           }),
         ExecRequest: (request: RunnerExecRequest) =>
           Stream.asyncPush<RunnerWorkerFrame>((emit) =>

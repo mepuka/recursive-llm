@@ -764,7 +764,7 @@ export const buildExtractSystemPrompt = (outputJsonSchema?: object): string => {
   lines.push("")
   lines.push("Review the conversation above and extract the final answer to the original query.")
   lines.push("You MUST finalize using exactly one SUBMIT tool call.")
-  lines.push("Do NOT output code blocks, FINAL(), or commentary.")
+  lines.push("Do NOT output code blocks or commentary.")
   lines.push("If your best final output already exists in `__vars`, you may finalize via `SUBMIT({ variable: \"name\" })`.")
   lines.push("Note: variable references are resolved through tool calls; text-only fallback parsing does not resolve textual SUBMIT snippets.")
   lines.push(`SUBMIT invocation schema for this run: ${JSON.stringify(submitInvocationSchema)}`)

@@ -251,11 +251,19 @@ const runSchedulerInternal = Effect.fn("Scheduler.runInternal")(function*(option
   const capturePartialResult = (
     callState: CallContext,
     reason: PartialResult["reason"]
-  ): Effect.Effect<PartialResult> =>
+  ) =>
     Effect.gen(function*() {
       const transcript = yield* readTranscript(callState)
       const vars = makeCallVariableSpace(callState)
-      yield* vars.sync.pipe(Effect.catchAll(() => Effect.void))
+      yield* vars.sync.pipe(
+        Effect.catchAll((error) =>
+          publishSchedulerWarning({
+            code: "VARIABLE_SYNC_FAILED",
+            message: `Failed to refresh sandbox variable snapshot while capturing partial result: ${formatExecutionError(error)}. Continuing with cached snapshot.`,
+            callId: callState.callId
+          })
+        )
+      )
       const cached = yield* vars.cached
 
       const values: Record<string, unknown> = {}
@@ -965,7 +973,7 @@ const runSchedulerInternal = Effect.fn("Scheduler.runInternal")(function*(option
           })
 
           if (options.responseFormat !== undefined) {
-            return parseAndValidateJson(response.text, options.responseFormat.schema)
+            return parseAndValidateJson(response.text, options.responseFormat.schema, { strict: true })
           }
           return response.text
         })

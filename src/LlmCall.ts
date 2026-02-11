@@ -50,6 +50,23 @@ const computeRetryDelayMs = (
   return Math.floor(Math.random() * (exponentialDelay + 1))
 }
 
+export const resolveUsageTokens = (
+  usage: Readonly<{
+    readonly inputTokens: number | undefined
+    readonly outputTokens: number | undefined
+    readonly totalTokens: number | undefined
+  }>
+): number | undefined => {
+  if (usage.totalTokens !== undefined) {
+    return usage.totalTokens
+  }
+
+  const input = usage.inputTokens ?? 0
+  const output = usage.outputTokens ?? 0
+  const fallbackTotal = input + output
+  return fallbackTotal > 0 ? fallbackTotal : undefined
+}
+
 export const LlmCallLive: Layer.Layer<LlmCall, never, RlmRuntime | RlmModel | RlmConfig> = Layer.effect(
   LlmCall,
   Effect.gen(function*() {
@@ -102,7 +119,7 @@ export const LlmCallLive: Layer.Layer<LlmCall, never, RlmRuntime | RlmModel | Rl
             )
           )
 
-          yield* recordTokens(options.callId, response.usage.totalTokens).pipe(
+          yield* recordTokens(options.callId, resolveUsageTokens(response.usage)).pipe(
             Effect.provideService(RlmRuntime, runtime)
           )
 
