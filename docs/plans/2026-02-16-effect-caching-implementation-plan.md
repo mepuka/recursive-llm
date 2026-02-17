@@ -1,9 +1,9 @@
-# Effect-Native Caching Implementation Plan (Rev 7)
+# Effect-Native Caching Implementation Plan (Rev 8)
 
 Date: 2026-02-16
 Base spec: `docs/plans/2026-02-07-rlm-effect-caching-refactor-spec.md`
 Branch: `feat/effect-caching-implementation`
-Revision: 7 — addresses codex review findings from Rev 6
+Revision: 8 — addresses codex review findings from Rev 7
 
 ## Review Findings Addressed
 
@@ -57,7 +57,7 @@ Revision: 7 — addresses codex review findings from Rev 6
 | # | Severity | Finding | Resolution |
 |---|----------|---------|------------|
 | 1 | HIGH | Failed cache entries not evicted outside StartCall/timeout paths (poisoned failed keys consume capacity) | Add identity-checked `evictCacheKey` after `failCacheDeferred` on all producer failure paths |
-| 2 | MEDIUM | StartCall error snippet wrong `FailCall` shape (includes `completionId`, raw `error`) | Aligned with actual `FailCall` type: `{ callId, error }` only |
+| 2 | MEDIUM | StartCall error snippet wrong `FailCall` shape (includes `completionId`) | Aligned with actual `FailCall` type: `{ callId, error }` only |
 | 3 | MEDIUM | `cacheResult` scope inconsistent: `const` inside block, referenced outside | Use `let cacheResult: ... \| undefined` in outer scope, assign inside cache block |
 | 4 | MEDIUM | Step 2 ordering contradiction: compute after `makeCallContext` vs pass into it | Compute static args BEFORE `makeCallContext`, then pass in |
 | 5 | LOW | "contextMetadata always set" claim overstated (undefined for empty context) | Reworded to "derived for non-empty context" |
@@ -70,6 +70,16 @@ Revision: 7 — addresses codex review findings from Rev 6
 | 2 | MEDIUM | Recursive enqueue snippet uses `cacheResult._tag` without optional chaining | Changed to `cacheResult?._tag === "miss"` for safe narrowing when `cacheResult` is `undefined` |
 | 3 | MEDIUM | Prompt-split test plan misses explicit parity coverage | Added parity assertion: `buildReplSystemPrompt(opts) === buildReplSystemPromptStatic(...) + "\n" + buildReplSystemPromptDynamic(...)` |
 | 4 | LOW | "Verbose mode" wording doesn't match actual renderer API | Changed to "render when `quiet !== true`" to match `RlmRenderer` options |
+
+### Rev 7 → Rev 8
+
+| # | Severity | Finding | Resolution |
+|---|----------|---------|------------|
+| 1 | HIGH | StartCall error snippet uses non-existent `SchedulerInternalError` and `instanceof RlmError` (type alias, not runtime class) | Use existing `UnknownRlmError` class; wrap raw `error` with `new UnknownRlmError({ message: "StartCall failed", cause: error })` to match existing handler pattern |
+| 2 | HIGH | Cache-hit fork closures read outer `let` variables — TS strict mode loses narrowing across closure boundaries | Capture narrowed values into `const` before fork: `const hitDeferred = cacheResult.deferred`, `const hitKey = cacheKey!`; similarly for miss path |
+| 3 | MEDIUM | BridgeStore converts all errors to `SandboxError`, so waiters won't receive `OutputValidationError` directly | Adjusted test expectations: assert `SandboxError` with message content, not typed `OutputValidationError` |
+| 4 | MEDIUM | `StartCall` command shape changes (`cacheKey`/`cacheDeferred`) not called out in Step 4 (which edits `RlmTypes.ts`) | Added explicit `StartCall` shape extension to Step 4 |
+| 5 | MEDIUM | `noCache` as required field in `CliArgs` breaks existing callers | Changed to `noCache?: boolean` with default `false` in `makeCliConfig` |
 
 ---
 
@@ -338,29 +348,37 @@ Add `noCache` to `commandConfig`.
 
 **Flag mapping** (`src/cli/Normalize.ts`):
 
-Add `noCache` to `ParsedCliConfig` and propagate into the `CliArgs` return type:
+Add `noCache` to `ParsedCliConfig` and propagate as optional into `CliArgs`:
 ```ts
 // In ParsedCliConfig:
 readonly noCache: boolean
 
-// In normalizeCliArgs return (CliArgs):
-noCache: parsed.noCache
+// In CliArgs (optional to avoid breaking existing callers):
+readonly noCache?: boolean
+
+// In normalizeCliArgs return:
+...(parsed.noCache ? { noCache: true } : {})
 ```
 
 **Downstream consumption** (`src/CliLayer.ts` — `makeCliConfig`):
 ```ts
-// In makeCliConfig:
-...(cliArgs.noCache ? { cache: { enabled: false } } : {})
+// In makeCliConfig (defaults to false when omitted):
+...(cliArgs.noCache === true ? { cache: { enabled: false } } : {})
 ```
+
+Making `noCache` optional on `CliArgs` avoids breaking existing test and
+internal callers that construct `CliArgs` object literals without this field.
 
 **Tests:** Config parsing test with and without cache field. CLI flag test
 for `--no-cache`.
 
 ---
 
-## Step 4: Add Cache Events to `RlmEvent`
+## Step 4: Add Cache Events and Extend `StartCall` Command
 
 **File:** `src/RlmTypes.ts`
+
+### 4a: New event variants
 
 Add two new event variants to the `RlmEvent` tagged enum:
 
@@ -380,6 +398,22 @@ CacheMiss: {
   readonly cacheKey: string
 }
 ```
+
+### 4b: Extend `StartCall` command shape
+
+Add optional `cacheKey` and `cacheDeferred` fields to the `StartCall` variant
+of the `RlmCommand` tagged enum (needed by Step 5c/5d for threading cache
+state into sub-call paths):
+
+```ts
+StartCall: {
+  // ... existing fields ...
+  readonly cacheKey?: string
+  readonly cacheDeferred?: Deferred.Deferred<unknown, RlmError>
+}
+```
+
+This requires adding `Deferred` and `RlmError` imports to `src/RlmTypes.ts`.
 
 **File:** `src/RlmRenderer.ts`
 
@@ -589,12 +623,19 @@ if (subcallCache !== null && command.method === "llm_query") {
   })
 
   if (cacheResult._tag === "hit") {
+    // CRITICAL (Rev 7 Finding #2): Capture narrowed values into const before
+    // fork closure. TypeScript strict mode does not preserve narrowing of outer
+    // `let` variables across closure boundaries. Without this, the compiler
+    // reports "possibly undefined" / missing property errors inside the fork.
+    const hitDeferred = cacheResult.deferred
+    const hitKey = cacheKey!
+
     yield* publishEvent(RlmEvent.CacheHit({
       completionId: runtime.completionId,
       callId: command.callId,
       depth: callState.depth,
       kind: "subcall",
-      cacheKey
+      cacheKey: hitKey
     }))
 
     // CRITICAL (Rev 2 Finding #1): Fork the await into a separate fiber.
@@ -603,7 +644,7 @@ if (subcallCache !== null && command.method === "llm_query") {
     // can never be processed.
     yield* Effect.forkIn(
       Effect.gen(function*() {
-        const cachedResult = yield* Deferred.await(cacheResult.deferred).pipe(
+        const cachedResult = yield* Deferred.await(hitDeferred).pipe(
           Effect.timeoutFail({
             duration: Duration.millis(subcallCache.timeoutMs),
             onTimeout: () => new SandboxError({
@@ -620,9 +661,9 @@ if (subcallCache !== null && command.method === "llm_query") {
             // sub-call from poisoning the key for the rest of the completion.
             // Identity check (Rev 4 Finding #1) ensures we don't evict a
             // freshly-inserted entry belonging to a different caller.
-            const isDone = yield* Deferred.isDone(cacheResult.deferred)
+            const isDone = yield* Deferred.isDone(hitDeferred)
             if (!isDone) {
-              yield* evictCacheKey(subcallCache, cacheKey, cacheResult.deferred)
+              yield* evictCacheKey(subcallCache, hitKey, hitDeferred)
             }
             yield* failBridgeDeferred(command.bridgeRequestId, error)
           })
@@ -667,12 +708,22 @@ if (subcallCache !== null && command.method === "llm_query") {
 
 **Threading cache key into sub-call paths:**
 
-For one-shot sub-calls: `cacheKey` is captured in the fork closure (already
-in scope from the cache check above).
+**CRITICAL (Rev 7 Finding #2):** Before entering fork closures, capture the
+narrowed cache state into `const` values. TypeScript strict mode does not
+preserve narrowing of outer `let` variables across closure boundaries.
 
-For recursive sub-calls: pass `cacheKey` into the `StartCall` command, then
-propagate to `makeCallContext` so it's available on `callState.cacheKey` in
-`handleFinalize`.
+```ts
+// Capture narrowed miss state for use in fork closures (one-shot and recursive paths)
+const missDeferred = cacheResult?._tag === "miss" ? cacheResult.deferred : undefined
+const missKey = cacheResult?._tag === "miss" ? cacheKey! : undefined
+```
+
+For one-shot sub-calls: `missDeferred` and `missKey` are captured `const`
+values used in the fork closure.
+
+For recursive sub-calls: pass `missKey` and `missDeferred` into the `StartCall`
+command, then propagate to `makeCallContext` so they're available on
+`callState.cacheKey`/`callState.cacheDeferred` in `handleFinalize`.
 
 ```ts
 // In the recursive dispatch path:
@@ -685,8 +736,8 @@ yield* enqueue(RlmCommand.StartCall({
   context: llmContextArg ?? "",
   parentBridgeRequestId: command.bridgeRequestId,
   ...(responseFormat !== undefined ? { outputJsonSchema: responseFormat.schema } : {}),
-  ...(cacheKey !== undefined && cacheResult?._tag === "miss"
-    ? { cacheKey, cacheDeferred: cacheResult.deferred }
+  ...(missKey !== undefined && missDeferred !== undefined
+    ? { cacheKey: missKey, cacheDeferred: missDeferred }
     : {})
 }))
 ```
@@ -706,8 +757,8 @@ yield* Effect.forkIn(
       ...(responseFormat !== undefined ? { responseFormat } : {})
     })
     // Cache write-back: resolve the captured deferred directly (not by key)
-    if (cacheResult?._tag === "miss") {
-      yield* succeedCacheDeferred(cacheResult.deferred, oneShotResult)
+    if (missDeferred !== undefined) {
+      yield* succeedCacheDeferred(missDeferred, oneShotResult)
     }
     yield* resolveBridgeDeferred(command.bridgeRequestId, oneShotResult)
   }).pipe(
@@ -717,9 +768,9 @@ yield* Effect.forkIn(
         ? (cause.error as RlmError)
         : new SandboxError({ message: Cause.pretty(cause) })
       return Effect.gen(function*() {
-        if (cacheResult?._tag === "miss" && cacheKey !== undefined && subcallCache !== null) {
-          yield* failCacheDeferred(cacheResult.deferred, error)
-          yield* evictCacheKey(subcallCache, cacheKey, cacheResult.deferred)
+        if (missDeferred !== undefined && missKey !== undefined && subcallCache !== null) {
+          yield* failCacheDeferred(missDeferred, error)
+          yield* evictCacheKey(subcallCache, missKey, missDeferred)
         }
         const message = "message" in error ? error.message : String(error)
         yield* failBridgeDeferred(command.bridgeRequestId, message)
@@ -857,13 +908,12 @@ cache deferred:
 // In handleStartCall error handler (Scheduler.ts:494-508):
 // CRITICAL (Rev 4 Finding #3): Use Effect.exit(Scope.close(...)) to prevent
 // finalizer failures from aborting the handler and skipping deferred cleanup.
-// CRITICAL (Rev 6 Finding #1): Normalize raw error to RlmError. The
-// catchAll error may be any type (e.g., Cause.UnknownException from
-// sandbox creation). failCacheDeferred and FailCall both require RlmError.
+// CRITICAL (Rev 7 Finding #1): Normalize raw error to RlmError using the
+// existing UnknownRlmError class. The catchAll error is `unknown` (after
+// catchTag filters out SchedulerQueueError). This matches the existing
+// handler pattern at Scheduler.ts:505.
 Effect.gen(function*() {
-  const rlmError: RlmError = error instanceof RlmError
-    ? error
-    : new SchedulerInternalError({ message: String(error) })
+  const rlmError = new UnknownRlmError({ message: "StartCall failed", cause: error })
   yield* Effect.exit(Scope.close(callScope, Exit.fail(rlmError)))
   if (command.parentBridgeRequestId) {
     yield* failBridgeDeferred(command.parentBridgeRequestId, rlmError)
@@ -911,7 +961,7 @@ requests (`docs/plans/2026-02-07-rlm-effect-caching-refactor-spec.md:149`):
 | Concurrent call for key K (in flight) | Hit → **fork** fiber to await deferred → scheduler loop continues |
 | Later call for key K (completed) | Hit → fork completes immediately (deferred already resolved) |
 | Sub-call fails for key K | Deferred failed + key evicted → waiters receive error; retries get fresh miss |
-| Schema validation fails | Deferred failed with `OutputValidationError` + key evicted → waiters get same error |
+| Schema validation fails | Deferred failed with `OutputValidationError` + key evicted → cache-deferred waiters receive `OutputValidationError`; bridge waiters receive `SandboxError` (BridgeStore converts) |
 | Deferred.await times out | Waiter fails with `SandboxError` → does not affect other waiters |
 | Capacity exceeded | No deferred registered → sub-call runs normally (no caching) |
 
@@ -945,7 +995,10 @@ dispatch, so `reserveLlmCall` is never called for cached responses.
 - Sub-call failure with waiters: deferred failed → all waiters receive error.
 - **Schema validation failure with waiters**: recursive sub-call with invalid
   structured output → deferred fails with `OutputValidationError` → cache-hit
-  waiters receive same validation error.
+  waiters that await the deferred directly receive `OutputValidationError`.
+  **Note:** Bridge waiters (via `failBridgeDeferred`) receive `SandboxError`
+  because `BridgeStore.fail` converts unknown errors via `toSandboxError`.
+  Assert on `SandboxError` message content containing the validation details.
 - **Over-capacity behavior**: when inflight map exceeds capacity, new sub-calls
   proceed without caching (no deferred registered, no events emitted).
 - **Timeout on never-resolved deferred**: cache-hit waiter times out with
