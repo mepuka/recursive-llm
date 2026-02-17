@@ -1,9 +1,9 @@
-# Effect-Native Caching Implementation Plan (Rev 11)
+# Effect-Native Caching Implementation Plan (Rev 12)
 
 Date: 2026-02-16
 Base spec: `docs/plans/2026-02-07-rlm-effect-caching-refactor-spec.md`
 Branch: `feat/effect-caching-implementation`
-Revision: 11 — addresses codex review findings from Rev 10
+Revision: 12 — addresses codex review findings from Rev 11
 
 ## Review Findings Addressed
 
@@ -108,6 +108,15 @@ Revision: 11 — addresses codex review findings from Rev 10
 | 3 | MEDIUM | Timeout test expectations flaky — BridgeHandler timeout fires before cache-hit waiter timeout | Revised test guidance: use asymmetric timeouts (short cache, long bridge) or test waiter fork in isolation |
 | 4 | LOW | `deterministicOnly` config field introduced but unused in Tier A/B | Deferred to Tier C — not added to config schema |
 | 5 | LOW | `canonicalizeJson(undefined)` returns `"null"` which is inconsistent with `JSON.stringify(undefined)` | Changed to throw an error for top-level `undefined` |
+
+### Rev 11 → Rev 12
+
+| # | Severity | Finding | Resolution |
+|---|----------|---------|------------|
+| 1 | HIGH | `Effect.catchAllCause` does NOT catch scope interruption — `Deferred.await` fiber interrupted via scope close exits without running `catchAllCause` handler, leaving bridge deferred unresolved | Added `Effect.onInterrupt` to guarantee `failBridgeDeferred` on interruption; `catchAllCause` still handles failures/defects |
+| 2 | HIGH | `canonicalizeJson`/`hashSchema` can throw inline during bridge handling, aborting scheduler with a defect | Wrapped hash generation in `try/catch`; on failure, skip caching and proceed with normal sub-call execution |
+| 3 | MEDIUM | `--no-cache` wiring not fully tested — flag parsing passes but `makeCliConfig` mapping untested | Added `test/CliLayer.test.ts` assertion for `makeCliConfig({ noCache: true })` |
+| 4 | LOW | Scheduler snippet uses `Either.match` but `src/Scheduler.ts` doesn't import `Either` | Added explicit import note |
 
 ---
 
@@ -629,20 +638,37 @@ if (subcallCache !== null && command.method === "llm_query") {
   const modelRoute = namedModel !== undefined
     ? `named:${namedModel}`
     : (callState.depth + 1 >= config.maxDepth ? "route:oneshot" : "route:recursive")
-  cacheKey = makeSubcallCacheKey({
-    completionId: runtime.completionId,
-    parentCallId: command.callId,
-    method: "llm_query",
-    query: llmQueryArg,
-    context: llmContextArg ?? "",
-    depth: callState.depth + 1,
-    modelRoute,
-    ...(responseFormat !== undefined
-      ? { responseFormatHash: hashSchema(responseFormat.schema) }
-      : {})
-  })
+  // CRITICAL (Rev 11 Finding #2): Wrap hash generation in try/catch.
+  // canonicalizeJson/hashSchema can throw on malformed schema objects.
+  // On failure, skip caching and proceed with normal sub-call execution.
+  let responseFormatHash: string | undefined
+  if (responseFormat !== undefined) {
+    try {
+      responseFormatHash = hashSchema(responseFormat.schema)
+    } catch {
+      // Hash failure → skip caching for this call
+    }
+  }
+  if (responseFormat !== undefined && responseFormatHash === undefined) {
+    // hashSchema failed — fall through to normal sub-call without caching
+  } else {
+    cacheKey = makeSubcallCacheKey({
+      completionId: runtime.completionId,
+      parentCallId: command.callId,
+      method: "llm_query",
+      query: llmQueryArg,
+      context: llmContextArg ?? "",
+      depth: callState.depth + 1,
+      modelRoute,
+      ...(responseFormatHash !== undefined
+        ? { responseFormatHash }
+        : {})
+    })
+  }
 
   // Atomic check-and-insert using Ref.modify to eliminate TOCTOU races
+  // Only attempt cache if key was successfully computed (hashSchema may have failed)
+  if (cacheKey !== undefined) {
   const freshDeferred = yield* Deferred.make<unknown, RlmError>()
   cacheResult = yield* Ref.modify(subcallCache.inflight, (m) => {
     const existing = m.get(cacheKey!)
@@ -677,9 +703,6 @@ if (subcallCache !== null && command.method === "llm_query") {
     // The scheduler loop MUST NOT block on Deferred.await — otherwise the
     // command queue stalls and the sub-call that would resolve this deferred
     // can never be processed.
-    // CRITICAL (Rev 8 Finding #1): Use catchAllCause, not catchAll. Scope
-    // closure can interrupt this fiber; without catching the interrupt cause,
-    // the bridge deferred would be left unresolved until BridgeHandler timeout.
     yield* Effect.forkIn(
       Effect.gen(function*() {
         const cachedResult = yield* Deferred.await(hitDeferred).pipe(
@@ -705,21 +728,30 @@ if (subcallCache !== null && command.method === "llm_query") {
         )
         yield* resolveBridgeDeferred(command.bridgeRequestId, cachedResult)
       }).pipe(
+        // Handles failures (timeout, producer error) and defects.
         Effect.catchAllCause((cause) =>
           Effect.gen(function*() {
             const error = Cause.failureOrCause(cause).pipe(
               Either.match({
                 onLeft: (e) => e,
-                onRight: (defectOrInterrupt) =>
-                  new SandboxError({ message: `Cache-hit fiber terminated: ${Cause.pretty(defectOrInterrupt)}` })
+                onRight: (defect) =>
+                  new SandboxError({ message: `Cache-hit fiber defect: ${Cause.pretty(defect)}` })
               })
             )
             // No eviction here — timeout eviction handled by tapError above.
-            // CRITICAL (Rev 9 Finding #2): Scope interruption must NOT evict
-            // a live producer entry. Other waiters may still be awaiting the
-            // same deferred successfully.
             yield* failBridgeDeferred(command.bridgeRequestId, error)
           })
+        ),
+        // CRITICAL (Rev 11 Finding #1): Effect.catchAllCause does NOT fire
+        // on interruption (verified experimentally). Scope closure interrupts
+        // forked fibers without entering the catch chain. Use onInterrupt to
+        // guarantee bridge deferred cleanup on scope-initiated interruption.
+        // No eviction — producer may still be alive serving other waiters.
+        Effect.onInterrupt(() =>
+          failBridgeDeferred(
+            command.bridgeRequestId,
+            new SandboxError({ message: "Cache-hit fiber interrupted (scope closed)" })
+          )
         )
       ),
       callState.callScope
@@ -739,6 +771,7 @@ if (subcallCache !== null && command.method === "llm_query") {
     // cacheKey is threaded into sub-call paths below for write-back.
   }
   // "over-capacity" → proceed without caching (no event, no deferred)
+  } // end if (cacheKey !== undefined)
 }
 // ... existing one-shot / recursive dispatch continues below,
 //     with cacheKey available for write-back ...
@@ -1111,7 +1144,8 @@ dispatch, so `reserveLlmCall` is never called for cached responses.
   by exactly 1 (not 2), confirming the cache hit does not consume budget.
 - **Cache-hit fiber interruption**: cache-hit waiter fiber is interrupted via
   scope closure before deferred resolves → bridge deferred is failed (not left
-  unresolved). Uses `Effect.catchAllCause` to handle interruption cause.
+  unresolved). Uses `Effect.onInterrupt` (not `catchAllCause`, which does not
+  fire on interruption) to guarantee cleanup.
 - **Scope.close failure does not skip cleanup**: In `handleFinalize`, inject a
   failing scope finalizer → verify cache deferred is still resolved/failed and
   bridge deferred is still resolved (i.e., `Effect.exit(Scope.close(...))` makes
@@ -1120,6 +1154,10 @@ dispatch, so `reserveLlmCall` is never called for cached responses.
   whose scope is closed (interrupted) does NOT evict the inflight entry. Verify
   the producer's deferred is still in the map and can be resolved successfully
   for other waiters. Only timeout-triggered failures cause eviction.
+- **Hash failure graceful degradation**: when `hashSchema` throws (e.g.,
+  circular reference or unsupported value), the sub-call proceeds without
+  caching (no deferred registered, no cache events). Verify normal sub-call
+  execution completes successfully.
 
 ---
 
@@ -1164,7 +1202,7 @@ This step is deferred because:
 | `src/RlmConfig.ts` | Add optional `cache` config block (`enabled`, `subcallCacheCapacity`) |
 | `src/RlmTypes.ts` | Add `CacheHit`, `CacheMiss` event variants; add `cacheBinding` to `StartCall` command |
 | `src/Runtime.ts` | Add `SubcallCache` interface and `subcallCache` to `RlmRuntimeShape` |
-| `src/Scheduler.ts` | Precompute static args/prefix in `handleStartCall`; use cached prefix in `handleGenerateStep`; cache check/write in `handleHandleBridgeCall` (forked hit), `handleFinalize` (post-validation write-back), `handleFailCall`, `handleStartCall` error handler (fail+evict cache deferred); harden `Scope.close` with `Effect.exit` in `handleFinalize`/`handleFailCall`; add `succeedCacheDeferred`/`failCacheDeferred`/`evictCacheKey` helpers |
+| `src/Scheduler.ts` | Add `Either` import; precompute static args/prefix in `handleStartCall`; use cached prefix in `handleGenerateStep`; cache check/write in `handleHandleBridgeCall` (forked hit with `onInterrupt`), `handleFinalize` (post-validation write-back), `handleFailCall`, `handleStartCall` error handler (fail+evict cache deferred); harden `Scope.close` with `Effect.exit` in `handleFinalize`/`handleFailCall`; add `succeedCacheDeferred`/`failCacheDeferred`/`evictCacheKey` helpers |
 | `src/scheduler/CacheKey.ts` | New: `makeSubcallCacheKey`, `canonicalizeJson`, `hashSchema` helpers |
 | `src/RlmRenderer.ts` | Render `CacheHit`/`CacheMiss` events |
 | `src/cli/Command.ts` | Add `--no-cache` flag definition |
@@ -1177,6 +1215,7 @@ This step is deferred because:
 | `test/RlmRenderer.test.ts` | Render `CacheHit`/`CacheMiss` event formatting |
 | `test/CliCommand.test.ts` | `--no-cache` flag parsing |
 | `test/CliNormalize.test.ts` | `noCache` propagation into `CliArgs` |
+| `test/CliLayer.test.ts` | `makeCliConfig({ noCache: true })` produces `cache.enabled === false`; default produces no cache override |
 
 ---
 
@@ -1219,9 +1258,10 @@ would leave waiters hanging. Mitigated by six layers of defense:
    `Effect.exit()` to make finalizer failures non-fatal — ensures cache/bridge
    cleanup code always executes even if a finalizer throws.
 4. The completion-level scope close in `Rlm.ts` which interrupts all fibers.
-5. Cache-hit fork uses `Effect.catchAllCause` (not `catchAll`) to handle
-   interruption causes from scope closure, ensuring the bridge deferred is
-   always failed on non-success exits.
+5. Cache-hit fork uses `Effect.catchAllCause` for failures/defects AND
+   `Effect.onInterrupt` for scope-closure interruption (the two are separate
+   — `catchAllCause` does NOT fire on interruption in Effect). Together they
+   ensure the bridge deferred is always failed on any non-success exit.
 6. Waiter interruption (scope close) does NOT evict the inflight entry — only
    timeout-triggered failures cause eviction. This prevents a canceled waiter
    from breaking single-flight semantics for other waiters of the same key.
