@@ -1,9 +1,9 @@
-# Effect-Native Caching Implementation Plan (Rev 5)
+# Effect-Native Caching Implementation Plan (Rev 6)
 
 Date: 2026-02-16
 Base spec: `docs/plans/2026-02-07-rlm-effect-caching-refactor-spec.md`
 Branch: `feat/effect-caching-implementation`
-Revision: 5 — addresses codex review findings from Rev 4
+Revision: 6 — addresses codex review findings from Rev 5
 
 ## Review Findings Addressed
 
@@ -51,6 +51,16 @@ Revision: 5 — addresses codex review findings from Rev 4
 | 4 | MEDIUM | CLI wiring inconsistent: `cache: { enabled }` vs `cliArgs.noCache`, wrong function name | Unified pipeline: `noCache` on `CliArgs` → `makeCliConfig` maps to config |
 | 5 | MEDIUM | Timeout default contradictory: Step 3 says 300s, Step 5c says 30s | Removed all 30s references; consistently derived from `bridgeTimeoutMs` |
 | 6 | MEDIUM | Prompt split omits compatibility guidance for `buildReplSystemPrompt` | Keep as compatibility wrapper; migrate scheduler first |
+
+### Rev 5 → Rev 6
+
+| # | Severity | Finding | Resolution |
+|---|----------|---------|------------|
+| 1 | HIGH | Failed cache entries not evicted outside StartCall/timeout paths (poisoned failed keys consume capacity) | Add identity-checked `evictCacheKey` after `failCacheDeferred` on all producer failure paths |
+| 2 | MEDIUM | StartCall error snippet wrong `FailCall` shape (includes `completionId`, raw `error`) | Aligned with actual `FailCall` type: `{ callId, error }` only |
+| 3 | MEDIUM | `cacheResult` scope inconsistent: `const` inside block, referenced outside | Use `let cacheResult: ... \| undefined` in outer scope, assign inside cache block |
+| 4 | MEDIUM | Step 2 ordering contradiction: compute after `makeCallContext` vs pass into it | Compute static args BEFORE `makeCallContext`, then pass in |
+| 5 | LOW | "contextMetadata always set" claim overstated (undefined for empty context) | Reworded to "derived for non-empty context" |
 
 ---
 
@@ -105,19 +115,16 @@ accessible.
 
 **File:** `src/Scheduler.ts` — `handleStartCall` (line ~382)
 
-After the existing `makeCallContext` call (line ~407), compute the static
-portions of the system prompt arguments. Store them on the `CallContext`.
-
-**Current code that moves (lines 557-604):**
-
-The tool descriptor mapping and system prompt option assembly currently live
-inside `handleGenerateStep`. The *static* portions (everything except
-`iteration` and `budget.*`) are computed once in `handleStartCall`.
+Compute the static portions of the system prompt arguments **before** the
+`makeCallContext` call, then pass them in. The tool descriptor mapping and
+system prompt option assembly currently live inside `handleGenerateStep`
+(lines 557-604). The *static* portions (everything except `iteration` and
+`budget.*`) are computed once in `handleStartCall` and stored on `CallContext`.
 
 **Concretely:**
 
 ```ts
-// In handleStartCall, after makeCallContext:
+// In handleStartCall, BEFORE makeCallContext:
 const toolDescriptors = command.tools?.map((t) => ({
   name: t.name,
   description: t.description,
@@ -156,7 +163,17 @@ const staticSystemPromptArgs = {
 }
 ```
 
-Pass `staticSystemPromptArgs` into `makeCallContext`.
+Then pass `staticSystemPromptArgs` and `staticSystemPromptPrefix` into `makeCallContext`:
+
+```ts
+const callContext = yield* makeCallContext({
+  // ... existing fields ...
+  staticSystemPromptArgs,
+  staticSystemPromptPrefix,
+  ...(command.cacheKey !== undefined ? { cacheKey: command.cacheKey } : {}),
+  ...(command.cacheDeferred !== undefined ? { cacheDeferred: command.cacheDeferred } : {})
+})
+```
 
 ### Tier A enhancement: split `buildReplSystemPrompt`
 
@@ -241,9 +258,12 @@ const prompt = buildReplPrompt({
 })
 ```
 
-**Remove the `analyzeContext` fallback** at line 607. Since `contextMetadata` is
-always set in `handleStartCall` (line 405), the fallback
-`callState.contextMetadata ?? analyzeContext(callState.context)` is dead code.
+**Remove the `analyzeContext` fallback** at line 607. `contextMetadata` is
+derived in `handleStartCall` (line 405) for all non-empty context inputs
+(via `deriveContextMetadata`). For empty context without provided metadata,
+it is `undefined` — but in that case `analyzeContext("")` also returns
+trivial metadata, so the fallback adds no value. Removing it simplifies the
+code and aligns with the precomputed field on `CallContext`.
 
 **Tests:** Existing `Scheduler.test.ts` tests must continue passing (no
 behavioral change). Add a focused test that verifies `callState` contains the
@@ -499,6 +519,12 @@ the depth check and sub-call dispatch:
 ```ts
 // --- Cache check for llm_query sub-calls ---
 let cacheKey: string | undefined
+// Declared in outer scope so one-shot/recursive write-back paths can reference it
+let cacheResult: { _tag: "hit"; deferred: Deferred.Deferred<unknown, RlmError> }
+  | { _tag: "miss"; deferred: Deferred.Deferred<unknown, RlmError> }
+  | { _tag: "over-capacity" }
+  | undefined
+
 if (subcallCache !== null && command.method === "llm_query") {
   // CRITICAL (Rev 4 Finding #2): Namespace route discriminators to prevent
   // collision with named model names like "recursive" or "oneshot".
@@ -520,7 +546,7 @@ if (subcallCache !== null && command.method === "llm_query") {
 
   // Atomic check-and-insert using Ref.modify to eliminate TOCTOU races
   const freshDeferred = yield* Deferred.make<unknown, RlmError>()
-  const cacheResult = yield* Ref.modify(subcallCache.inflight, (m) => {
+  cacheResult = yield* Ref.modify(subcallCache.inflight, (m) => {
     const existing = m.get(cacheKey!)
     if (existing !== undefined) {
       return [{ _tag: "hit" as const, deferred: existing }, m] as const
@@ -662,8 +688,9 @@ yield* Effect.forkIn(
         ? (cause.error as RlmError)
         : new SandboxError({ message: Cause.pretty(cause) })
       return Effect.gen(function*() {
-        if (cacheResult?._tag === "miss") {
+        if (cacheResult?._tag === "miss" && cacheKey !== undefined && subcallCache !== null) {
           yield* failCacheDeferred(cacheResult.deferred, error)
+          yield* evictCacheKey(subcallCache, cacheKey, cacheResult.deferred)
         }
         const message = "message" in error ? error.message : String(error)
         yield* failBridgeDeferred(command.bridgeRequestId, message)
@@ -753,9 +780,11 @@ if (callState.parentBridgeRequestId) {
           message: `Sub-call structured output schema validation failed: ${validationResult.errors.join("; ")}`,
           raw: renderSubmitAnswer(command.payload)
         })
-        // Fail captured deferred so waiters also get the validation error
-        if (callState.cacheDeferred !== undefined) {
+        // Fail captured deferred and evict so waiters get the error
+        // and the key is freed for potential retry
+        if (callState.cacheDeferred !== undefined && callState.cacheKey !== undefined && subcallCache !== null) {
           yield* failCacheDeferred(callState.cacheDeferred, error)
+          yield* evictCacheKey(subcallCache, callState.cacheKey, callState.cacheDeferred)
         }
         yield* failBridgeDeferred(callState.parentBridgeRequestId, error)
         return
@@ -774,8 +803,9 @@ if (callState.parentBridgeRequestId) {
     message: "Sub-call finalization must use `SUBMIT({ answer: ... })`.",
     raw: renderSubmitAnswer(command.payload)
   })
-  if (callState.cacheDeferred !== undefined) {
+  if (callState.cacheDeferred !== undefined && callState.cacheKey !== undefined && subcallCache !== null) {
     yield* failCacheDeferred(callState.cacheDeferred, error)
+    yield* evictCacheKey(subcallCache, callState.cacheKey, callState.cacheDeferred)
   }
   yield* failBridgeDeferred(callState.parentBridgeRequestId, error)
 }
@@ -812,7 +842,6 @@ Effect.gen(function*() {
     yield* evictCacheKey(subcallCache, command.cacheKey, command.cacheDeferred)
   }
   yield* enqueue(RlmCommand.FailCall({
-    completionId: runtime.completionId,
     callId: command.callId,
     error
   }))
@@ -830,6 +859,9 @@ if the transient failure (e.g., budget) has been resolved.
 ```ts
 if (callState?.parentBridgeRequestId && callState.cacheDeferred !== undefined) {
   yield* failCacheDeferred(callState.cacheDeferred, command.error)
+  if (callState.cacheKey !== undefined && subcallCache !== null) {
+    yield* evictCacheKey(subcallCache, callState.cacheKey, callState.cacheDeferred)
+  }
 }
 ```
 
@@ -843,8 +875,8 @@ requests (`docs/plans/2026-02-07-rlm-effect-caching-refactor-spec.md:149`):
 | First call for key K | Miss → create deferred → run sub-call → resolve deferred |
 | Concurrent call for key K (in flight) | Hit → **fork** fiber to await deferred → scheduler loop continues |
 | Later call for key K (completed) | Hit → fork completes immediately (deferred already resolved) |
-| Sub-call fails for key K | Deferred failed → all waiters receive the error |
-| Schema validation fails | Deferred failed with `OutputValidationError` → waiters get same error |
+| Sub-call fails for key K | Deferred failed + key evicted → waiters receive error; retries get fresh miss |
+| Schema validation fails | Deferred failed with `OutputValidationError` + key evicted → waiters get same error |
 | Deferred.await times out | Waiter fails with `SandboxError` → does not affect other waiters |
 | Capacity exceeded | No deferred registered → sub-call runs normally (no caching) |
 
@@ -895,6 +927,9 @@ dispatch, so `reserveLlmCall` is never called for cached responses.
 - **Named model route isolation**: a named model called `"recursive"` produces
   cache key with `named:recursive`, not `route:recursive` → no false hit with
   the implicit recursive routing path.
+- **Producer failure eviction**: when a one-shot sub-call fails, the cache
+  deferred is failed AND the key is evicted. A subsequent identical call gets
+  a fresh miss (not the stale failed deferred). Verify capacity is freed.
 
 ---
 
@@ -971,8 +1006,10 @@ would leave waiters hanging. Mitigated by four layers of defense:
 1. `Effect.timeoutFail` on `Deferred.await` in the cache-hit fork (derived
    from `bridgeTimeoutMs`, default 300s). On timeout with pending deferred,
    the stale key is evicted from the inflight map.
-2. `handleStartCall` error handler: fails cache deferred and evicts key when
-   sub-call fails before `setCallState`.
+2. All producer failure paths (one-shot catch, handleFinalize validation
+   failure, handleFailCall, handleStartCall error handler) fail the cache
+   deferred AND evict the key with identity check. This ensures failed entries
+   don't consume capacity or cause stale error hits.
 3. The existing `callScope` close in error paths.
 4. The completion-level scope close in `Rlm.ts` which interrupts all fibers.
 
