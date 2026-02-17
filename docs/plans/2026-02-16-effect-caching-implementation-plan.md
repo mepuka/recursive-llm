@@ -1,9 +1,9 @@
-# Effect-Native Caching Implementation Plan (Rev 3)
+# Effect-Native Caching Implementation Plan (Rev 4)
 
 Date: 2026-02-16
 Base spec: `docs/plans/2026-02-07-rlm-effect-caching-refactor-spec.md`
 Branch: `feat/effect-caching-implementation`
-Revision: 3 — addresses codex review findings from Rev 2
+Revision: 4 — addresses codex review findings from Rev 3
 
 ## Review Findings Addressed
 
@@ -30,6 +30,16 @@ Revision: 3 — addresses codex review findings from Rev 2
 | 5 | MEDIUM | Deferred timeout documented but not in implementation steps | Added `Effect.timeoutFail` wrapper on `Deferred.await` in cache-hit fork |
 | 6 | MEDIUM | Missing test cases: deadlock, schema canonicalization, over-capacity | Added to test plan |
 | 7 | LOW | Cache key policy partial divergence from base spec | Acknowledged; `parentCallId` + discriminators sufficient for current runtime |
+
+### Rev 3 → Rev 4
+
+| # | Severity | Finding | Resolution |
+|---|----------|---------|------------|
+| 1 | HIGH | `StartCall` pre-state failure leaves cache deferred unresolved (poisoned key) | Fail cache deferred in `handleStartCall` error handler; evict key from map |
+| 2 | MEDIUM | Cache-hit timeout (30s) shorter than bridge timeout (300s) → split outcomes | Derive cache timeout from `bridgeTimeoutMs` (default 300s) instead of independent config |
+| 3 | MEDIUM | Timeout path doesn't evict stale inflight entry → poisoned key for completion | On timeout, check `Deferred.isDone`; if still pending, evict key from map |
+| 4 | MEDIUM | `canonicalizeJson` undefined handling incorrect (`Object.keys` includes undefined keys) | Filter out `undefined` values explicitly to match `JSON.stringify` semantics |
+| 5 | LOW | Missing test cases for StartCall-pre-state failure and timeout eviction | Added to test plan |
 
 ---
 
@@ -222,13 +232,16 @@ Extend `RlmConfigService` with:
 readonly cache?: {
   readonly enabled?: boolean                   // default true
   readonly subcallCacheCapacity?: number        // default 256
-  readonly subcallCacheTimeoutMs?: number       // default 30_000 (defensive timeout for Deferred.await)
   readonly deterministicOnly?: boolean          // default true
 }
 ```
 
 The `cache` field is optional with all sub-fields optional, preserving
 backward compatibility. Defaults are applied in the consumer code.
+
+**No separate cache timeout config.** The cache-hit timeout is derived from
+the existing `bridgeTimeoutMs` config (default 300s, see `BridgeHandler.ts:72`)
+to ensure cache-hit waiters never time out before the original sub-call would.
 
 Removed from Rev 1: `subcallCacheTtlMs`, `modelCacheCapacity`, `modelCacheTtlMs`
 — TTL is unnecessary for request-local lifetime (map lives in `RlmRuntime`
@@ -341,7 +354,7 @@ import type { RlmError } from "./RlmError"
 export interface SubcallCache {
   readonly inflight: Ref.Ref<Map<string, Deferred.Deferred<unknown, RlmError>>>
   readonly capacity: number
-  readonly timeoutMs: number
+  readonly timeoutMs: number  // derived from bridgeTimeoutMs
 }
 
 export interface RlmRuntimeShape {
@@ -358,7 +371,7 @@ const subcallCache: SubcallCache | null = cacheEnabled
   ? {
       inflight: yield* Ref.make(new Map<string, Deferred.Deferred<unknown, RlmError>>()),
       capacity: config.cache?.subcallCacheCapacity ?? 256,
-      timeoutMs: config.cache?.subcallCacheTimeoutMs ?? 30_000
+      timeoutMs: config.bridgeTimeoutMs ?? 300_000  // match bridge timeout
     }
   : null
 ```
@@ -399,8 +412,10 @@ export const makeSubcallCacheKey = (parts: SubcallCacheKeyParts): string => {
 /**
  * Deep-canonicalize a JSON-serializable value for deterministic hashing.
  * Recursively sorts object keys at all nesting levels. Arrays preserve order.
+ * Drops keys with `undefined` values to match `JSON.stringify` semantics.
  */
 export const canonicalizeJson = (value: unknown): string => {
+  if (value === undefined) return "null"  // match JSON.stringify(undefined) → undefined, but treat as null for safety
   if (value === null || typeof value !== "object") {
     return JSON.stringify(value)
   }
@@ -408,7 +423,7 @@ export const canonicalizeJson = (value: unknown): string => {
     return "[" + value.map(canonicalizeJson).join(",") + "]"
   }
   const obj = value as Record<string, unknown>
-  const keys = Object.keys(obj).sort()
+  const keys = Object.keys(obj).sort().filter((k) => obj[k] !== undefined)
   return "{" + keys.map((k) =>
     JSON.stringify(k) + ":" + canonicalizeJson(obj[k])
   ).join(",") + "}"
@@ -499,7 +514,7 @@ if (subcallCache !== null && command.method === "llm_query") {
       Effect.gen(function*() {
         const cachedResult = yield* Deferred.await(cacheResult.deferred).pipe(
           Effect.timeoutFail({
-            duration: `${subcallCache.timeoutMs} millis`,
+            duration: Duration.millis(subcallCache.timeoutMs),
             onTimeout: () => new SandboxError({
               message: `Sub-call cache await timed out after ${subcallCache.timeoutMs}ms`
             })
@@ -508,7 +523,16 @@ if (subcallCache !== null && command.method === "llm_query") {
         yield* resolveBridgeDeferred(command.bridgeRequestId, cachedResult)
       }).pipe(
         Effect.catchAll((error) =>
-          failBridgeDeferred(command.bridgeRequestId, error)
+          Effect.gen(function*() {
+            // CRITICAL (Rev 3 Finding #3): On timeout, evict the stale entry
+            // if the deferred is still pending. This prevents a stuck/dropped
+            // sub-call from poisoning the key for the rest of the completion.
+            const isDone = yield* Deferred.isDone(cacheResult.deferred)
+            if (!isDone) {
+              yield* evictCacheKey(subcallCache, cacheKey)
+            }
+            yield* failBridgeDeferred(command.bridgeRequestId, error)
+          })
         )
       ),
       callState.callScope
@@ -641,6 +665,21 @@ const failCacheDeferred = (
       yield* Deferred.fail(deferred, error)
     }
   })
+
+/**
+ * Evict a cache key from the inflight map.
+ * Used on timeout (when deferred is still pending) and on StartCall
+ * pre-state failure to prevent poisoned keys.
+ */
+const evictCacheKey = (
+  cache: SubcallCache,
+  key: string
+) =>
+  Ref.update(cache.inflight, (m) => {
+    const next = new Map(m)
+    next.delete(key)
+    return next
+  })
 ```
 
 **Recursive path** (in `handleFinalize`, when resolving parent bridge deferred):
@@ -697,6 +736,46 @@ if (callState.parentBridgeRequestId) {
   yield* failBridgeDeferred(callState.parentBridgeRequestId, error)
 }
 ```
+
+**StartCall pre-state failure** (in `handleStartCall` error handler, `Scheduler.ts:494-508`):
+
+**CRITICAL (Rev 3 Finding #1):** When `handleStartCall` fails before
+`setCallState` (e.g., sandbox creation fails, budget exhausted), the cache
+deferred — already inserted into the inflight map by the parent's
+`handleHandleBridgeCall` — is never resolved. This poisons the key: any
+concurrent or future cache hit for the same key will await a deferred that
+will never complete (or timeout after `bridgeTimeoutMs`).
+
+**Fix:** In the existing error handler at `Scheduler.ts:494-508`, after
+closing the scope and failing the bridge deferred, also fail and evict the
+cache deferred:
+
+```ts
+// In handleStartCall error handler (Scheduler.ts:494-508):
+Effect.gen(function*() {
+  yield* Scope.close(callScope, Exit.void)
+  if (command.parentBridgeRequestId) {
+    yield* failBridgeDeferred(command.parentBridgeRequestId, error)
+  }
+  // CRITICAL (Rev 3 Finding #1): Fail and evict cache deferred to prevent
+  // poisoned key when StartCall fails before setCallState
+  if (subcallCache !== null && command.cacheKey !== undefined) {
+    yield* failCacheDeferred(subcallCache, command.cacheKey, error)
+    yield* evictCacheKey(subcallCache, command.cacheKey)
+  }
+  yield* enqueue(RlmCommand.FailCall({
+    completionId: runtime.completionId,
+    callId: command.callId,
+    error
+  }))
+})
+```
+
+**Why evict after fail?** Failing the deferred resolves any current waiters
+with the error. Evicting the key from the map ensures that *subsequent*
+calls for the same key don't find the failed deferred and immediately
+receive a stale error — they get a fresh miss instead, which may succeed
+if the transient failure (e.g., budget) has been resolved.
 
 **Recursive failure path** (in `handleFailCall`):
 
@@ -756,6 +835,12 @@ dispatch, so `reserveLlmCall` is never called for cached responses.
   proceed without caching (no deferred registered, no events emitted).
 - **Timeout on never-resolved deferred**: cache-hit waiter times out with
   `SandboxError` after configured duration.
+- **Timeout eviction**: when a cache-hit waiter times out and the deferred is
+  still pending (`Deferred.isDone` returns false), the key is evicted from
+  the inflight map. A subsequent call for the same key gets a fresh miss.
+- **StartCall pre-state failure**: a sub-call whose `StartCall` fails (e.g.,
+  sandbox creation error) fails the cache deferred AND evicts the key.
+  Concurrent waiters receive the error; subsequent callers get a fresh miss.
 
 ---
 
@@ -796,10 +881,10 @@ This step is deferred because:
 |------|--------|
 | `src/CallContext.ts` | Add `staticSystemPromptArgs`, `staticSystemPromptPrefix`, `cacheKey` fields |
 | `src/SystemPrompt.ts` | Split `buildReplSystemPrompt` into `buildReplSystemPromptStatic` + `buildReplSystemPromptDynamic` |
-| `src/RlmConfig.ts` | Add optional `cache` config block (including `subcallCacheTimeoutMs`) |
+| `src/RlmConfig.ts` | Add optional `cache` config block (`enabled`, `subcallCacheCapacity`, `deterministicOnly`) |
 | `src/RlmTypes.ts` | Add `CacheHit`, `CacheMiss` event variants; add `cacheKey` to `StartCall` command |
 | `src/Runtime.ts` | Add `SubcallCache` interface and `subcallCache` to `RlmRuntimeShape` |
-| `src/Scheduler.ts` | Precompute static args/prefix in `handleStartCall`; use cached prefix in `handleGenerateStep`; cache check/write in `handleHandleBridgeCall` (forked hit), `handleFinalize` (post-validation write-back), `handleFailCall`; add `succeedCacheDeferred`/`failCacheDeferred` helpers |
+| `src/Scheduler.ts` | Precompute static args/prefix in `handleStartCall`; use cached prefix in `handleGenerateStep`; cache check/write in `handleHandleBridgeCall` (forked hit), `handleFinalize` (post-validation write-back), `handleFailCall`, `handleStartCall` error handler (fail+evict cache deferred); add `succeedCacheDeferred`/`failCacheDeferred`/`evictCacheKey` helpers |
 | `src/scheduler/CacheKey.ts` | New: `makeSubcallCacheKey`, `canonicalizeJson`, `hashSchema` helpers |
 | `src/RlmRenderer.ts` | Render `CacheHit`/`CacheMiss` events |
 | `src/cli/Command.ts` | Add `--no-cache` flag definition |
@@ -828,11 +913,14 @@ Steps 5a and 5b can be done in parallel.
 
 **Deferred lifecycle:** A `Deferred` that is never resolved (e.g., if the
 sub-call silently drops without hitting `handleFinalize` or `handleFailCall`)
-would leave waiters hanging. Mitigated by three layers of defense:
-1. `Effect.timeoutFail` on `Deferred.await` in the cache-hit fork (default
-   30s, configurable via `subcallCacheTimeoutMs`).
-2. The existing `callScope` close in error paths.
-3. The completion-level scope close in `Rlm.ts` which interrupts all fibers.
+would leave waiters hanging. Mitigated by four layers of defense:
+1. `Effect.timeoutFail` on `Deferred.await` in the cache-hit fork (derived
+   from `bridgeTimeoutMs`, default 300s). On timeout with pending deferred,
+   the stale key is evicted from the inflight map.
+2. `handleStartCall` error handler: fails cache deferred and evicts key when
+   sub-call fails before `setCallState`.
+3. The existing `callScope` close in error paths.
+4. The completion-level scope close in `Rlm.ts` which interrupts all fibers.
 
 **Deferred double-resolve:** `Deferred.succeed`/`Deferred.fail` on an
 already-resolved deferred is a no-op in Effect (returns `false`). This is safe
@@ -882,6 +970,8 @@ original execution). The cache check happens before `runOneShotSubCall` or
 - Objects (sort keys at every nesting level, recursively canonicalize values)
 - Nested objects within arrays within objects (full recursion)
 
-Edge cases: `undefined` values in objects are dropped by `Object.keys`,
-matching `JSON.stringify` behavior. Circular references would cause infinite
-recursion, but JSON Schema objects are acyclic by design.
+Edge cases: `undefined` values in objects are explicitly filtered out via
+`.filter((k) => obj[k] !== undefined)` after `Object.keys(...).sort()`,
+matching `JSON.stringify` behavior (which omits `undefined`-valued keys).
+Circular references would cause infinite recursion, but JSON Schema objects
+are acyclic by design.
