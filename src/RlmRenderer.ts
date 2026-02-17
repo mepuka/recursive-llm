@@ -257,6 +257,14 @@ const bridgeBlock = (
 ): Doc.Doc<Annotation> =>
   withGuide(e.depth, styled("bridge", `├─ ↗ Bridge: ${e.method}`))
 
+const cacheBlock = (
+  e: Extract<RlmEvent, { _tag: "CacheHit" | "CacheMiss" }>
+): Doc.Doc<Annotation> => {
+  const status = e._tag === "CacheHit" ? "hit" : "miss"
+  const shortKey = e.cacheKey.length > 24 ? `${e.cacheKey.slice(0, 24)}...` : e.cacheKey
+  return withGuide(e.depth, styled("bridge", `├─ ↺ Cache ${status} (${e.kind}): ${shortKey}`))
+}
+
 const finalBlock = (
   e: Extract<RlmEvent, { _tag: "CallFinalized" }>,
   opts: RenderOptions
@@ -355,6 +363,8 @@ export const buildEventDoc = (event: RlmEvent, options?: RenderOptions): Doc.Doc
       CodeExecutionStarted: (e) => opts.quiet ? Doc.empty as Doc.Doc<Annotation> : codeBlock(e, opts),
       CodeExecutionCompleted: (e) => opts.quiet ? Doc.empty as Doc.Doc<Annotation> : outputBlock(e, opts),
       BridgeCallReceived: (e) => opts.quiet ? Doc.empty as Doc.Doc<Annotation> : bridgeBlock(e),
+      CacheHit: (e) => opts.quiet ? Doc.empty as Doc.Doc<Annotation> : cacheBlock(e),
+      CacheMiss: (e) => opts.quiet ? Doc.empty as Doc.Doc<Annotation> : cacheBlock(e),
       CallFinalized: (e) => finalBlock(e, opts),
       CallFailed: (e) => Doc.vsep(formatError(e.error).map((line) => withGuide(e.depth, line))),
       SchedulerWarning: (e) => schedulerWarningDoc(e, opts)

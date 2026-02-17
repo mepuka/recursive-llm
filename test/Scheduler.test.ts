@@ -1659,6 +1659,224 @@ describe("Scheduler tool dispatch (e2e with real sandbox)", () => {
     expect(eventList.some((event) => event._tag === "CallFailed")).toBe(false)
   }, 15_000)
 
+  test("concurrent duplicate llm_query calls dedupe and emit cache hit/miss", async () => {
+    const modelMetrics: FakeModelMetrics = {
+      calls: 0,
+      prompts: [],
+      depths: [],
+      isSubCalls: []
+    }
+
+    const events = await Effect.runPromise(
+      stream({
+        query: "cache dedup concurrent",
+        context: "ctx"
+      }).pipe(
+        Stream.runCollect,
+        Effect.provide(makeRealSandboxLayers({
+          responses: [
+            { text: "```js\nconst [left, right] = await Promise.all([\n  llm_query('same query', 'same context'),\n  llm_query('same query', 'same context')\n])\nprint(JSON.stringify([left, right]))\n```" },
+            { text: "shared-sub-answer" },
+            submitAnswer("done")
+          ],
+          modelMetrics,
+          config: { maxDepth: 0 }
+        })),
+        Effect.timeout("12 seconds")
+      )
+    )
+
+    const eventList = Chunk.toReadonlyArray(events)
+    const cacheHitCount = eventList.filter((event) =>
+      event._tag === "CacheHit" && event.kind === "subcall"
+    ).length
+    const cacheMissCount = eventList.filter((event) =>
+      event._tag === "CacheMiss" && event.kind === "subcall"
+    ).length
+    const execCompleted = eventList.find(
+      (event): event is Extract<typeof event, { _tag: "CodeExecutionCompleted" }> =>
+        event._tag === "CodeExecutionCompleted"
+    )
+
+    expect(execCompleted).toBeDefined()
+    expect(execCompleted!.output).toContain("[\"shared-sub-answer\",\"shared-sub-answer\"]")
+    expect(cacheHitCount).toBeGreaterThanOrEqual(1)
+    expect(cacheMissCount).toBeGreaterThanOrEqual(1)
+    expect(modelMetrics.calls).toBe(3)
+    expect(modelMetrics.isSubCalls?.filter((value) => value === true).length).toBe(1)
+  }, 20_000)
+
+  test("concurrent duplicate recursive llm_query calls complete without scheduler deadlock", async () => {
+    const modelMetrics: FakeModelMetrics = {
+      calls: 0,
+      prompts: [],
+      depths: [],
+      isSubCalls: []
+    }
+
+    const events = await Effect.runPromise(
+      stream({
+        query: "recursive cache dedup",
+        context: "ctx"
+      }).pipe(
+        Stream.runCollect,
+        Effect.provide(makeRealSandboxLayers({
+          responses: [
+            { text: "```js\nconst [left, right] = await Promise.all([\n  llm_query('same recursive query', 'same recursive context'),\n  llm_query('same recursive query', 'same recursive context')\n])\nprint(left + '|' + right)\n```" },
+            submitAnswer("recursive-sub-answer"),
+            submitAnswer("done")
+          ],
+          modelMetrics,
+          config: { maxDepth: 2 }
+        })),
+        Effect.timeout("15 seconds")
+      )
+    )
+
+    const eventList = Chunk.toReadonlyArray(events)
+    const cacheHitCount = eventList.filter((event) =>
+      event._tag === "CacheHit" && event.kind === "subcall"
+    ).length
+    const cacheMissCount = eventList.filter((event) =>
+      event._tag === "CacheMiss" && event.kind === "subcall"
+    ).length
+    const execCompleted = eventList.find(
+      (event): event is Extract<typeof event, { _tag: "CodeExecutionCompleted" }> =>
+        event._tag === "CodeExecutionCompleted" && event.callId === "root"
+    )
+    const finalized = eventList.find(
+      (event): event is Extract<typeof event, { _tag: "CallFinalized" }> =>
+        event._tag === "CallFinalized" && event.callId === "root"
+    )
+
+    expect(execCompleted).toBeDefined()
+    expect(execCompleted!.output).toContain("recursive-sub-answer|recursive-sub-answer")
+    expect(finalized).toBeDefined()
+    expect(finalized!.answer).toBe("done")
+    expect(cacheHitCount).toBeGreaterThanOrEqual(1)
+    expect(cacheMissCount).toBeGreaterThanOrEqual(1)
+    expect(modelMetrics.calls).toBe(3)
+    expect(modelMetrics.depths.some((depth) => depth === 1)).toBe(true)
+  }, 25_000)
+
+  test("llm_query responseFormat cache hit preserves parsed object values", async () => {
+    const modelMetrics: FakeModelMetrics = {
+      calls: 0,
+      prompts: [],
+      depths: [],
+      isSubCalls: []
+    }
+
+    const events = await Effect.runPromise(
+      stream({
+        query: "structured cache hit",
+        context: "ctx"
+      }).pipe(
+        Stream.runCollect,
+        Effect.provide(makeRealSandboxLayers({
+          responses: [
+            { text: "```js\nconst schema = { type: 'object', properties: { name: { type: 'string' } }, required: ['name'] }\nconst first = await llm_query('Extract actor', 'Alice is a researcher', { responseFormat: { type: 'json', schema } })\nconst second = await llm_query('Extract actor', 'Alice is a researcher', { responseFormat: { type: 'json', schema } })\nprint(`${typeof first}|${typeof second}|${first.name}|${second.name}`)\n```" },
+            { text: "{\"name\":\"Alice\"}" },
+            submitAnswer("done")
+          ],
+          modelMetrics,
+          config: { maxDepth: 0 }
+        })),
+        Effect.timeout("12 seconds")
+      )
+    )
+
+    const eventList = Chunk.toReadonlyArray(events)
+    const cacheHitCount = eventList.filter((event) =>
+      event._tag === "CacheHit" && event.kind === "subcall"
+    ).length
+    const execCompleted = eventList.find(
+      (event): event is Extract<typeof event, { _tag: "CodeExecutionCompleted" }> =>
+        event._tag === "CodeExecutionCompleted"
+    )
+
+    expect(execCompleted).toBeDefined()
+    expect(execCompleted!.output).toBe("object|object|Alice|Alice")
+    expect(cacheHitCount).toBeGreaterThanOrEqual(1)
+    expect(modelMetrics.calls).toBe(3)
+  }, 20_000)
+
+  test("cache hit does not consume an extra llm call budget slot", async () => {
+    const modelMetrics: FakeModelMetrics = {
+      calls: 0,
+      prompts: [],
+      depths: [],
+      isSubCalls: []
+    }
+
+    const answer = await Effect.runPromise(
+      complete({
+        query: "budget with cache hit",
+        context: "ctx"
+      }).pipe(
+        Effect.provide(makeRealSandboxLayers({
+          responses: [
+            { text: "```js\nconst first = await llm_query('budget query', 'budget context')\nconst second = await llm_query('budget query', 'budget context')\nprint(first + '|' + second)\n```" },
+            { text: "budget-answer" },
+            submitAnswer("done")
+          ],
+          modelMetrics,
+          config: {
+            maxDepth: 0,
+            maxLlmCalls: 3
+          }
+        })),
+        Effect.timeout("12 seconds")
+      )
+    )
+
+    expect(answer).toBe("done")
+    expect(modelMetrics.calls).toBe(3)
+  }, 20_000)
+
+  test("cache disabled runs duplicate llm_query calls without cache events", async () => {
+    const modelMetrics: FakeModelMetrics = {
+      calls: 0,
+      prompts: [],
+      depths: [],
+      isSubCalls: []
+    }
+
+    const events = await Effect.runPromise(
+      stream({
+        query: "cache disabled",
+        context: "ctx"
+      }).pipe(
+        Stream.runCollect,
+        Effect.provide(makeRealSandboxLayers({
+          responses: [
+            { text: "```js\nconst first = await llm_query('same query', 'same context')\nconst second = await llm_query('same query', 'same context')\nprint(first + '|' + second)\n```" },
+            { text: "first-sub-answer" },
+            { text: "second-sub-answer" },
+            submitAnswer("done")
+          ],
+          modelMetrics,
+          config: {
+            maxDepth: 0,
+            cache: { enabled: false }
+          }
+        })),
+        Effect.timeout("12 seconds")
+      )
+    )
+
+    const eventList = Chunk.toReadonlyArray(events)
+    const execCompleted = eventList.find(
+      (event): event is Extract<typeof event, { _tag: "CodeExecutionCompleted" }> =>
+        event._tag === "CodeExecutionCompleted"
+    )
+
+    expect(execCompleted).toBeDefined()
+    expect(execCompleted!.output).toContain("first-sub-answer|second-sub-answer")
+    expect(eventList.some((event) => event._tag === "CacheHit" || event._tag === "CacheMiss")).toBe(false)
+    expect(modelMetrics.calls).toBe(4)
+  }, 20_000)
+
   test("llm_query_batched preserves result order and routes as sub-calls", async () => {
     const modelMetrics: FakeModelMetrics = {
       calls: 0,

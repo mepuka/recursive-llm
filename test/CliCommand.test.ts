@@ -118,6 +118,17 @@ describe("Effect CLI command", () => {
     expect(captured?.enablePromptCaching).toBe(false)
   })
 
+  test("maps --no-cache to noCache=true", async () => {
+    const captured = await runWithCapture([
+      "bun",
+      "src/cli.ts",
+      "summarize this",
+      "--no-cache"
+    ])
+
+    expect(captured?.noCache).toBe(true)
+  })
+
   test("maps --no-trace to noTrace=true", async () => {
     const captured = await runWithCapture([
       "bun",

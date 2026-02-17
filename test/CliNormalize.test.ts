@@ -27,6 +27,7 @@ const baseParsed: ParsedCliConfig = {
   maxTimeMs: Option.none(),
   sandboxTransport: "auto",
   noPromptCaching: false,
+  noCache: false,
   quiet: false,
   noColor: false,
   nlpTools: false,
@@ -124,6 +125,17 @@ describe("CLI normalization", () => {
   test("leaves prompt caching default when no disable flag is present", async () => {
     const cliArgs = await normalize(baseParsed, ["query"])
     expect(cliArgs.enablePromptCaching).toBeUndefined()
+  })
+
+  test("maps --no-cache to noCache=true", async () => {
+    const cliArgs = await normalize(
+      {
+        ...baseParsed,
+        noCache: true
+      },
+      ["query", "--no-cache"]
+    )
+    expect(cliArgs.noCache).toBe(true)
   })
 
   test("fails when delegation is explicitly enabled without sub model", async () => {

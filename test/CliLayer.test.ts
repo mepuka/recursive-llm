@@ -92,6 +92,15 @@ describe("CliLayer config mapping", () => {
     expect(config.enablePromptCaching).toBe(false)
   })
 
+  test("maps noCache flag to cache.enabled=false", () => {
+    const config = makeCliConfig({
+      ...baseArgs,
+      noCache: true
+    })
+
+    expect(config.cache?.enabled).toBe(false)
+  })
+
   test("enables tracing by default with default base directory", () => {
     const traceConfig = makeCliTraceConfig({
       ...baseArgs

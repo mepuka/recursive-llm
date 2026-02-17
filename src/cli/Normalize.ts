@@ -22,6 +22,7 @@ export interface ParsedCliConfig {
   readonly maxTimeMs: Option.Option<number>
   readonly sandboxTransport: "auto" | "worker" | "spawn"
   readonly noPromptCaching: boolean
+  readonly noCache: boolean
   readonly quiet: boolean
   readonly noColor: boolean
   readonly nlpTools: boolean
@@ -277,6 +278,7 @@ export const normalizeCliArgs = (
         : {}),
       ...(traceDir !== undefined ? { traceDir } : {}),
       ...(enablePromptCaching !== undefined ? { enablePromptCaching } : {}),
+      ...(parsed.noCache ? { noCache: true } : {}),
       ...(anthropicApiKey !== undefined ? { anthropicApiKey } : {}),
       ...(openaiApiKey !== undefined ? { openaiApiKey } : {}),
       ...(googleApiKey !== undefined ? { googleApiKey } : {}),

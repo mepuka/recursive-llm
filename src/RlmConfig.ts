@@ -30,6 +30,10 @@ export interface RlmConfigService {
   readonly namedModels?: Record<string, RlmModelTarget>
   readonly subLlmDelegation: SubLlmDelegationConfig
   readonly subModelContextChars?: number
+  readonly cache?: {
+    readonly enabled?: boolean
+    readonly subcallCacheCapacity?: number
+  }
   readonly bridgeTimeoutMs?: number
   readonly bridgeToolRetryCount?: number
   readonly bridgeLlmQueryRetryCount?: number

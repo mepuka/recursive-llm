@@ -1,7 +1,7 @@
 import { Context, Deferred, Effect, Layer, Option, PubSub, Queue, Ref } from "effect"
 import type { CallContext } from "./CallContext"
 import { RlmConfig } from "./RlmConfig"
-import type { SandboxError } from "./RlmError"
+import type { RlmError, SandboxError } from "./RlmError"
 import {
   BudgetState,
   type BridgeRequestId,
@@ -10,6 +10,12 @@ import {
   type RlmCommand,
   type RlmEvent
 } from "./RlmTypes"
+
+export interface SubcallCache {
+  readonly inflight: Ref.Ref<Map<string, Deferred.Deferred<unknown, RlmError>>>
+  readonly capacity: number
+  readonly timeoutMs: number
+}
 
 export interface RlmRuntimeShape {
   readonly completionId: string
@@ -22,6 +28,7 @@ export interface RlmRuntimeShape {
   readonly callStates: Ref.Ref<Map<CallId, CallContext>>
   readonly bridgePending: Ref.Ref<Map<BridgeRequestId, Deferred.Deferred<unknown, SandboxError>>>
   readonly partialOutcomesRef: Ref.Ref<Map<CallId, PartialResult>>
+  readonly subcallCache: SubcallCache | null
 }
 
 export class RlmRuntime extends Context.Tag("@recursive-llm/RlmRuntime")<
@@ -55,6 +62,14 @@ export const RlmRuntimeLive = Layer.scoped(
     const callStates = yield* Ref.make(new Map<CallId, CallContext>())
     const bridgePending = yield* Ref.make(new Map<BridgeRequestId, Deferred.Deferred<unknown, SandboxError>>())
     const partialOutcomesRef = yield* Ref.make(new Map<CallId, PartialResult>())
+    const cacheEnabled = config.cache?.enabled !== false
+    const subcallCache: SubcallCache | null = cacheEnabled
+      ? {
+          inflight: yield* Ref.make(new Map<string, Deferred.Deferred<unknown, RlmError>>()),
+          capacity: config.cache?.subcallCacheCapacity ?? 256,
+          timeoutMs: config.bridgeTimeoutMs ?? 300_000
+        }
+      : null
 
     const completionId = `completion-${crypto.randomUUID()}`
 
@@ -68,7 +83,8 @@ export const RlmRuntimeLive = Layer.scoped(
       llmSemaphore,
       callStates,
       bridgePending,
-      partialOutcomesRef
+      partialOutcomesRef,
+      subcallCache
     } satisfies RlmRuntimeShape
   })
 )

@@ -156,6 +156,38 @@ describe("RlmRenderer", () => {
     expect(out).toContain("↗ Bridge: llm_query")
   })
 
+  test("CacheHit renders cache status, kind, and key", () => {
+    const out = capture(
+      RlmEvent.CacheHit({
+        completionId,
+        callId,
+        depth: 0,
+        kind: "subcall",
+        cacheKey: "subcall:abcdef1234567890"
+      }),
+      { noColor: true }
+    )
+    expect(out).toContain("Cache hit")
+    expect(out).toContain("subcall")
+    expect(out).toContain("subcall:abcdef")
+  })
+
+  test("CacheMiss renders cache status, kind, and key", () => {
+    const out = capture(
+      RlmEvent.CacheMiss({
+        completionId,
+        callId,
+        depth: 0,
+        kind: "subcall",
+        cacheKey: "subcall:abcdef1234567890"
+      }),
+      { noColor: true }
+    )
+    expect(out).toContain("Cache miss")
+    expect(out).toContain("subcall")
+    expect(out).toContain("subcall:abcdef")
+  })
+
   // --- Final ---
 
   test("CallFinalized renders answer", () => {

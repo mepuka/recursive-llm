@@ -18,6 +18,14 @@ const makeStubSandbox = (): SandboxInstance => ({
   listVariables: () => Effect.succeed([])
 })
 
+const staticSystemPromptArgs = {
+  depth: 0,
+  maxIterations: 10,
+  maxDepth: 1
+} as const
+
+const staticSystemPromptPrefix = "static prompt prefix"
+
 describe("CallContext", () => {
   test("makeCallContext initializes refs", async () => {
     const result = await Effect.runPromise(
@@ -29,16 +37,25 @@ describe("CallContext", () => {
           query: "q",
           context: "ctx",
           callScope: scope,
-          sandbox: makeStubSandbox()
+          sandbox: makeStubSandbox(),
+          staticSystemPromptArgs,
+          staticSystemPromptPrefix
         })
         const iteration = yield* readIteration(ctx)
         const transcript = yield* readTranscript(ctx)
-        return { iteration, transcriptLength: transcript.length }
+        return {
+          iteration,
+          transcriptLength: transcript.length,
+          staticPrefix: ctx.staticSystemPromptPrefix,
+          staticDepth: ctx.staticSystemPromptArgs.depth
+        }
       })
     )
 
     expect(result.iteration).toBe(0)
     expect(result.transcriptLength).toBe(0)
+    expect(result.staticPrefix).toBe(staticSystemPromptPrefix)
+    expect(result.staticDepth).toBe(0)
   })
 
   test("transcript operations append and attach output", async () => {
@@ -51,7 +68,9 @@ describe("CallContext", () => {
           query: "q",
           context: "ctx",
           callScope: scope,
-          sandbox: makeStubSandbox()
+          sandbox: makeStubSandbox(),
+          staticSystemPromptArgs,
+          staticSystemPromptPrefix
         })
 
         yield* appendTranscript(ctx, "first response")
@@ -76,7 +95,9 @@ describe("CallContext", () => {
           query: "q",
           context: "ctx",
           callScope: scope,
-          sandbox: makeStubSandbox()
+          sandbox: makeStubSandbox(),
+          staticSystemPromptArgs,
+          staticSystemPromptPrefix
         })
 
         const n1 = yield* incrementIteration(ctx)

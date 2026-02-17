@@ -33,6 +33,7 @@ export interface CliArgs {
   media?: ReadonlyArray<{ readonly name: string; readonly path: string }>
   mediaUrls?: ReadonlyArray<{ readonly name: string; readonly url: string }>
   enablePromptCaching?: boolean
+  noCache?: boolean
   quiet: boolean
   noColor: boolean
   nlpTools: boolean
@@ -183,6 +184,7 @@ export const makeCliConfig = (cliArgs: CliArgs): RlmConfigService => {
     eventBufferCapacity: 4096,
     maxExecutionOutputChars: 8_000,
     enablePromptCaching: cliArgs.enablePromptCaching ?? true,
+    ...(cliArgs.noCache === true ? { cache: { enabled: false } } : {}),
     llmRetryCount: 1,
     llmRetryBaseDelayMs: 100,
     llmRetryJitter: true,

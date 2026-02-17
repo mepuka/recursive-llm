@@ -1,4 +1,4 @@
-import { Brand, Data, Option, Scope } from "effect"
+import { Brand, Data, Deferred, Option, Scope } from "effect"
 import type { SandboxInstance } from "./Sandbox"
 import type { RlmError } from "./RlmError"
 import type { RlmToolAny } from "./RlmTool"
@@ -84,6 +84,10 @@ export type RlmCommand = Data.TaggedEnum<{
     readonly parentBridgeRequestId?: BridgeRequestId
     readonly tools?: ReadonlyArray<RlmToolAny>
     readonly outputJsonSchema?: object
+    readonly cacheBinding?: {
+      readonly key: string
+      readonly deferred: Deferred.Deferred<unknown, RlmError>
+    }
   }
   GenerateStep: { readonly callId: CallId }
   ExecuteCode: { readonly callId: CallId; readonly code: string }
@@ -144,6 +148,20 @@ export type RlmEvent = Data.TaggedEnum<{
     readonly callId: CallId
     readonly depth: number
     readonly method: string
+  }
+  CacheHit: {
+    readonly completionId: string
+    readonly callId: CallId
+    readonly depth: number
+    readonly kind: "subcall" | "model"
+    readonly cacheKey: string
+  }
+  CacheMiss: {
+    readonly completionId: string
+    readonly callId: CallId
+    readonly depth: number
+    readonly kind: "subcall" | "model"
+    readonly cacheKey: string
   }
   CallFailed: {
     readonly completionId: string

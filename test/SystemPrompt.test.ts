@@ -1,5 +1,12 @@
 import { describe, expect, test } from "bun:test"
-import { buildReplSystemPrompt, buildOneShotSystemPrompt, buildOneShotJsonSystemPrompt, buildExtractSystemPrompt } from "../src/SystemPrompt"
+import {
+  buildExtractSystemPrompt,
+  buildOneShotJsonSystemPrompt,
+  buildOneShotSystemPrompt,
+  buildReplSystemPrompt,
+  buildReplSystemPromptDynamic,
+  buildReplSystemPromptStatic
+} from "../src/SystemPrompt"
 
 describe("SystemPrompt", () => {
   const baseOptions = {
@@ -15,6 +22,23 @@ describe("SystemPrompt", () => {
     parameterNames: ["arg"],
     parametersJsonSchema: { type: "object" },
     returnsJsonSchema: { type: "object" }
+  })
+
+  test("buildReplSystemPrompt equals static + dynamic", () => {
+    const options = {
+      ...baseOptions,
+      tools: [makeTool("search")]
+    }
+    const { iteration, budget, ...staticOptions } = options
+
+    const combined = buildReplSystemPrompt(options)
+    const split = buildReplSystemPromptStatic(staticOptions) + "\n" + buildReplSystemPromptDynamic({
+      iteration,
+      budget,
+      maxIterations: options.maxIterations
+    })
+
+    expect(combined).toBe(split)
   })
 
   test("REPL prompt does not contain FINAL(...) instructions", () => {

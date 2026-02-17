@@ -99,6 +99,10 @@ const noPromptCaching = Options.boolean("no-prompt-caching").pipe(
   Options.withDescription("Disable Anthropic prompt caching breakpoints")
 )
 
+const noCache = Options.boolean("no-cache").pipe(
+  Options.withDescription("Disable sub-call caching and deduplication")
+)
+
 const quiet = Options.boolean("quiet").pipe(
   Options.withDescription("Only show final answer and errors")
 )
@@ -140,6 +144,7 @@ const commandConfig = {
   media,
   mediaUrl,
   noPromptCaching,
+  noCache,
   quiet,
   noColor,
   nlpTools,

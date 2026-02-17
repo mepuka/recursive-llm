@@ -103,7 +103,9 @@ const STRUCTURED_CONTEXT_FORMATS = new Set<ContextMetadata["format"]>([
   "tsv"
 ])
 
-export const buildReplSystemPrompt = (options: ReplSystemPromptOptions): string => {
+export const buildReplSystemPromptStatic = (
+  options: Omit<ReplSystemPromptOptions, "iteration" | "budget">
+): string => {
   const isStrict = options.sandboxMode === "strict"
   const canRecurse = !isStrict && options.depth < options.maxDepth
   const submitInvocationSchema = buildSubmitInvocationSchema(options.outputJsonSchema)
@@ -744,6 +746,13 @@ export const buildReplSystemPrompt = (options: ReplSystemPromptOptions): string 
     lines.push("")
   }
 
+  return lines.join("\n")
+}
+
+export const buildReplSystemPromptDynamic = (
+  options: Pick<ReplSystemPromptOptions, "iteration" | "budget"> & { maxIterations: number }
+): string => {
+  const lines: Array<string> = []
   lines.push("## Budget (current snapshot — call `budget()` in code for live values)")
   const phase = options.iteration <= 2 ? "EXPLORE/PLAN"
     : options.iteration <= Math.floor(options.maxIterations * 0.8) ? "EXECUTE"
@@ -757,12 +766,19 @@ export const buildReplSystemPrompt = (options: ReplSystemPromptOptions): string 
   if (options.budget.maxTimeMs !== undefined) {
     lines.push(`Elapsed time: ${options.budget.elapsedMs ?? 0}ms / ${options.budget.maxTimeMs}ms.`)
   }
-
   if (options.budget.iterationsRemaining <= 0) {
     lines.push("WARNING: This is your LAST iteration. If you have verified output, call SUBMIT() now.")
   }
-
   return lines.join("\n")
+}
+
+export const buildReplSystemPrompt = (options: ReplSystemPromptOptions): string => {
+  const { iteration, budget, ...staticOptions } = options
+  return buildReplSystemPromptStatic(staticOptions) + "\n" + buildReplSystemPromptDynamic({
+    iteration,
+    budget,
+    maxIterations: options.maxIterations
+  })
 }
 
 export const buildExtractSystemPrompt = (outputJsonSchema?: object, variableNames?: ReadonlyArray<string>): string => {

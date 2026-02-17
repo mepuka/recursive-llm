@@ -1,9 +1,9 @@
-# Effect-Native Caching Implementation Plan (Rev 12)
+# Effect-Native Caching Implementation Plan (Rev 13)
 
 Date: 2026-02-16
 Base spec: `docs/plans/2026-02-07-rlm-effect-caching-refactor-spec.md`
-Branch: `feat/effect-caching-implementation`
-Revision: 12 — addresses codex review findings from Rev 11
+Branch: `codex/effect-caching-implementation`
+Revision: 13 — readiness-gate update (branch naming, checkpoint baseline, test-path clarification)
 
 ## Review Findings Addressed
 
@@ -1165,11 +1165,12 @@ dispatch, so `reserveLlmCall` is never called for cached responses.
 
 At this point, pause and verify:
 
-1. All 124+ existing tests pass.
+1. All existing repository tests pass via `bun test` (baseline at plan update time: 470 passing on 2026-02-17).
 2. New cache tests pass (including concurrent dedup and deadlock tests).
-3. `bun run rlm` works end-to-end with both default (cache on) and `--no-cache`.
-4. Cache events render correctly in verbose output.
-5. Run codex review with full context prompt.
+3. `bun run typecheck` introduces no new errors in `src/**` or `test/**` versus baseline. Existing unrelated strict-null test errors under `effect-nlp/test/**` are unchanged.
+4. `bun run rlm` works end-to-end with both default (cache on) and `--no-cache`.
+5. Cache events render correctly in verbose output.
+6. Run codex review with full context prompt.
 
 ---
 
@@ -1210,7 +1211,7 @@ This step is deferred because:
 | `src/CliLayer.ts` | Consume `noCache` from normalized args |
 | `test/Scheduler.test.ts` | New cache tests: hit/miss, concurrent-dedup, no-deadlock, typed values, key discrimination, validation failure, over-capacity, timeout, budget accounting, fiber interruption |
 | `test/CallContext.test.ts` | Test precomputed field storage |
-| `test/scheduler/CacheKey.test.ts` | New: canonicalizeJson determinism, hashSchema collision avoidance |
+| `test/scheduler/CacheKey.test.ts` | New: canonicalizeJson determinism, hashSchema collision avoidance (create `test/scheduler/` directory if absent) |
 | `test/SystemPrompt.test.ts` | Prompt-split parity test (`buildReplSystemPrompt === static + dynamic`) |
 | `test/RlmRenderer.test.ts` | Render `CacheHit`/`CacheMiss` event formatting |
 | `test/CliCommand.test.ts` | `--no-cache` flag parsing |

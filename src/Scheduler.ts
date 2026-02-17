@@ -1,4 +1,4 @@
-import { Cause, Clock, Deferred, Duration, Effect, Exit, Match, Option, Queue, Ref, Schedule, Scope, Stream } from "effect"
+import { Cause, Clock, Deferred, Duration, Effect, Either, Exit, Match, Option, Queue, Ref, Schedule, Scope, Stream } from "effect"
 import { consumeIteration, snapshot } from "./Budget"
 import {
   appendTranscript,
@@ -32,7 +32,13 @@ import {
   buildExtractPrompt,
   truncateExecutionOutput
 } from "./RlmPrompt"
-import { buildReplSystemPrompt, buildOneShotSystemPrompt, buildOneShotJsonSystemPrompt, buildExtractSystemPrompt } from "./SystemPrompt"
+import {
+  buildReplSystemPromptDynamic,
+  buildReplSystemPromptStatic,
+  buildOneShotSystemPrompt,
+  buildOneShotJsonSystemPrompt,
+  buildExtractSystemPrompt
+} from "./SystemPrompt"
 import { parseAndValidateJson, validateJsonSchema } from "./JsonSchemaValidator"
 import {
   buildSubmitToolkit,
@@ -42,7 +48,7 @@ import {
   type SubmitPayload
 } from "./SubmitTool"
 import { SandboxConfig, SandboxFactory } from "./Sandbox"
-import { RlmRuntime } from "./Runtime"
+import { RlmRuntime, type SubcallCache } from "./Runtime"
 import {
   BridgeRequestId,
   CallId,
@@ -59,6 +65,7 @@ import { getCallStateOption, getCallStateOrWarn, deleteCallState, setCallState }
 import { BridgeStore } from "./scheduler/BridgeStore"
 import { publishEvent, publishSchedulerWarning } from "./scheduler/Events"
 import { enqueue } from "./scheduler/Queue"
+import { hashSchema, makeSubcallCacheKey } from "./scheduler/CacheKey"
 import { analyzeContext, type ContextMetadata } from "./ContextMetadata"
 
 import type { RlmToolAny } from "./RlmTool"
@@ -108,6 +115,7 @@ const runSchedulerInternal = Effect.fn("Scheduler.runInternal")(function*(option
 
   const resultDeferred = yield* Deferred.make<CompletionOutcome, RlmError>()
   const queueFailureHandled = yield* Ref.make(false)
+  const subcallCache = runtime.subcallCache
 
   const rememberPartialOutcome = (callId: CallId, partial: PartialResult) =>
     Ref.update(runtime.partialOutcomesRef, (current) =>
@@ -127,6 +135,30 @@ const runSchedulerInternal = Effect.fn("Scheduler.runInternal")(function*(option
 
   const failBridgeDeferred = (bridgeRequestId: BridgeRequestId, error: unknown) =>
     bridgeStore.fail(bridgeRequestId, error).pipe(Effect.asVoid)
+
+  const succeedCacheDeferred = (
+    deferred: Deferred.Deferred<unknown, RlmError>,
+    value: unknown
+  ) =>
+    Deferred.succeed(deferred, value).pipe(Effect.asVoid)
+
+  const failCacheDeferred = (
+    deferred: Deferred.Deferred<unknown, RlmError>,
+    error: RlmError
+  ) =>
+    Deferred.fail(deferred, error).pipe(Effect.asVoid)
+
+  const evictCacheKey = (
+    cache: SubcallCache,
+    key: string,
+    expectedDeferred: Deferred.Deferred<unknown, RlmError>
+  ) =>
+    Ref.update(cache.inflight, (current) => {
+      if (current.get(key) !== expectedDeferred) return current
+      const next = new Map(current)
+      next.delete(key)
+      return next
+    })
 
   const closeRemainingCallScopes = (exit: Exit.Exit<unknown, unknown>) =>
     Effect.gen(function*() {
@@ -403,6 +435,42 @@ const runSchedulerInternal = Effect.fn("Scheduler.runInternal")(function*(option
         }).pipe(Effect.provideService(Scope.Scope, callScope))
 
         const contextMetadata = deriveContextMetadata(command)
+        const toolDescriptors = command.tools?.map((tool) => ({
+          name: tool.name,
+          description: tool.description,
+          parameterNames: tool.parameterNames,
+          parametersJsonSchema: tool.parametersJsonSchema,
+          returnsJsonSchema: tool.returnsJsonSchema,
+          ...(tool.usageExamples !== undefined && tool.usageExamples.length > 0
+            ? { usageExamples: tool.usageExamples }
+            : {})
+        }))
+        const staticSystemPromptArgs = {
+          depth: command.depth,
+          maxIterations: config.maxIterations,
+          maxDepth: config.maxDepth,
+          ...(config.namedModels !== undefined
+            ? { namedModelNames: Object.keys(config.namedModels) }
+            : {}),
+          ...(command.mediaAttachments !== undefined && command.mediaAttachments.length > 0
+            ? { mediaNames: command.mediaAttachments.map((attachment) => attachment.name) }
+            : {}),
+          ...(toolDescriptors !== undefined && toolDescriptors.length > 0
+            ? { tools: toolDescriptors }
+            : {}),
+          ...(command.outputJsonSchema !== undefined
+            ? { outputJsonSchema: command.outputJsonSchema }
+            : {}),
+          ...(contextMetadata !== undefined
+            ? { contextMetadata }
+            : {}),
+          maxFrameBytes: sandboxConfig.maxFrameBytes,
+          sandboxMode: sandboxConfig.sandboxMode,
+          ...(config.subModelContextChars !== undefined
+            ? { subModelContextChars: config.subModelContextChars }
+            : {})
+        } as const
+        const staticSystemPromptPrefix = buildReplSystemPromptStatic(staticSystemPromptArgs)
 
         const state = yield* makeCallContext({
           callId: command.callId,
@@ -425,6 +493,11 @@ const runSchedulerInternal = Effect.fn("Scheduler.runInternal")(function*(option
             : {}),
           ...(command.outputJsonSchema !== undefined
             ? { outputJsonSchema: command.outputJsonSchema }
+            : {}),
+          staticSystemPromptArgs,
+          staticSystemPromptPrefix,
+          ...(command.cacheBinding !== undefined
+            ? { cacheBinding: command.cacheBinding }
             : {})
         })
 
@@ -493,16 +566,21 @@ const runSchedulerInternal = Effect.fn("Scheduler.runInternal")(function*(option
         Effect.catchTag("SchedulerQueueError", (error) => Effect.fail(error)),
         Effect.catchAll((error) =>
           Effect.gen(function*() {
+            const rlmError = new UnknownRlmError({ message: "StartCall failed", cause: error })
             // Close scope directly — CallState was never stored so handleFailCall can't.
             // Use Effect.exit to prevent finalizer failures from masking the original error.
-            yield* Effect.exit(Scope.close(callScope, Exit.fail(error)))
+            yield* Effect.exit(Scope.close(callScope, Exit.fail(rlmError)))
 
             if (command.parentBridgeRequestId) {
-              yield* failBridgeDeferred(command.parentBridgeRequestId, error)
+              yield* failBridgeDeferred(command.parentBridgeRequestId, rlmError)
+            }
+            if (command.cacheBinding !== undefined && subcallCache !== null) {
+              yield* evictCacheKey(subcallCache, command.cacheBinding.key, command.cacheBinding.deferred)
+              yield* failCacheDeferred(command.cacheBinding.deferred, rlmError)
             }
             yield* enqueue(RlmCommand.FailCall({
               callId: command.callId,
-              error: new UnknownRlmError({ message: "StartCall failed", cause: error })
+              error: rlmError
             }))
           })
         )
@@ -554,57 +632,26 @@ const runSchedulerInternal = Effect.fn("Scheduler.runInternal")(function*(option
         budget
       }))
 
-      const toolDescriptors = callState.tools?.map((t) => ({
-        name: t.name,
-        description: t.description,
-        parameterNames: t.parameterNames,
-        parametersJsonSchema: t.parametersJsonSchema,
-        returnsJsonSchema: t.returnsJsonSchema,
-        ...(t.usageExamples !== undefined && t.usageExamples.length > 0
-          ? { usageExamples: t.usageExamples }
-          : {})
-      }))
+      const dynamicSystemPromptSuffix = buildReplSystemPromptDynamic({
+        iteration: iteration + 1,
+        budget: {
+          iterationsRemaining: config.maxIterations - (iteration + 1),
+          llmCallsRemaining: budget.llmCallsRemaining,
+          ...(Option.isSome(budget.tokenBudgetRemaining)
+            ? { tokenBudgetRemaining: budget.tokenBudgetRemaining.value }
+            : {}),
+          totalTokensUsed: budget.totalTokensUsed,
+          elapsedMs: Date.now() - runtime.completionStartedAtMs,
+          ...(config.maxTimeMs !== undefined ? { maxTimeMs: config.maxTimeMs } : {})
+        },
+        maxIterations: config.maxIterations
+      })
 
       const prompt = buildReplPrompt({
-        systemPrompt: buildReplSystemPrompt({
-          depth: callState.depth,
-          iteration: iteration + 1,
-          maxIterations: config.maxIterations,
-          maxDepth: config.maxDepth,
-          budget: {
-            iterationsRemaining: config.maxIterations - (iteration + 1),
-            llmCallsRemaining: budget.llmCallsRemaining,
-            ...(Option.isSome(budget.tokenBudgetRemaining)
-              ? { tokenBudgetRemaining: budget.tokenBudgetRemaining.value }
-              : {}),
-            totalTokensUsed: budget.totalTokensUsed,
-            elapsedMs: Date.now() - runtime.completionStartedAtMs,
-            ...(config.maxTimeMs !== undefined ? { maxTimeMs: config.maxTimeMs } : {})
-          },
-          ...(config.namedModels !== undefined
-            ? { namedModelNames: Object.keys(config.namedModels) }
-            : {}),
-          ...(callState.mediaAttachments !== undefined
-            ? { mediaNames: callState.mediaAttachments.map((attachment) => attachment.name) }
-            : {}),
-          ...(toolDescriptors !== undefined && toolDescriptors.length > 0
-            ? { tools: toolDescriptors }
-            : {}),
-          ...(callState.outputJsonSchema !== undefined
-            ? { outputJsonSchema: callState.outputJsonSchema }
-            : {}),
-          ...(callState.contextMetadata !== undefined
-            ? { contextMetadata: callState.contextMetadata }
-            : {}),
-          maxFrameBytes: sandboxConfig.maxFrameBytes,
-          sandboxMode: sandboxConfig.sandboxMode,
-          ...(config.subModelContextChars !== undefined
-            ? { subModelContextChars: config.subModelContextChars }
-            : {})
-        }),
+        systemPrompt: callState.staticSystemPromptPrefix + "\n" + dynamicSystemPromptSuffix,
         query: callState.query,
-        ...(callState.contextMetadata !== undefined || callState.context.length > 0
-          ? { contextMetadata: callState.contextMetadata ?? analyzeContext(callState.context) }
+        ...(callState.contextMetadata !== undefined
+          ? { contextMetadata: callState.contextMetadata }
           : {}),
         transcript,
         enablePromptCaching: config.enablePromptCaching
@@ -1250,6 +1297,131 @@ const runSchedulerInternal = Effect.fn("Scheduler.runInternal")(function*(option
         responseFormat = { type: "json", schema: (rf as { schema: object }).schema }
       }
 
+      type SubcallCacheLookupResult =
+        | { readonly _tag: "hit"; readonly deferred: Deferred.Deferred<unknown, RlmError> }
+        | { readonly _tag: "miss"; readonly deferred: Deferred.Deferred<unknown, RlmError> }
+        | { readonly _tag: "over-capacity" }
+
+      let cacheKey: string | undefined
+      let cacheResult: SubcallCacheLookupResult | undefined
+
+      if (subcallCache !== null) {
+        const modelRoute = namedModel !== undefined
+          ? `named:${namedModel}`
+          : (callState.depth + 1 >= config.maxDepth ? "route:oneshot" : "route:recursive")
+        const responseFormatHash = responseFormat === undefined
+          ? undefined
+          : Option.getOrUndefined(yield* Effect.try({
+              try: () => hashSchema(responseFormat.schema),
+              catch: () => new SandboxError({ message: "Failed to hash responseFormat schema for cache key" })
+            }).pipe(Effect.option))
+        if (responseFormat === undefined || responseFormatHash !== undefined) {
+          cacheKey = makeSubcallCacheKey({
+            completionId: runtime.completionId,
+            parentCallId: command.callId,
+            method: "llm_query",
+            query: llmQueryArg,
+            context: llmContextArg ?? "",
+            depth: callState.depth + 1,
+            modelRoute,
+            ...(responseFormatHash !== undefined ? { responseFormatHash } : {})
+          })
+        }
+
+        const cacheKeyForLookup = cacheKey
+        if (cacheKeyForLookup !== undefined) {
+          const freshDeferred = yield* Deferred.make<unknown, RlmError>()
+          const lookupResult = yield* Ref.modify<
+            Map<string, Deferred.Deferred<unknown, RlmError>>,
+            SubcallCacheLookupResult
+          >(subcallCache.inflight, (current): readonly [SubcallCacheLookupResult, Map<string, Deferred.Deferred<unknown, RlmError>>] => {
+            const existing = current.get(cacheKeyForLookup)
+            if (existing !== undefined) {
+              const result: SubcallCacheLookupResult = { _tag: "hit", deferred: existing }
+              return [result, current] as const
+            }
+            if (current.size >= subcallCache.capacity) {
+              const result: SubcallCacheLookupResult = { _tag: "over-capacity" }
+              return [result, current] as const
+            }
+            const next = new Map(current)
+            next.set(cacheKeyForLookup, freshDeferred)
+            const result: SubcallCacheLookupResult = { _tag: "miss", deferred: freshDeferred }
+            return [result, next] as const
+          })
+          cacheResult = lookupResult
+
+          if (lookupResult._tag === "hit") {
+            const hitDeferred = lookupResult.deferred
+            const hitKey = cacheKeyForLookup
+            yield* publishEvent(RlmEvent.CacheHit({
+              completionId: runtime.completionId,
+              callId: command.callId,
+              depth: callState.depth,
+              kind: "subcall",
+              cacheKey: hitKey
+            }))
+
+            yield* Effect.forkIn(
+              Effect.gen(function*() {
+                const cachedResult = yield* Deferred.await(hitDeferred).pipe(
+                  Effect.timeoutFail({
+                    duration: Duration.millis(subcallCache.timeoutMs),
+                    onTimeout: () => new SandboxError({
+                      message: `Sub-call cache await timed out after ${subcallCache.timeoutMs}ms`
+                    })
+                  }),
+                  Effect.tapError(() =>
+                    Effect.gen(function*() {
+                      const isDone = yield* Deferred.isDone(hitDeferred)
+                      if (!isDone) {
+                        yield* evictCacheKey(subcallCache, hitKey, hitDeferred)
+                      }
+                    })
+                  )
+                )
+                yield* resolveBridgeDeferred(command.bridgeRequestId, cachedResult)
+              }).pipe(
+                Effect.catchAllCause((cause) =>
+                  Effect.gen(function*() {
+                    const error = Cause.failureOrCause(cause).pipe(
+                      Either.match({
+                        onLeft: (failure) => failure,
+                        onRight: (defect) =>
+                          new SandboxError({ message: `Cache-hit fiber defect: ${Cause.pretty(defect)}` })
+                      })
+                    )
+                    yield* failBridgeDeferred(command.bridgeRequestId, error)
+                  })
+                ),
+                Effect.onInterrupt(() =>
+                  failBridgeDeferred(
+                    command.bridgeRequestId,
+                    new SandboxError({ message: "Cache-hit fiber interrupted (scope closed)" })
+                  )
+                )
+              ),
+              callState.callScope
+            )
+            return
+          }
+
+          if (lookupResult._tag === "miss") {
+            yield* publishEvent(RlmEvent.CacheMiss({
+              completionId: runtime.completionId,
+              callId: command.callId,
+              depth: callState.depth,
+              kind: "subcall",
+              cacheKey: cacheKeyForLookup
+            }))
+          }
+        }
+      }
+
+      const missBinding = cacheResult?._tag === "miss" && cacheKey !== undefined
+        ? { key: cacheKey, deferred: cacheResult.deferred }
+        : undefined
+
       if (callState.depth + 1 >= config.maxDepth || namedModel !== undefined) {
         // At max depth: one-shot model call (no REPL protocol) with budget reservation
         yield* Effect.forkIn(
@@ -1261,14 +1433,23 @@ const runSchedulerInternal = Effect.fn("Scheduler.runInternal")(function*(option
               ...(namedModel !== undefined ? { namedModel } : {}),
               ...(responseFormat !== undefined ? { responseFormat } : {})
             })
+            if (missBinding !== undefined) {
+              yield* succeedCacheDeferred(missBinding.deferred, oneShotResult)
+            }
             yield* resolveBridgeDeferred(command.bridgeRequestId, oneShotResult)
           }).pipe(
-            Effect.catchAllCause((cause) => {
-              const message = Cause.isFailType(cause)
-                ? ("message" in cause.error ? (cause.error as { message: string }).message : String(cause.error))
-                : Cause.pretty(cause)
-              return failBridgeDeferred(command.bridgeRequestId, message)
-            })
+            Effect.catchAllCause((cause) =>
+              Effect.gen(function*() {
+                const error: RlmError = Cause.isFailType(cause)
+                  ? (cause.error as RlmError)
+                  : new SandboxError({ message: Cause.pretty(cause) })
+                if (missBinding !== undefined && subcallCache !== null) {
+                  yield* evictCacheKey(subcallCache, missBinding.key, missBinding.deferred)
+                  yield* failCacheDeferred(missBinding.deferred, error)
+                }
+                yield* failBridgeDeferred(command.bridgeRequestId, error)
+              })
+            )
           ),
           callState.callScope
         )
@@ -1281,7 +1462,8 @@ const runSchedulerInternal = Effect.fn("Scheduler.runInternal")(function*(option
           query: llmQueryArg,
           context: llmContextArg ?? "",
           parentBridgeRequestId: command.bridgeRequestId,
-          ...(responseFormat !== undefined ? { outputJsonSchema: responseFormat.schema } : {})
+          ...(responseFormat !== undefined ? { outputJsonSchema: responseFormat.schema } : {}),
+          ...(missBinding !== undefined ? { cacheBinding: missBinding } : {})
         }))
       }
     })
@@ -1312,12 +1494,15 @@ const runSchedulerInternal = Effect.fn("Scheduler.runInternal")(function*(option
         )
       }
 
-      yield* Scope.close(callState.callScope, Exit.void)
+      yield* Effect.exit(Scope.close(callState.callScope, Exit.void))
       yield* deleteCallState(command.callId)
 
       if (callState.parentBridgeRequestId) {
         // Sub-call completing → resolve bridge deferred
         if (command.payload.source === "answer") {
+          if (callState.cacheBinding !== undefined) {
+            yield* succeedCacheDeferred(callState.cacheBinding.deferred, command.payload.answer)
+          }
           yield* resolveBridgeDeferred(callState.parentBridgeRequestId, command.payload.answer)
           return
         }
@@ -1326,26 +1511,43 @@ const runSchedulerInternal = Effect.fn("Scheduler.runInternal")(function*(option
           if (callState.outputJsonSchema !== undefined) {
             const validationResult = validateJsonSchema(command.payload.value, callState.outputJsonSchema)
             if (!validationResult.valid) {
+              const error = new OutputValidationError({
+                message: `Sub-call structured output schema validation failed: ${validationResult.errors.join("; ")}`,
+                raw: renderedAnswer
+              })
+              if (callState.cacheBinding !== undefined) {
+                if (subcallCache !== null) {
+                  yield* evictCacheKey(subcallCache, callState.cacheBinding.key, callState.cacheBinding.deferred)
+                }
+                yield* failCacheDeferred(callState.cacheBinding.deferred, error)
+              }
               yield* failBridgeDeferred(
                 callState.parentBridgeRequestId,
-                new OutputValidationError({
-                  message: `Sub-call structured output schema validation failed: ${validationResult.errors.join("; ")}`,
-                  raw: renderedAnswer
-                })
+                error
               )
               return
             }
+          }
+          if (callState.cacheBinding !== undefined) {
+            yield* succeedCacheDeferred(callState.cacheBinding.deferred, command.payload.value)
           }
           yield* resolveBridgeDeferred(callState.parentBridgeRequestId, command.payload.value)
           return
         }
 
+        const error = new OutputValidationError({
+          message: "Sub-call finalization must use `SUBMIT({ answer: ... })`.",
+          raw: renderedAnswer
+        })
+        if (callState.cacheBinding !== undefined) {
+          if (subcallCache !== null) {
+            yield* evictCacheKey(subcallCache, callState.cacheBinding.key, callState.cacheBinding.deferred)
+          }
+          yield* failCacheDeferred(callState.cacheBinding.deferred, error)
+        }
         yield* failBridgeDeferred(
           callState.parentBridgeRequestId,
-          new OutputValidationError({
-            message: "Sub-call finalization must use `SUBMIT({ answer: ... })`.",
-            raw: renderedAnswer
-          })
+          error
         )
       } else if (command.callId === rootCallId) {
         // Fail all outstanding bridge deferreds before queue shutdown
@@ -1377,11 +1579,17 @@ const runSchedulerInternal = Effect.fn("Scheduler.runInternal")(function*(option
       }))
 
       if (callState) {
-        yield* Scope.close(callState.callScope, Exit.fail(command.error))
+        yield* Effect.exit(Scope.close(callState.callScope, Exit.fail(command.error)))
       }
       yield* deleteCallState(command.callId)
 
       if (callState?.parentBridgeRequestId) {
+        if (callState.cacheBinding !== undefined) {
+          if (subcallCache !== null) {
+            yield* evictCacheKey(subcallCache, callState.cacheBinding.key, callState.cacheBinding.deferred)
+          }
+          yield* failCacheDeferred(callState.cacheBinding.deferred, command.error)
+        }
         yield* failBridgeDeferred(callState.parentBridgeRequestId, command.error)
       } else if (command.callId === rootCallId) {
         // Fail all outstanding bridge deferreds before queue shutdown

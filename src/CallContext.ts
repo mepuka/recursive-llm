@@ -1,9 +1,11 @@
-import { Effect, Ref, Scope } from "effect"
+import { Deferred, Effect, Ref, Scope } from "effect"
 import type { SandboxInstance, VariableMetadata } from "./Sandbox"
 import type { BridgeRequestId, CallId, MediaAttachment } from "./RlmTypes"
 import { TranscriptEntry } from "./RlmTypes"
 import type { RlmToolAny } from "./RlmTool"
 import type { ContextMetadata } from "./ContextMetadata"
+import type { ReplSystemPromptOptions } from "./SystemPrompt"
+import type { RlmError } from "./RlmError"
 
 export interface VariableSnapshot {
   readonly variables: ReadonlyArray<VariableMetadata>
@@ -23,6 +25,12 @@ export interface CallContext {
   readonly parentBridgeRequestId?: BridgeRequestId
   readonly tools?: ReadonlyArray<RlmToolAny>
   readonly outputJsonSchema?: object
+  readonly staticSystemPromptArgs: Omit<ReplSystemPromptOptions, "iteration" | "budget">
+  readonly staticSystemPromptPrefix: string
+  readonly cacheBinding?: {
+    readonly key: string
+    readonly deferred: Deferred.Deferred<unknown, RlmError>
+  }
 
   readonly iteration: Ref.Ref<number>
   readonly transcript: Ref.Ref<ReadonlyArray<TranscriptEntry>>
@@ -43,6 +51,12 @@ export interface MakeCallContextOptions {
   readonly parentBridgeRequestId?: BridgeRequestId
   readonly tools?: ReadonlyArray<RlmToolAny>
   readonly outputJsonSchema?: object
+  readonly staticSystemPromptArgs: Omit<ReplSystemPromptOptions, "iteration" | "budget">
+  readonly staticSystemPromptPrefix: string
+  readonly cacheBinding?: {
+    readonly key: string
+    readonly deferred: Deferred.Deferred<unknown, RlmError>
+  }
 }
 
 export const makeCallContext = (options: MakeCallContextOptions): Effect.Effect<CallContext> =>
