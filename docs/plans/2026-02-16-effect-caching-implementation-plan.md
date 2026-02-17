@@ -1,9 +1,9 @@
-# Effect-Native Caching Implementation Plan (Rev 4)
+# Effect-Native Caching Implementation Plan (Rev 5)
 
 Date: 2026-02-16
 Base spec: `docs/plans/2026-02-07-rlm-effect-caching-refactor-spec.md`
 Branch: `feat/effect-caching-implementation`
-Revision: 4 — addresses codex review findings from Rev 3
+Revision: 5 — addresses codex review findings from Rev 4
 
 ## Review Findings Addressed
 
@@ -41,6 +41,17 @@ Revision: 4 — addresses codex review findings from Rev 3
 | 4 | MEDIUM | `canonicalizeJson` undefined handling incorrect (`Object.keys` includes undefined keys) | Filter out `undefined` values explicitly to match `JSON.stringify` semantics |
 | 5 | LOW | Missing test cases for StartCall-pre-state failure and timeout eviction | Added to test plan |
 
+### Rev 4 → Rev 5
+
+| # | Severity | Finding | Resolution |
+|---|----------|---------|------------|
+| 1 | HIGH | ABA race: timeout eviction + key-based write-back can resolve wrong deferred | Bind write-back to captured deferred identity; `evictCacheKey` checks `map.get(key) === expectedDeferred` before evicting |
+| 2 | HIGH | `modelRoute` namespace collision with named model names (`"recursive"`, `"oneshot"`) | Namespace discriminators: `route:recursive`, `route:oneshot`, `named:<name>` |
+| 3 | HIGH | StartCall error handler snippet regresses cleanup safety (`Scope.close` without `Effect.exit`) | Use existing defensive `Effect.exit(Scope.close(callScope, Exit.fail(error)))` pattern |
+| 4 | MEDIUM | CLI wiring inconsistent: `cache: { enabled }` vs `cliArgs.noCache`, wrong function name | Unified pipeline: `noCache` on `CliArgs` → `makeCliConfig` maps to config |
+| 5 | MEDIUM | Timeout default contradictory: Step 3 says 300s, Step 5c says 30s | Removed all 30s references; consistently derived from `bridgeTimeoutMs` |
+| 6 | MEDIUM | Prompt split omits compatibility guidance for `buildReplSystemPrompt` | Keep as compatibility wrapper; migrate scheduler first |
+
 ---
 
 ## Overview
@@ -70,6 +81,7 @@ Add fields to the `CallContext` interface:
 readonly staticSystemPromptArgs: Omit<ReplSystemPromptOptions, "iteration" | "budget">
 readonly staticSystemPromptPrefix: string
 readonly cacheKey?: string  // set for recursive sub-calls with caching enabled
+readonly cacheDeferred?: Deferred.Deferred<unknown, RlmError>  // the originating deferred for this key
 ```
 
 **Dropped from Rev 1:**
@@ -81,8 +93,8 @@ readonly cacheKey?: string  // set for recursive sub-calls with caching enabled
 **Changes to `makeCallContext`:**
 
 Add `staticSystemPromptArgs`, `staticSystemPromptPrefix`, and optional
-`cacheKey` to `MakeCallContextOptions` and propagate into the returned
-`CallContext`.
+`cacheKey`/`cacheDeferred` to `MakeCallContextOptions` and propagate into the
+returned `CallContext`.
 
 **Tests:** Unit test `makeCallContext` to verify the new fields are stored and
 accessible.
@@ -159,7 +171,8 @@ change.
 dependent logic is localized near `src/SystemPrompt.ts:747`. The split is
 clean.
 
-**Solution:** Split `buildReplSystemPrompt` into two functions:
+**Solution:** Split `buildReplSystemPrompt` into two functions, keeping the
+original as a compatibility wrapper:
 
 ```ts
 // Returns the static prefix (everything that doesn't depend on iteration/budget)
@@ -171,7 +184,23 @@ export const buildReplSystemPromptStatic = (
 export const buildReplSystemPromptDynamic = (
   options: Pick<ReplSystemPromptOptions, "iteration" | "budget"> & { maxIterations: number }
 ): string => { ... }
+
+// Compatibility wrapper — existing tests and non-scheduler callers continue using this
+export const buildReplSystemPrompt = (options: ReplSystemPromptOptions): string => {
+  const { iteration, budget, ...staticOpts } = options
+  return buildReplSystemPromptStatic(staticOpts) + "\n" + buildReplSystemPromptDynamic({
+    iteration,
+    budget,
+    maxIterations: options.maxIterations
+  })
+}
 ```
+
+**Why keep the wrapper (Rev 4 Finding #6):** Existing tests (`SystemPrompt.test.ts`,
+`SystemPrompt.prop.test.ts`) and the `Scheduler.ts` import all reference
+`buildReplSystemPrompt`. The wrapper preserves backward compatibility and avoids
+unnecessary test churn. Only the scheduler's `handleGenerateStep` is migrated to
+use the split functions directly.
 
 In `handleStartCall`, precompute and store the static prefix:
 
@@ -259,16 +288,19 @@ const noCache = Options.boolean("no-cache").pipe(
 Add `noCache` to `commandConfig`.
 
 **Flag mapping** (`src/cli/Normalize.ts`):
+
+Add `noCache` to `ParsedCliConfig` and propagate into the `CliArgs` return type:
 ```ts
-// In normalizeCliArgs:
+// In ParsedCliConfig:
 readonly noCache: boolean
-// Maps to:
-cache: { enabled: !parsed.noCache }
+
+// In normalizeCliArgs return (CliArgs):
+noCache: parsed.noCache
 ```
 
-**Downstream consumption** (`src/CliLayer.ts`):
+**Downstream consumption** (`src/CliLayer.ts` — `makeCliConfig`):
 ```ts
-// In buildRlmConfig:
+// In makeCliConfig:
 ...(cliArgs.noCache ? { cache: { enabled: false } } : {})
 ```
 
@@ -391,7 +423,7 @@ export interface SubcallCacheKeyParts {
   readonly query: string
   readonly context: string
   readonly depth: number
-  readonly modelRoute: string   // "primary" | "sub" | named model name
+  readonly modelRoute: string   // "route:oneshot" | "route:recursive" | "named:<name>"
   readonly responseFormatHash?: string  // hash of schema object, if present
 }
 
@@ -443,8 +475,9 @@ export const hashSchema = (schema: object): string => {
   all nesting levels, preventing collisions from nested schema differences.
 - Added `responseFormatHash` to key parts — same `(query, context)` with
   different schemas now produce different cache keys.
-- `modelRoute` already covers model overrides (named models, sub-model
-  routing).
+- `modelRoute` uses namespaced discriminators (`route:oneshot`, `route:recursive`,
+  `named:<name>`) to prevent collisions between routing literals and named
+  model names (Rev 4 Finding #2).
 - `parentCallId` provides frame-scoping (sibling branches are distinct).
 
 **Key policy note (Rev 2 Finding #7):** The base spec
@@ -467,8 +500,11 @@ the depth check and sub-call dispatch:
 // --- Cache check for llm_query sub-calls ---
 let cacheKey: string | undefined
 if (subcallCache !== null && command.method === "llm_query") {
-  const modelRoute = namedModel
-    ?? (callState.depth + 1 >= config.maxDepth ? "oneshot" : "recursive")
+  // CRITICAL (Rev 4 Finding #2): Namespace route discriminators to prevent
+  // collision with named model names like "recursive" or "oneshot".
+  const modelRoute = namedModel !== undefined
+    ? `named:${namedModel}`
+    : (callState.depth + 1 >= config.maxDepth ? "route:oneshot" : "route:recursive")
   cacheKey = makeSubcallCacheKey({
     completionId: runtime.completionId,
     parentCallId: command.callId,
@@ -527,9 +563,11 @@ if (subcallCache !== null && command.method === "llm_query") {
             // CRITICAL (Rev 3 Finding #3): On timeout, evict the stale entry
             // if the deferred is still pending. This prevents a stuck/dropped
             // sub-call from poisoning the key for the rest of the completion.
+            // Identity check (Rev 4 Finding #1) ensures we don't evict a
+            // freshly-inserted entry belonging to a different caller.
             const isDone = yield* Deferred.isDone(cacheResult.deferred)
             if (!isDone) {
-              yield* evictCacheKey(subcallCache, cacheKey)
+              yield* evictCacheKey(subcallCache, cacheKey, cacheResult.deferred)
             }
             yield* failBridgeDeferred(command.bridgeRequestId, error)
           })
@@ -564,9 +602,9 @@ if (subcallCache !== null && command.method === "llm_query") {
   an awaiting hit blocks the scheduler from processing the `StartCall` that
   would resolve the deferred.
 - **Timeout (Finding #5):** `Effect.timeoutFail` wraps `Deferred.await` with
-  a configurable timeout (default 30s). If a deferred is never resolved (e.g.,
-  a sub-call silently drops), the waiter fails with a clear error instead of
-  hanging forever.
+  a timeout derived from `bridgeTimeoutMs` (default 300s). If a deferred is
+  never resolved (e.g., a sub-call silently drops), the waiter fails with a
+  clear error instead of hanging forever.
 - **Atomic Ref.modify (Finding #4):** The check-and-insert is done in a single
   `Ref.modify` call. The `Deferred` is created before `Ref.modify`, and either
   inserted (miss) or discarded (hit/over-capacity). This eliminates the TOCTOU
@@ -583,6 +621,8 @@ propagate to `makeCallContext` so it's available on `callState.cacheKey` in
 
 ```ts
 // In the recursive dispatch path:
+// Thread both cacheKey and cacheDeferred so handleFinalize can resolve
+// the originating deferred directly (prevents ABA race — Rev 4 Finding #1)
 yield* enqueue(RlmCommand.StartCall({
   callId: subCallId,
   depth: callState.depth + 1,
@@ -590,7 +630,9 @@ yield* enqueue(RlmCommand.StartCall({
   context: llmContextArg ?? "",
   parentBridgeRequestId: command.bridgeRequestId,
   ...(responseFormat !== undefined ? { outputJsonSchema: responseFormat.schema } : {}),
-  ...(cacheKey !== undefined ? { cacheKey } : {})
+  ...(cacheKey !== undefined && cacheResult._tag === "miss"
+    ? { cacheKey, cacheDeferred: cacheResult.deferred }
+    : {})
 }))
 ```
 
@@ -608,9 +650,9 @@ yield* Effect.forkIn(
       ...(namedModel !== undefined ? { namedModel } : {}),
       ...(responseFormat !== undefined ? { responseFormat } : {})
     })
-    // Cache write-back: resolve deferred with the typed result
-    if (subcallCache !== null && cacheKey !== undefined) {
-      yield* succeedCacheDeferred(subcallCache, cacheKey, oneShotResult)
+    // Cache write-back: resolve the captured deferred directly (not by key)
+    if (cacheResult?._tag === "miss") {
+      yield* succeedCacheDeferred(cacheResult.deferred, oneShotResult)
     }
     yield* resolveBridgeDeferred(command.bridgeRequestId, oneShotResult)
   }).pipe(
@@ -620,8 +662,8 @@ yield* Effect.forkIn(
         ? (cause.error as RlmError)
         : new SandboxError({ message: Cause.pretty(cause) })
       return Effect.gen(function*() {
-        if (subcallCache !== null && cacheKey !== undefined) {
-          yield* failCacheDeferred(subcallCache, cacheKey, error)
+        if (cacheResult?._tag === "miss") {
+          yield* failCacheDeferred(cacheResult.deferred, error)
         }
         const message = "message" in error ? error.message : String(error)
         yield* failBridgeDeferred(command.bridgeRequestId, message)
@@ -639,46 +681,48 @@ this typed value as `unknown`, and cache hit callers receive it unchanged.
 
 **Helper functions** (defined once in `Scheduler.ts`):
 
-```ts
-const succeedCacheDeferred = (
-  cache: SubcallCache,
-  key: string,
-  value: unknown
-) =>
-  Effect.gen(function*() {
-    const m = yield* Ref.get(cache.inflight)
-    const deferred = m.get(key)
-    if (deferred !== undefined) {
-      yield* Deferred.succeed(deferred, value)
-    }
-  })
+**CRITICAL (Rev 4 Finding #1):** Helpers resolve/fail the captured deferred
+directly, never looking up by key. This prevents ABA races where a key is
+evicted, reinserted with a new deferred by a retry, and the old producer
+resolves the *new* deferred with stale data.
 
-const failCacheDeferred = (
-  cache: SubcallCache,
-  key: string,
-  error: RlmError
-) =>
-  Effect.gen(function*() {
-    const m = yield* Ref.get(cache.inflight)
-    const deferred = m.get(key)
-    if (deferred !== undefined) {
-      yield* Deferred.fail(deferred, error)
-    }
-  })
+```ts
+/**
+ * Resolve a cache deferred with a successful result.
+ * Takes the deferred directly — never looks up by key.
+ */
+const succeedCacheDeferred = (
+  deferred: Deferred.Deferred<unknown, RlmError>,
+  value: unknown
+) => Deferred.succeed(deferred, value)
 
 /**
- * Evict a cache key from the inflight map.
- * Used on timeout (when deferred is still pending) and on StartCall
- * pre-state failure to prevent poisoned keys.
+ * Fail a cache deferred with an error.
+ * Takes the deferred directly — never looks up by key.
+ */
+const failCacheDeferred = (
+  deferred: Deferred.Deferred<unknown, RlmError>,
+  error: RlmError
+) => Deferred.fail(deferred, error)
+
+/**
+ * Conditionally evict a cache key from the inflight map.
+ * Only evicts if the current entry for the key is the expected deferred
+ * (identity check). This prevents evicting a freshly-inserted entry
+ * belonging to a different caller after an ABA sequence.
  */
 const evictCacheKey = (
   cache: SubcallCache,
-  key: string
+  key: string,
+  expectedDeferred: Deferred.Deferred<unknown, RlmError>
 ) =>
   Ref.update(cache.inflight, (m) => {
-    const next = new Map(m)
-    next.delete(key)
-    return next
+    if (m.get(key) === expectedDeferred) {
+      const next = new Map(m)
+      next.delete(key)
+      return next
+    }
+    return m  // different deferred for this key — leave it alone
   })
 ```
 
@@ -692,9 +736,9 @@ also receive the error.
 ```ts
 if (callState.parentBridgeRequestId) {
   if (command.payload.source === "answer") {
-    // Plain text answer — cache and resolve
-    if (subcallCache !== null && callState.cacheKey !== undefined) {
-      yield* succeedCacheDeferred(subcallCache, callState.cacheKey, command.payload.answer)
+    // Plain text answer — resolve captured deferred directly
+    if (callState.cacheDeferred !== undefined) {
+      yield* succeedCacheDeferred(callState.cacheDeferred, command.payload.answer)
     }
     yield* resolveBridgeDeferred(callState.parentBridgeRequestId, command.payload.answer)
     return
@@ -709,17 +753,17 @@ if (callState.parentBridgeRequestId) {
           message: `Sub-call structured output schema validation failed: ${validationResult.errors.join("; ")}`,
           raw: renderSubmitAnswer(command.payload)
         })
-        // Fail cache deferred so waiters also get the validation error
-        if (subcallCache !== null && callState.cacheKey !== undefined) {
-          yield* failCacheDeferred(subcallCache, callState.cacheKey, error)
+        // Fail captured deferred so waiters also get the validation error
+        if (callState.cacheDeferred !== undefined) {
+          yield* failCacheDeferred(callState.cacheDeferred, error)
         }
         yield* failBridgeDeferred(callState.parentBridgeRequestId, error)
         return
       }
     }
-    // Validation passed (or no schema) — cache the validated value
-    if (subcallCache !== null && callState.cacheKey !== undefined) {
-      yield* succeedCacheDeferred(subcallCache, callState.cacheKey, command.payload.value)
+    // Validation passed (or no schema) — resolve captured deferred
+    if (callState.cacheDeferred !== undefined) {
+      yield* succeedCacheDeferred(callState.cacheDeferred, command.payload.value)
     }
     yield* resolveBridgeDeferred(callState.parentBridgeRequestId, command.payload.value)
     return
@@ -730,8 +774,8 @@ if (callState.parentBridgeRequestId) {
     message: "Sub-call finalization must use `SUBMIT({ answer: ... })`.",
     raw: renderSubmitAnswer(command.payload)
   })
-  if (subcallCache !== null && callState.cacheKey !== undefined) {
-    yield* failCacheDeferred(subcallCache, callState.cacheKey, error)
+  if (callState.cacheDeferred !== undefined) {
+    yield* failCacheDeferred(callState.cacheDeferred, error)
   }
   yield* failBridgeDeferred(callState.parentBridgeRequestId, error)
 }
@@ -752,16 +796,20 @@ cache deferred:
 
 ```ts
 // In handleStartCall error handler (Scheduler.ts:494-508):
+// CRITICAL (Rev 4 Finding #3): Use Effect.exit(Scope.close(...)) to prevent
+// finalizer failures from aborting the handler and skipping deferred cleanup.
 Effect.gen(function*() {
-  yield* Scope.close(callScope, Exit.void)
+  yield* Effect.exit(Scope.close(callScope, Exit.fail(error)))
   if (command.parentBridgeRequestId) {
     yield* failBridgeDeferred(command.parentBridgeRequestId, error)
   }
   // CRITICAL (Rev 3 Finding #1): Fail and evict cache deferred to prevent
-  // poisoned key when StartCall fails before setCallState
-  if (subcallCache !== null && command.cacheKey !== undefined) {
-    yield* failCacheDeferred(subcallCache, command.cacheKey, error)
-    yield* evictCacheKey(subcallCache, command.cacheKey)
+  // poisoned key when StartCall fails before setCallState.
+  // Uses captured deferred directly (Rev 4 Finding #1) and identity-checked
+  // eviction to prevent ABA race.
+  if (command.cacheDeferred !== undefined && command.cacheKey !== undefined && subcallCache !== null) {
+    yield* failCacheDeferred(command.cacheDeferred, error)
+    yield* evictCacheKey(subcallCache, command.cacheKey, command.cacheDeferred)
   }
   yield* enqueue(RlmCommand.FailCall({
     completionId: runtime.completionId,
@@ -780,8 +828,8 @@ if the transient failure (e.g., budget) has been resolved.
 **Recursive failure path** (in `handleFailCall`):
 
 ```ts
-if (callState?.parentBridgeRequestId && callState.cacheKey !== undefined && subcallCache !== null) {
-  yield* failCacheDeferred(subcallCache, callState.cacheKey, command.error)
+if (callState?.parentBridgeRequestId && callState.cacheDeferred !== undefined) {
+  yield* failCacheDeferred(callState.cacheDeferred, command.error)
 }
 ```
 
@@ -841,6 +889,12 @@ dispatch, so `reserveLlmCall` is never called for cached responses.
 - **StartCall pre-state failure**: a sub-call whose `StartCall` fails (e.g.,
   sandbox creation error) fails the cache deferred AND evicts the key.
   Concurrent waiters receive the error; subsequent callers get a fresh miss.
+- **ABA race prevention**: eviction of key K followed by reinsertion of key K
+  with a new deferred D2 → old producer resolving D1 does not affect D2.
+  `evictCacheKey` with D1 does not evict D2's entry.
+- **Named model route isolation**: a named model called `"recursive"` produces
+  cache key with `named:recursive`, not `route:recursive` → no false hit with
+  the implicit recursive routing path.
 
 ---
 
@@ -879,10 +933,10 @@ This step is deferred because:
 
 | File | Change |
 |------|--------|
-| `src/CallContext.ts` | Add `staticSystemPromptArgs`, `staticSystemPromptPrefix`, `cacheKey` fields |
-| `src/SystemPrompt.ts` | Split `buildReplSystemPrompt` into `buildReplSystemPromptStatic` + `buildReplSystemPromptDynamic` |
+| `src/CallContext.ts` | Add `staticSystemPromptArgs`, `staticSystemPromptPrefix`, `cacheKey`, `cacheDeferred` fields |
+| `src/SystemPrompt.ts` | Split into `buildReplSystemPromptStatic` + `buildReplSystemPromptDynamic`; keep `buildReplSystemPrompt` as compatibility wrapper |
 | `src/RlmConfig.ts` | Add optional `cache` config block (`enabled`, `subcallCacheCapacity`, `deterministicOnly`) |
-| `src/RlmTypes.ts` | Add `CacheHit`, `CacheMiss` event variants; add `cacheKey` to `StartCall` command |
+| `src/RlmTypes.ts` | Add `CacheHit`, `CacheMiss` event variants; add `cacheKey`/`cacheDeferred` to `StartCall` command |
 | `src/Runtime.ts` | Add `SubcallCache` interface and `subcallCache` to `RlmRuntimeShape` |
 | `src/Scheduler.ts` | Precompute static args/prefix in `handleStartCall`; use cached prefix in `handleGenerateStep`; cache check/write in `handleHandleBridgeCall` (forked hit), `handleFinalize` (post-validation write-back), `handleFailCall`, `handleStartCall` error handler (fail+evict cache deferred); add `succeedCacheDeferred`/`failCacheDeferred`/`evictCacheKey` helpers |
 | `src/scheduler/CacheKey.ts` | New: `makeSubcallCacheKey`, `canonicalizeJson`, `hashSchema` helpers |
@@ -936,11 +990,18 @@ hash (SHA-256 or similar).
 be 1-10KB), worst case is ~2.5MB per completion. The `Deferred` objects add
 negligible overhead. Acceptable.
 
-**Map concurrency and TOCTOU:** All cache check-and-insert operations use
-`Ref.modify` for atomicity. The `Deferred` is created before `Ref.modify` and
-either inserted (miss) or discarded (hit/over-capacity). If two fibers race
-for the same key, only the first one's deferred is inserted; the second sees
-the existing entry and awaits it. This eliminates the TOCTOU race entirely.
+**Map concurrency, TOCTOU, and ABA:** All cache check-and-insert operations
+use `Ref.modify` for atomicity. The `Deferred` is created before `Ref.modify`
+and either inserted (miss) or discarded (hit/over-capacity). If two fibers
+race for the same key, only the first one's deferred is inserted; the second
+sees the existing entry and awaits it. This eliminates the TOCTOU race.
+
+To prevent ABA races (Rev 4 Finding #1): write-back helpers resolve/fail the
+captured deferred directly, never looking up by key. `evictCacheKey` checks
+`map.get(key) === expectedDeferred` before deleting. This ensures that if a
+key is evicted on timeout, reinserted by a new caller, and the old producer
+finishes late, it resolves its own (now-disconnected) deferred — not the new
+caller's deferred.
 
 ```ts
 // Atomic check-and-insert pattern
@@ -957,6 +1018,12 @@ const result = yield* Ref.modify(subcallCache.inflight, (m) => {
   next.set(cacheKey, freshDeferred)
   return [{ _tag: "miss" as const, deferred: freshDeferred }, next] as const
 })
+
+// Write-back uses captured deferred directly — no key lookup
+yield* succeedCacheDeferred(result.deferred, value)  // not succeedCacheDeferred(cache, key, value)
+
+// Eviction checks identity before deleting
+yield* evictCacheKey(cache, key, result.deferred)  // only evicts if map.get(key) === result.deferred
 ```
 
 **Budget accounting on cache hit:** A cache hit in the sub-call path should
