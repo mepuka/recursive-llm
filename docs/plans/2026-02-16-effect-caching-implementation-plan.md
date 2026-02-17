@@ -1,9 +1,9 @@
-# Effect-Native Caching Implementation Plan (Rev 10)
+# Effect-Native Caching Implementation Plan (Rev 11)
 
 Date: 2026-02-16
 Base spec: `docs/plans/2026-02-07-rlm-effect-caching-refactor-spec.md`
 Branch: `feat/effect-caching-implementation`
-Revision: 10 — addresses codex review findings from Rev 9
+Revision: 11 — addresses codex review findings from Rev 10
 
 ## Review Findings Addressed
 
@@ -98,6 +98,16 @@ Revision: 10 — addresses codex review findings from Rev 9
 | 2 | MEDIUM | Cache-hit fork evicts on any non-success exit including scope interruption — a canceled waiter fiber can evict a still-healthy in-flight entry, breaking single-flight semantics | Move eviction into `Effect.tapError` on the `Deferred.await` pipe (runs only on failures like timeout, not on interruption/defect causes); remove eviction from `catchAllCause` |
 | 3 | MEDIUM | `cacheKey?` and `cacheDeferred?` are independent optionals permitting partial invalid states | Model as single optional object `cacheBinding?: { key; deferred }` — both-or-none enforced by type |
 | 4 | LOW | Test plan misses: (a) cleanup after `Scope.close` failure in Finalize/FailCall, (b) hit-waiter interruption does NOT evict live producer entry | Added targeted tests for both scenarios |
+
+### Rev 10 → Rev 11
+
+| # | Severity | Finding | Resolution |
+|---|----------|---------|------------|
+| 1 | HIGH | `contextMetadata` spread uses `\|\| callState.context.length > 0` which can produce `{ contextMetadata: undefined }` — breaks `exactOptionalPropertyTypes` | Changed to only spread when `callState.contextMetadata !== undefined` |
+| 2 | MEDIUM | Step 2 references `command.cacheBinding` before Step 4 adds it to `StartCall`; Step 1 new fields break tests until Step 2 lands | Reordered: Step 4 (types/events/commands) first, then Step 1+2 together |
+| 3 | MEDIUM | Timeout test expectations flaky — BridgeHandler timeout fires before cache-hit waiter timeout | Revised test guidance: use asymmetric timeouts (short cache, long bridge) or test waiter fork in isolation |
+| 4 | LOW | `deterministicOnly` config field introduced but unused in Tier A/B | Deferred to Tier C — not added to config schema |
+| 5 | LOW | `canonicalizeJson(undefined)` returns `"null"` which is inconsistent with `JSON.stringify(undefined)` | Changed to throw an error for top-level `undefined` |
 
 ---
 
@@ -288,7 +298,7 @@ const dynamicSuffix = buildReplSystemPromptDynamic({
 const prompt = buildReplPrompt({
   systemPrompt: callState.staticSystemPromptPrefix + "\n" + dynamicSuffix,
   query: callState.query,
-  ...(callState.contextMetadata !== undefined || callState.context.length > 0
+  ...(callState.contextMetadata !== undefined
     ? { contextMetadata: callState.contextMetadata }
     : {}),
   transcript,
@@ -339,12 +349,16 @@ Extend `RlmConfigService` with:
 readonly cache?: {
   readonly enabled?: boolean                   // default true
   readonly subcallCacheCapacity?: number        // default 256
-  readonly deterministicOnly?: boolean          // default true
 }
 ```
 
 The `cache` field is optional with all sub-fields optional, preserving
 backward compatibility. Defaults are applied in the consumer code.
+
+**Deferred to Tier C:** `deterministicOnly` (temperature gating) is not
+added in Tier A/B since sub-call caching operates on exact input match
+regardless of model temperature. It will be introduced with the model
+response cache (Step 7) where temperature sensitivity matters.
 
 **No separate cache timeout config.** The cache-hit timeout is derived from
 the existing `bridgeTimeoutMs` config (default 300s, see `BridgeHandler.ts:72`)
@@ -551,7 +565,7 @@ export const makeSubcallCacheKey = (parts: SubcallCacheKeyParts): string => {
  * Drops keys with `undefined` values to match `JSON.stringify` semantics.
  */
 export const canonicalizeJson = (value: unknown): string => {
-  if (value === undefined) return "null"  // match JSON.stringify(undefined) → undefined, but treat as null for safety
+  if (value === undefined) throw new Error("canonicalizeJson: top-level undefined is not valid JSON")
   if (value === null || typeof value !== "object") {
     return JSON.stringify(value)
   }
@@ -1068,11 +1082,18 @@ dispatch, so `reserveLlmCall` is never called for cached responses.
   Assert on `SandboxError` message content containing the validation details.
 - **Over-capacity behavior**: when inflight map exceeds capacity, new sub-calls
   proceed without caching (no deferred registered, no events emitted).
-- **Timeout on never-resolved deferred**: cache-hit waiter times out with
-  `SandboxError` after configured duration.
+- **Timeout on never-resolved deferred**: cache-hit waiter times out. Note:
+  BridgeHandler timeout starts earlier than the cache-hit waiter, so in
+  end-to-end tests the bridge timeout may fire first. Test at scheduler level
+  by setting a very short cache timeout (e.g., 50ms) and a much longer bridge
+  timeout, or test the waiter fork in isolation without BridgeHandler. Assert
+  eviction behavior (key removed from inflight map) rather than specific
+  timeout error messages.
 - **Timeout eviction**: when a cache-hit waiter times out and the deferred is
   still pending (`Deferred.isDone` returns false), the key is evicted from
   the inflight map. A subsequent call for the same key gets a fresh miss.
+  Use asymmetric timeout values (short cache, long bridge) to isolate the
+  cache timeout path.
 - **StartCall pre-state failure**: a sub-call whose `StartCall` fails (e.g.,
   sandbox creation error) fails the cache deferred AND evicts the key.
   Concurrent waiters receive the error; subsequent callers get a fresh miss.
@@ -1120,8 +1141,9 @@ Contingent on Step 6 review passing. Adds model-level caching wrapping all
 `llmCall.generateText` invocations.
 
 Key design decisions:
-- Only cache when `deterministicOnly` is true (default) — temperature 0 or
-  equivalent.
+- Add `deterministicOnly?: boolean` (default true) to `cache` config — only
+  cache when temperature is 0 or equivalent. This field is deferred from
+  Tier A/B since sub-call caching doesn't depend on temperature.
 - Cache key = hash of serialized prompt + model route + settings + schema.
 - Same deferred-based pattern as Tier B for concurrent dedup.
 - Budget policy: skip budget consumption on hit and log saved tokens.
@@ -1139,7 +1161,7 @@ This step is deferred because:
 |------|--------|
 | `src/CallContext.ts` | Add `staticSystemPromptArgs`, `staticSystemPromptPrefix`, `cacheBinding` fields |
 | `src/SystemPrompt.ts` | Split into `buildReplSystemPromptStatic` + `buildReplSystemPromptDynamic`; keep `buildReplSystemPrompt` as compatibility wrapper |
-| `src/RlmConfig.ts` | Add optional `cache` config block (`enabled`, `subcallCacheCapacity`, `deterministicOnly`) |
+| `src/RlmConfig.ts` | Add optional `cache` config block (`enabled`, `subcallCacheCapacity`) |
 | `src/RlmTypes.ts` | Add `CacheHit`, `CacheMiss` event variants; add `cacheBinding` to `StartCall` command |
 | `src/Runtime.ts` | Add `SubcallCache` interface and `subcallCache` to `RlmRuntimeShape` |
 | `src/Scheduler.ts` | Precompute static args/prefix in `handleStartCall`; use cached prefix in `handleGenerateStep`; cache check/write in `handleHandleBridgeCall` (forked hit), `handleFinalize` (post-validation write-back), `handleFailCall`, `handleStartCall` error handler (fail+evict cache deferred); harden `Scope.close` with `Effect.exit` in `handleFinalize`/`handleFailCall`; add `succeedCacheDeferred`/`failCacheDeferred`/`evictCacheKey` helpers |
@@ -1161,12 +1183,19 @@ This step is deferred because:
 ## Implementation Order
 
 ```
-Step 1  ──► Step 2  ──► Step 3  ──► Step 4  ──► Step 5a ──► Step 5b ──► Step 5c ──► Step 5d ──► Step 6
-(types)    (scheduler   (config)    (events)    (runtime)   (key)      (read)      (write)     (review)
-            + prompt)
+Step 4  ──► Step 1  ──► Step 2  ──► Step 3  ──► Step 5a ──► Step 5b ──► Step 5c ──► Step 5d ──► Step 6
+(events+    (types)    (scheduler   (config)    (runtime)   (key)      (read)      (write)     (review)
+ commands)              + prompt)
 ```
 
-Steps 3 and 4 can be done in parallel since they touch different files.
+**Why Step 4 first (Rev 10 Finding #2):** Step 2 references `command.cacheBinding`
+on `StartCall`, which is added in Step 4b. Step 4 must land before Step 2 to
+avoid compile errors. Similarly, Step 1 adds new fields to `MakeCallContextOptions`
+that are populated in Step 2's `handleStartCall` changes — Steps 1 and 2 should
+be landed together (or Step 1 fields made temporarily optional with a tightening
+pass in Step 2).
+
+Steps 3 and 5a can be done in parallel (different files).
 Steps 5a and 5b can be done in parallel.
 
 ---
