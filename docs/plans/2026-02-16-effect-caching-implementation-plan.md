@@ -1,9 +1,9 @@
-# Effect-Native Caching Implementation Plan (Rev 9)
+# Effect-Native Caching Implementation Plan (Rev 10)
 
 Date: 2026-02-16
 Base spec: `docs/plans/2026-02-07-rlm-effect-caching-refactor-spec.md`
 Branch: `feat/effect-caching-implementation`
-Revision: 9 — addresses codex review findings from Rev 8
+Revision: 10 — addresses codex review findings from Rev 9
 
 ## Review Findings Addressed
 
@@ -90,6 +90,15 @@ Revision: 9 — addresses codex review findings from Rev 8
 | 3 | MEDIUM | Budget-policy claim (cache hit ≠ LLM call) not explicitly tested | Added budget accounting test: two identical calls, assert `llmCallsRemaining` decrements once |
 | 4 | LOW | File change summary missing planned test file edits for prompt, renderer, CLI | Updated summary to include all test files |
 
+### Rev 9 → Rev 10
+
+| # | Severity | Finding | Resolution |
+|---|----------|---------|------------|
+| 1 | HIGH | `Scope.close` in `handleFinalize` and `handleFailCall` is not wrapped with `Effect.exit` — if finalizer fails, cache/bridge cleanup is skipped | Harden both handlers: `yield* Effect.exit(Scope.close(...))` to match the existing StartCall error handler pattern |
+| 2 | MEDIUM | Cache-hit fork evicts on any non-success exit including scope interruption — a canceled waiter fiber can evict a still-healthy in-flight entry, breaking single-flight semantics | Move eviction into `Effect.tapError` on the `Deferred.await` pipe (runs only on failures like timeout, not on interruption/defect causes); remove eviction from `catchAllCause` |
+| 3 | MEDIUM | `cacheKey?` and `cacheDeferred?` are independent optionals permitting partial invalid states | Model as single optional object `cacheBinding?: { key; deferred }` — both-or-none enforced by type |
+| 4 | LOW | Test plan misses: (a) cleanup after `Scope.close` failure in Finalize/FailCall, (b) hit-waiter interruption does NOT evict live producer entry | Added targeted tests for both scenarios |
+
 ---
 
 ## Overview
@@ -118,8 +127,10 @@ Add fields to the `CallContext` interface:
 // New fields on CallContext
 readonly staticSystemPromptArgs: Omit<ReplSystemPromptOptions, "iteration" | "budget">
 readonly staticSystemPromptPrefix: string
-readonly cacheKey?: string  // set for recursive sub-calls with caching enabled
-readonly cacheDeferred?: Deferred.Deferred<unknown, RlmError>  // the originating deferred for this key
+readonly cacheBinding?: {
+  readonly key: string
+  readonly deferred: Deferred.Deferred<unknown, RlmError>
+}  // set for recursive sub-calls with caching enabled — paired type prevents partial invalid state
 ```
 
 **Dropped from Rev 1:**
@@ -131,7 +142,7 @@ readonly cacheDeferred?: Deferred.Deferred<unknown, RlmError>  // the originatin
 **Changes to `makeCallContext`:**
 
 Add `staticSystemPromptArgs`, `staticSystemPromptPrefix`, and optional
-`cacheKey`/`cacheDeferred` to `MakeCallContextOptions` and propagate into the
+`cacheBinding` to `MakeCallContextOptions` and propagate into the
 returned `CallContext`.
 
 **Tests:** Unit test `makeCallContext` to verify the new fields are stored and
@@ -198,8 +209,7 @@ const callContext = yield* makeCallContext({
   // ... existing fields ...
   staticSystemPromptArgs,
   staticSystemPromptPrefix,
-  ...(command.cacheKey !== undefined ? { cacheKey: command.cacheKey } : {}),
-  ...(command.cacheDeferred !== undefined ? { cacheDeferred: command.cacheDeferred } : {})
+  ...(command.cacheBinding !== undefined ? { cacheBinding: command.cacheBinding } : {})
 })
 ```
 
@@ -410,15 +420,17 @@ CacheMiss: {
 
 ### 4b: Extend `StartCall` command shape
 
-Add optional `cacheKey` and `cacheDeferred` fields to the `StartCall` variant
-of the `RlmCommand` tagged enum (needed by Step 5c/5d for threading cache
-state into sub-call paths):
+Add an optional `cacheBinding` field (paired key + deferred) to the `StartCall`
+variant of the `RlmCommand` tagged enum (needed by Step 5c/5d for threading
+cache state into sub-call paths):
 
 ```ts
 StartCall: {
   // ... existing fields ...
-  readonly cacheKey?: string
-  readonly cacheDeferred?: Deferred.Deferred<unknown, RlmError>
+  readonly cacheBinding?: {
+    readonly key: string
+    readonly deferred: Deferred.Deferred<unknown, RlmError>
+  }
 }
 ```
 
@@ -662,7 +674,20 @@ if (subcallCache !== null && command.method === "llm_query") {
             onTimeout: () => new SandboxError({
               message: `Sub-call cache await timed out after ${subcallCache.timeoutMs}ms`
             })
-          })
+          }),
+          // CRITICAL (Rev 9 Finding #2): Evict on FAILURE only (includes
+          // timeout). tapError runs for failures but NOT for interruption or
+          // defect causes. This ensures scope-closure interruption of a waiter
+          // does not evict a still-healthy producer entry, preserving
+          // single-flight semantics for other waiters.
+          Effect.tapError(() =>
+            Effect.gen(function*() {
+              const isDone = yield* Deferred.isDone(hitDeferred)
+              if (!isDone) {
+                yield* evictCacheKey(subcallCache, hitKey, hitDeferred)
+              }
+            })
+          )
         )
         yield* resolveBridgeDeferred(command.bridgeRequestId, cachedResult)
       }).pipe(
@@ -675,15 +700,10 @@ if (subcallCache !== null && command.method === "llm_query") {
                   new SandboxError({ message: `Cache-hit fiber terminated: ${Cause.pretty(defectOrInterrupt)}` })
               })
             )
-            // CRITICAL (Rev 3 Finding #3): On timeout, evict the stale entry
-            // if the deferred is still pending. This prevents a stuck/dropped
-            // sub-call from poisoning the key for the rest of the completion.
-            // Identity check (Rev 4 Finding #1) ensures we don't evict a
-            // freshly-inserted entry belonging to a different caller.
-            const isDone = yield* Deferred.isDone(hitDeferred)
-            if (!isDone) {
-              yield* evictCacheKey(subcallCache, hitKey, hitDeferred)
-            }
+            // No eviction here — timeout eviction handled by tapError above.
+            // CRITICAL (Rev 9 Finding #2): Scope interruption must NOT evict
+            // a live producer entry. Other waiters may still be awaiting the
+            // same deferred successfully.
             yield* failBridgeDeferred(command.bridgeRequestId, error)
           })
         )
@@ -733,21 +753,22 @@ preserve narrowing of outer `let` variables across closure boundaries.
 
 ```ts
 // Capture narrowed miss state for use in fork closures (one-shot and recursive paths)
-const missDeferred = cacheResult?._tag === "miss" ? cacheResult.deferred : undefined
-const missKey = cacheResult?._tag === "miss" ? cacheKey! : undefined
+const missBinding = cacheResult?._tag === "miss"
+  ? { key: cacheKey!, deferred: cacheResult.deferred }
+  : undefined
 ```
 
-For one-shot sub-calls: `missDeferred` and `missKey` are captured `const`
-values used in the fork closure.
+For one-shot sub-calls: `missBinding` is a captured `const` used in the fork
+closure.
 
-For recursive sub-calls: pass `missKey` and `missDeferred` into the `StartCall`
-command, then propagate to `makeCallContext` so they're available on
-`callState.cacheKey`/`callState.cacheDeferred` in `handleFinalize`.
+For recursive sub-calls: pass `missBinding` as `cacheBinding` into the
+`StartCall` command, then propagate to `makeCallContext` so it's available on
+`callState.cacheBinding` in `handleFinalize`.
 
 ```ts
 // In the recursive dispatch path:
-// Thread both cacheKey and cacheDeferred so handleFinalize can resolve
-// the originating deferred directly (prevents ABA race — Rev 4 Finding #1)
+// Thread cacheBinding so handleFinalize can resolve the originating deferred
+// directly (prevents ABA race — Rev 4 Finding #1)
 yield* enqueue(RlmCommand.StartCall({
   callId: subCallId,
   depth: callState.depth + 1,
@@ -755,9 +776,7 @@ yield* enqueue(RlmCommand.StartCall({
   context: llmContextArg ?? "",
   parentBridgeRequestId: command.bridgeRequestId,
   ...(responseFormat !== undefined ? { outputJsonSchema: responseFormat.schema } : {}),
-  ...(missKey !== undefined && missDeferred !== undefined
-    ? { cacheKey: missKey, cacheDeferred: missDeferred }
-    : {})
+  ...(missBinding !== undefined ? { cacheBinding: missBinding } : {})
 }))
 ```
 
@@ -776,8 +795,8 @@ yield* Effect.forkIn(
       ...(responseFormat !== undefined ? { responseFormat } : {})
     })
     // Cache write-back: resolve the captured deferred directly (not by key)
-    if (missDeferred !== undefined) {
-      yield* succeedCacheDeferred(missDeferred, oneShotResult)
+    if (missBinding !== undefined) {
+      yield* succeedCacheDeferred(missBinding.deferred, oneShotResult)
     }
     yield* resolveBridgeDeferred(command.bridgeRequestId, oneShotResult)
   }).pipe(
@@ -789,9 +808,9 @@ yield* Effect.forkIn(
       return Effect.gen(function*() {
         // CRITICAL (Rev 8 Finding #2): Evict BEFORE failing deferred to prevent
         // concurrent callers from observing a failed deferred still in the map.
-        if (missDeferred !== undefined && missKey !== undefined && subcallCache !== null) {
-          yield* evictCacheKey(subcallCache, missKey, missDeferred)
-          yield* failCacheDeferred(missDeferred, error)
+        if (missBinding !== undefined && subcallCache !== null) {
+          yield* evictCacheKey(subcallCache, missBinding.key, missBinding.deferred)
+          yield* failCacheDeferred(missBinding.deferred, error)
         }
         const message = "message" in error ? error.message : String(error)
         yield* failBridgeDeferred(command.bridgeRequestId, message)
@@ -856,6 +875,16 @@ const evictCacheKey = (
 
 **Recursive path** (in `handleFinalize`, when resolving parent bridge deferred):
 
+**CRITICAL (Rev 9 Finding #1):** The existing `Scope.close` in `handleFinalize`
+(at `Scheduler.ts:1315`) is not wrapped with `Effect.exit`. If a scope finalizer
+fails, the remaining handler code (cache write-back and bridge deferred
+resolution) would be skipped. Change to:
+
+```ts
+// Harden Scope.close — make non-fatal so cache/bridge cleanup always executes
+yield* Effect.exit(Scope.close(callState.callScope, Exit.void))
+```
+
 **CRITICAL (Rev 2 Finding #3):** Cache write-back MUST happen AFTER schema
 validation, not before. If the structured output fails validation, the deferred
 must be failed (not resolved with invalid data), so that cache-hit waiters
@@ -865,8 +894,8 @@ also receive the error.
 if (callState.parentBridgeRequestId) {
   if (command.payload.source === "answer") {
     // Plain text answer — resolve captured deferred directly
-    if (callState.cacheDeferred !== undefined) {
-      yield* succeedCacheDeferred(callState.cacheDeferred, command.payload.answer)
+    if (callState.cacheBinding !== undefined) {
+      yield* succeedCacheDeferred(callState.cacheBinding.deferred, command.payload.answer)
     }
     yield* resolveBridgeDeferred(callState.parentBridgeRequestId, command.payload.answer)
     return
@@ -882,17 +911,17 @@ if (callState.parentBridgeRequestId) {
           raw: renderSubmitAnswer(command.payload)
         })
         // CRITICAL (Rev 8 Finding #2): Evict BEFORE failing deferred
-        if (callState.cacheDeferred !== undefined && callState.cacheKey !== undefined && subcallCache !== null) {
-          yield* evictCacheKey(subcallCache, callState.cacheKey, callState.cacheDeferred)
-          yield* failCacheDeferred(callState.cacheDeferred, error)
+        if (callState.cacheBinding !== undefined && subcallCache !== null) {
+          yield* evictCacheKey(subcallCache, callState.cacheBinding.key, callState.cacheBinding.deferred)
+          yield* failCacheDeferred(callState.cacheBinding.deferred, error)
         }
         yield* failBridgeDeferred(callState.parentBridgeRequestId, error)
         return
       }
     }
     // Validation passed (or no schema) — resolve captured deferred
-    if (callState.cacheDeferred !== undefined) {
-      yield* succeedCacheDeferred(callState.cacheDeferred, command.payload.value)
+    if (callState.cacheBinding !== undefined) {
+      yield* succeedCacheDeferred(callState.cacheBinding.deferred, command.payload.value)
     }
     yield* resolveBridgeDeferred(callState.parentBridgeRequestId, command.payload.value)
     return
@@ -904,9 +933,9 @@ if (callState.parentBridgeRequestId) {
     raw: renderSubmitAnswer(command.payload)
   })
   // CRITICAL (Rev 8 Finding #2): Evict BEFORE failing deferred
-  if (callState.cacheDeferred !== undefined && callState.cacheKey !== undefined && subcallCache !== null) {
-    yield* evictCacheKey(subcallCache, callState.cacheKey, callState.cacheDeferred)
-    yield* failCacheDeferred(callState.cacheDeferred, error)
+  if (callState.cacheBinding !== undefined && subcallCache !== null) {
+    yield* evictCacheKey(subcallCache, callState.cacheBinding.key, callState.cacheBinding.deferred)
+    yield* failCacheDeferred(callState.cacheBinding.deferred, error)
   }
   yield* failBridgeDeferred(callState.parentBridgeRequestId, error)
 }
@@ -944,9 +973,9 @@ Effect.gen(function*() {
   // CRITICAL (Rev 8 Finding #2): Evict BEFORE failing deferred.
   // Uses captured deferred directly (Rev 4 Finding #1) and identity-checked
   // eviction to prevent ABA race.
-  if (command.cacheDeferred !== undefined && command.cacheKey !== undefined && subcallCache !== null) {
-    yield* evictCacheKey(subcallCache, command.cacheKey, command.cacheDeferred)
-    yield* failCacheDeferred(command.cacheDeferred, rlmError)
+  if (command.cacheBinding !== undefined && subcallCache !== null) {
+    yield* evictCacheKey(subcallCache, command.cacheBinding.key, command.cacheBinding.deferred)
+    yield* failCacheDeferred(command.cacheBinding.deferred, rlmError)
   }
   yield* enqueue(RlmCommand.FailCall({
     callId: command.callId,
@@ -966,13 +995,25 @@ transient failure (e.g., budget) has been resolved.
 
 **Recursive failure path** (in `handleFailCall`):
 
+**CRITICAL (Rev 9 Finding #1):** The existing `Scope.close` in `handleFailCall`
+(at `Scheduler.ts:1380`) is not wrapped with `Effect.exit`. Change to:
+
+```ts
+// Harden Scope.close — make non-fatal so cache/bridge cleanup always executes
+if (callState) {
+  yield* Effect.exit(Scope.close(callState.callScope, Exit.fail(command.error)))
+}
+```
+
+Then add cache deferred cleanup:
+
 ```ts
 // CRITICAL (Rev 8 Finding #2): Evict BEFORE failing deferred
-if (callState?.parentBridgeRequestId && callState.cacheDeferred !== undefined) {
-  if (callState.cacheKey !== undefined && subcallCache !== null) {
-    yield* evictCacheKey(subcallCache, callState.cacheKey, callState.cacheDeferred)
+if (callState?.parentBridgeRequestId && callState.cacheBinding !== undefined) {
+  if (subcallCache !== null) {
+    yield* evictCacheKey(subcallCache, callState.cacheBinding.key, callState.cacheBinding.deferred)
   }
-  yield* failCacheDeferred(callState.cacheDeferred, command.error)
+  yield* failCacheDeferred(callState.cacheBinding.deferred, command.error)
 }
 ```
 
@@ -1050,6 +1091,14 @@ dispatch, so `reserveLlmCall` is never called for cached responses.
 - **Cache-hit fiber interruption**: cache-hit waiter fiber is interrupted via
   scope closure before deferred resolves → bridge deferred is failed (not left
   unresolved). Uses `Effect.catchAllCause` to handle interruption cause.
+- **Scope.close failure does not skip cleanup**: In `handleFinalize`, inject a
+  failing scope finalizer → verify cache deferred is still resolved/failed and
+  bridge deferred is still resolved (i.e., `Effect.exit(Scope.close(...))` makes
+  finalizer failure non-fatal). Same test for `handleFailCall`.
+- **Waiter interruption does NOT evict live producer**: A cache-hit waiter
+  whose scope is closed (interrupted) does NOT evict the inflight entry. Verify
+  the producer's deferred is still in the map and can be resolved successfully
+  for other waiters. Only timeout-triggered failures cause eviction.
 
 ---
 
@@ -1088,12 +1137,12 @@ This step is deferred because:
 
 | File | Change |
 |------|--------|
-| `src/CallContext.ts` | Add `staticSystemPromptArgs`, `staticSystemPromptPrefix`, `cacheKey`, `cacheDeferred` fields |
+| `src/CallContext.ts` | Add `staticSystemPromptArgs`, `staticSystemPromptPrefix`, `cacheBinding` fields |
 | `src/SystemPrompt.ts` | Split into `buildReplSystemPromptStatic` + `buildReplSystemPromptDynamic`; keep `buildReplSystemPrompt` as compatibility wrapper |
 | `src/RlmConfig.ts` | Add optional `cache` config block (`enabled`, `subcallCacheCapacity`, `deterministicOnly`) |
-| `src/RlmTypes.ts` | Add `CacheHit`, `CacheMiss` event variants; add `cacheKey`/`cacheDeferred` to `StartCall` command |
+| `src/RlmTypes.ts` | Add `CacheHit`, `CacheMiss` event variants; add `cacheBinding` to `StartCall` command |
 | `src/Runtime.ts` | Add `SubcallCache` interface and `subcallCache` to `RlmRuntimeShape` |
-| `src/Scheduler.ts` | Precompute static args/prefix in `handleStartCall`; use cached prefix in `handleGenerateStep`; cache check/write in `handleHandleBridgeCall` (forked hit), `handleFinalize` (post-validation write-back), `handleFailCall`, `handleStartCall` error handler (fail+evict cache deferred); add `succeedCacheDeferred`/`failCacheDeferred`/`evictCacheKey` helpers |
+| `src/Scheduler.ts` | Precompute static args/prefix in `handleStartCall`; use cached prefix in `handleGenerateStep`; cache check/write in `handleHandleBridgeCall` (forked hit), `handleFinalize` (post-validation write-back), `handleFailCall`, `handleStartCall` error handler (fail+evict cache deferred); harden `Scope.close` with `Effect.exit` in `handleFinalize`/`handleFailCall`; add `succeedCacheDeferred`/`failCacheDeferred`/`evictCacheKey` helpers |
 | `src/scheduler/CacheKey.ts` | New: `makeSubcallCacheKey`, `canonicalizeJson`, `hashSchema` helpers |
 | `src/RlmRenderer.ts` | Render `CacheHit`/`CacheMiss` events |
 | `src/cli/Command.ts` | Add `--no-cache` flag definition |
@@ -1126,21 +1175,27 @@ Steps 5a and 5b can be done in parallel.
 
 **Deferred lifecycle:** A `Deferred` that is never resolved (e.g., if the
 sub-call silently drops without hitting `handleFinalize` or `handleFailCall`)
-would leave waiters hanging. Mitigated by four layers of defense:
+would leave waiters hanging. Mitigated by six layers of defense:
 1. `Effect.timeoutFail` on `Deferred.await` in the cache-hit fork (derived
    from `bridgeTimeoutMs`, default 300s). On timeout with pending deferred,
-   the stale key is evicted from the inflight map.
+   the stale key is evicted via `Effect.tapError` (which runs only on
+   failures, not on interruption — preserving single-flight semantics).
 2. All producer failure paths (one-shot catch, handleFinalize validation
    failure, handleFailCall, handleStartCall error handler) evict the key
    (identity-checked) THEN fail the cache deferred. Evict-before-fail
    prevents concurrent callers from observing a failed deferred still in the
    map. This ensures failed entries don't consume capacity or cause stale
    error hits.
-3. The existing `callScope` close in error paths.
+3. `Scope.close` in `handleFinalize` and `handleFailCall` wrapped with
+   `Effect.exit()` to make finalizer failures non-fatal — ensures cache/bridge
+   cleanup code always executes even if a finalizer throws.
 4. The completion-level scope close in `Rlm.ts` which interrupts all fibers.
 5. Cache-hit fork uses `Effect.catchAllCause` (not `catchAll`) to handle
    interruption causes from scope closure, ensuring the bridge deferred is
    always failed on non-success exits.
+6. Waiter interruption (scope close) does NOT evict the inflight entry — only
+   timeout-triggered failures cause eviction. This prevents a canceled waiter
+   from breaking single-flight semantics for other waiters of the same key.
 
 **Deferred double-resolve:** `Deferred.succeed`/`Deferred.fail` on an
 already-resolved deferred is a no-op in Effect (returns `false`). This is safe
