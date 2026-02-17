@@ -1,9 +1,9 @@
-# Effect-Native Caching Implementation Plan (Rev 6)
+# Effect-Native Caching Implementation Plan (Rev 7)
 
 Date: 2026-02-16
 Base spec: `docs/plans/2026-02-07-rlm-effect-caching-refactor-spec.md`
 Branch: `feat/effect-caching-implementation`
-Revision: 6 — addresses codex review findings from Rev 5
+Revision: 7 — addresses codex review findings from Rev 6
 
 ## Review Findings Addressed
 
@@ -61,6 +61,15 @@ Revision: 6 — addresses codex review findings from Rev 5
 | 3 | MEDIUM | `cacheResult` scope inconsistent: `const` inside block, referenced outside | Use `let cacheResult: ... \| undefined` in outer scope, assign inside cache block |
 | 4 | MEDIUM | Step 2 ordering contradiction: compute after `makeCallContext` vs pass into it | Compute static args BEFORE `makeCallContext`, then pass in |
 | 5 | LOW | "contextMetadata always set" claim overstated (undefined for empty context) | Reworded to "derived for non-empty context" |
+
+### Rev 6 → Rev 7
+
+| # | Severity | Finding | Resolution |
+|---|----------|---------|------------|
+| 1 | MEDIUM | StartCall error handler passes raw `error` to `failCacheDeferred` — `catchAll` error may not be `RlmError` | Normalize error: `const rlmError = error instanceof RlmError ? error : new SchedulerInternalError(...)` before passing to `failCacheDeferred` and `FailCall` |
+| 2 | MEDIUM | Recursive enqueue snippet uses `cacheResult._tag` without optional chaining | Changed to `cacheResult?._tag === "miss"` for safe narrowing when `cacheResult` is `undefined` |
+| 3 | MEDIUM | Prompt-split test plan misses explicit parity coverage | Added parity assertion: `buildReplSystemPrompt(opts) === buildReplSystemPromptStatic(...) + "\n" + buildReplSystemPromptDynamic(...)` |
+| 4 | LOW | "Verbose mode" wording doesn't match actual renderer API | Changed to "render when `quiet !== true`" to match `RlmRenderer` options |
 
 ---
 
@@ -269,6 +278,26 @@ code and aligns with the precomputed field on `CallContext`.
 behavioral change). Add a focused test that verifies `callState` contains the
 precomputed fields and prefix string after `StartCall`.
 
+**Prompt split parity test** (`test/SystemPrompt.test.ts`): Assert that the
+compatibility wrapper produces identical output to the split functions:
+
+```ts
+test("buildReplSystemPrompt equals static + dynamic", () => {
+  const opts: ReplSystemPromptOptions = { /* representative options */ }
+  const { iteration, budget, ...staticOpts } = opts
+  const combined = buildReplSystemPrompt(opts)
+  const split = buildReplSystemPromptStatic(staticOpts) + "\n" + buildReplSystemPromptDynamic({
+    iteration,
+    budget,
+    maxIterations: opts.maxIterations
+  })
+  expect(combined).toBe(split)
+})
+```
+
+This ensures the wrapper and split functions remain in sync as the template
+evolves.
+
 ---
 
 ## Step 3: Add Cache Config to `RlmConfigService`
@@ -354,7 +383,7 @@ CacheMiss: {
 
 **File:** `src/RlmRenderer.ts`
 
-Add rendering for these events in verbose mode (log line with hit/miss, kind,
+Render these events when `quiet !== true` (a log line with hit/miss, kind,
 and abbreviated cache key). Handle in `Match.tagsExhaustive` to maintain
 exhaustiveness.
 
@@ -656,7 +685,7 @@ yield* enqueue(RlmCommand.StartCall({
   context: llmContextArg ?? "",
   parentBridgeRequestId: command.bridgeRequestId,
   ...(responseFormat !== undefined ? { outputJsonSchema: responseFormat.schema } : {}),
-  ...(cacheKey !== undefined && cacheResult._tag === "miss"
+  ...(cacheKey !== undefined && cacheResult?._tag === "miss"
     ? { cacheKey, cacheDeferred: cacheResult.deferred }
     : {})
 }))
@@ -828,22 +857,28 @@ cache deferred:
 // In handleStartCall error handler (Scheduler.ts:494-508):
 // CRITICAL (Rev 4 Finding #3): Use Effect.exit(Scope.close(...)) to prevent
 // finalizer failures from aborting the handler and skipping deferred cleanup.
+// CRITICAL (Rev 6 Finding #1): Normalize raw error to RlmError. The
+// catchAll error may be any type (e.g., Cause.UnknownException from
+// sandbox creation). failCacheDeferred and FailCall both require RlmError.
 Effect.gen(function*() {
-  yield* Effect.exit(Scope.close(callScope, Exit.fail(error)))
+  const rlmError: RlmError = error instanceof RlmError
+    ? error
+    : new SchedulerInternalError({ message: String(error) })
+  yield* Effect.exit(Scope.close(callScope, Exit.fail(rlmError)))
   if (command.parentBridgeRequestId) {
-    yield* failBridgeDeferred(command.parentBridgeRequestId, error)
+    yield* failBridgeDeferred(command.parentBridgeRequestId, rlmError)
   }
   // CRITICAL (Rev 3 Finding #1): Fail and evict cache deferred to prevent
   // poisoned key when StartCall fails before setCallState.
   // Uses captured deferred directly (Rev 4 Finding #1) and identity-checked
   // eviction to prevent ABA race.
   if (command.cacheDeferred !== undefined && command.cacheKey !== undefined && subcallCache !== null) {
-    yield* failCacheDeferred(command.cacheDeferred, error)
+    yield* failCacheDeferred(command.cacheDeferred, rlmError)
     yield* evictCacheKey(subcallCache, command.cacheKey, command.cacheDeferred)
   }
   yield* enqueue(RlmCommand.FailCall({
     callId: command.callId,
-    error
+    error: rlmError
   }))
 })
 ```
