@@ -20,7 +20,7 @@ export interface ParsedCliConfig {
   readonly maxLlmCalls: Option.Option<number>
   readonly maxTotalTokens: Option.Option<number>
   readonly maxTimeMs: Option.Option<number>
-  readonly sandboxTransport: "auto" | "worker" | "spawn"
+  readonly sandboxTransport: Option.Option<"auto" | "worker" | "spawn">
   readonly noPromptCaching: boolean
   readonly noCache: boolean
   readonly quiet: boolean
@@ -176,6 +176,7 @@ export const normalizeCliArgs = (
     const maxTotalTokens = toUndefined(parsed.maxTotalTokens)
     const maxTimeMs = toUndefined(parsed.maxTimeMs)
     const enablePromptCaching = parsed.noPromptCaching ? false : undefined
+    const sandboxTransport = toUndefined(parsed.sandboxTransport)
     const traceDir = toUndefined(parsed.traceDir)
     const namedModels = yield* parseNamedModelSpecs(parsed.namedModel)
     const media = yield* parseNamedPathSpecs(parsed.media, "--media")
@@ -264,7 +265,7 @@ export const normalizeCliArgs = (
       ...(maxLlmCalls !== undefined ? { maxLlmCalls } : {}),
       ...(maxTotalTokens !== undefined ? { maxTotalTokens } : {}),
       ...(maxTimeMs !== undefined ? { maxTimeMs } : {}),
-      sandboxTransport: parsed.sandboxTransport,
+      ...(sandboxTransport !== undefined ? { sandboxTransport } : {}),
       ...(namedModels !== undefined ? { namedModels } : {}),
       ...(media !== undefined
         ? {

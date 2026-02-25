@@ -3,10 +3,15 @@
   "module": "index.ts",
   "type": "module",
   "private": true,
+  "bin": {
+    "rlm": "./dist/rlm"
+  },
   "scripts": {
     "prepare": "effect-language-service patch",
     "typecheck": "tsc --noEmit",
     "rlm": "bun run src/cli.ts",
+    "build": "bun run scripts/build.ts",
+    "build:cross": "bun run scripts/build.ts bun-linux-x64",
     "test": "bun test",
     "test:property": "bun test test/property",
     "bench:transport": "bun run scripts/bench/sandbox-transport.ts"

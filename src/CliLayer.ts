@@ -13,6 +13,7 @@ import type { RlmModel } from "./RlmModel"
 import { makeRlmModelLayer } from "./RlmModel"
 import { SandboxConfig } from "./Sandbox"
 import { RunTraceConfig, type RunTraceConfigService } from "./RunTraceWriter"
+import { resolveWorkerPath } from "./WorkerPath"
 
 export interface CliArgs {
   query: string
@@ -210,7 +211,7 @@ export const buildCliLayer = (cliArgs: CliArgs): Layer.Layer<Rlm, never, never> 
   const configLayer = Layer.succeed(RlmConfig, makeCliConfig(cliArgs))
   const sandboxConfigLayer = Layer.succeed(SandboxConfig, {
     sandboxMode: "permissive" as const,
-    sandboxTransport: cliArgs.sandboxTransport ?? "auto",
+    sandboxTransport: cliArgs.sandboxTransport ?? (process.env.RLM_COMPILED === "1" ? "spawn" : "auto"),
     executeTimeoutMs: 300_000,
     setVarTimeoutMs: 5_000,
     getVarTimeoutMs: 5_000,
@@ -219,7 +220,7 @@ export const buildCliLayer = (cliArgs: CliArgs): Layer.Layer<Rlm, never, never> 
     maxFrameBytes: 32 * 1024 * 1024,
     maxBridgeConcurrency: 4,
     incomingFrameQueueCapacity: 2_048,
-    workerPath: new URL("./sandbox-worker.ts", import.meta.url).pathname
+    workerPath: resolveWorkerPath()
   })
   const traceConfigLayer = Layer.succeed(RunTraceConfig, makeCliTraceConfig(cliArgs))
 

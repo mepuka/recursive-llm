@@ -1,6 +1,7 @@
 import { Context, Effect, Layer, Scope } from "effect"
 import { SandboxError } from "./RlmError"
 import type { CallId } from "./RlmTypes"
+import { resolveWorkerPath } from "./WorkerPath"
 
 export interface SandboxConfigService {
   readonly sandboxMode: "permissive" | "strict"
@@ -62,7 +63,7 @@ export class SandboxConfig extends Context.Reference<SandboxConfig>()(
       maxFrameBytes: 32 * 1024 * 1024,
       maxBridgeConcurrency: 4,
       incomingFrameQueueCapacity: 2_048,
-      workerPath: new URL("./sandbox-worker.ts", import.meta.url).pathname
+      workerPath: resolveWorkerPath()
     })
   }
 ) {}

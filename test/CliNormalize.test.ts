@@ -25,7 +25,7 @@ const baseParsed: ParsedCliConfig = {
   maxLlmCalls: Option.none(),
   maxTotalTokens: Option.none(),
   maxTimeMs: Option.none(),
-  sandboxTransport: "auto",
+  sandboxTransport: Option.none(),
   noPromptCaching: false,
   noCache: false,
   quiet: false,
@@ -89,7 +89,6 @@ describe("CLI normalization", () => {
       maxDepth: 4,
       maxLlmCalls: 140,
       enablePromptCaching: false,
-      sandboxTransport: "auto",
       quiet: true,
       noColor: true,
       nlpTools: false,
@@ -232,7 +231,7 @@ describe("CLI normalization", () => {
         ],
         maxTotalTokens: Option.some(10_000),
         maxTimeMs: Option.some(60_000),
-        sandboxTransport: "worker"
+        sandboxTransport: Option.some("worker" as const)
       },
       [
         "query",

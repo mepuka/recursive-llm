@@ -76,7 +76,7 @@ const maxTimeMs = Options.integer("max-time-ms").pipe(
 )
 
 const sandboxTransport = Options.choice("sandbox-transport", SANDBOX_TRANSPORTS).pipe(
-  Options.withDefault("auto"),
+  Options.optional,
   Options.withDescription("Sandbox transport: auto, worker, spawn")
 )
 
