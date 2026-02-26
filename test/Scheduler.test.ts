@@ -50,10 +50,11 @@ const makeLayers = (options: {
   readonly responses: ReadonlyArray<FakeModelResponse>
   readonly modelMetrics?: FakeModelMetrics
   readonly sandboxMetrics?: FakeSandboxMetrics
+  readonly sandboxOptions?: { executeHandler?: (code: string, vars: Map<string, unknown>) => string }
   readonly config?: Partial<RlmConfigService>
 }) => {
   const model = makeFakeRlmModelLayer(options.responses, options.modelMetrics)
-  const sandbox = makeFakeSandboxFactoryLayer(options.sandboxMetrics)
+  const sandbox = makeFakeSandboxFactoryLayer(options.sandboxMetrics, options.sandboxOptions)
   const runtimeLayer = makeRuntimeWithBridgeStoreLayer()
   const core = Layer.mergeAll(model, sandbox, runtimeLayer)
   const llmCallLayer = Layer.provideMerge(LlmCallLive, core)
@@ -360,6 +361,129 @@ describe("Scheduler integration", () => {
       event._tag === "SchedulerWarning" && event.code === "MIXED_SUBMIT_AND_CODE"
     )
     expect(warning).toBeDefined()
+  })
+
+  test("MIXED_SUBMIT_AND_CODE with variable ref executes code first then resolves SUBMIT", async () => {
+    const sandboxMetrics: FakeSandboxMetrics = {
+      createCalls: 0,
+      executeCalls: 0,
+      snippets: []
+    }
+
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function*() {
+          const runtime = yield* RlmRuntime
+          const subscription = yield* PubSub.subscribe(runtime.events)
+
+          const answer = yield* runScheduler({
+            query: "compute and submit",
+            context: "ctx"
+          })
+
+          const events = yield* subscription.takeAll
+          return { answer, events: Chunk.toReadonlyArray(events) }
+        }).pipe(
+          Effect.provide(
+            makeLayers({
+              responses: [{
+                text: '```js\n__vars.finalAnswer = "computed-42"\n```',
+                toolCalls: [{
+                  name: "SUBMIT",
+                  params: { variable: "finalAnswer" }
+                }]
+              }],
+              sandboxMetrics,
+              sandboxOptions: {
+                executeHandler: (_code, vars) => {
+                  vars.set("finalAnswer", "computed-42")
+                  return "done"
+                }
+              }
+            })
+          )
+        )
+      )
+    )
+
+    // Code should have been executed first
+    expect(sandboxMetrics.executeCalls).toBe(1)
+    expect(sandboxMetrics.snippets[0]).toBe('__vars.finalAnswer = "computed-42"')
+    // SUBMIT should resolve the variable set by code execution
+    expect(result.answer).toEqual({ source: "answer", answer: "computed-42" })
+    // Should emit MIXED_SUBMIT_AND_CODE warning about executing code first
+    const warning = result.events.find((event) =>
+      event._tag === "SchedulerWarning" && event.code === "MIXED_SUBMIT_AND_CODE"
+    )
+    expect(warning).toBeDefined()
+    if (warning && warning._tag === "SchedulerWarning") {
+      expect(warning.message).toContain("executing code first")
+    }
+  })
+
+  test("MIXED_SUBMIT_AND_CODE with variable ref falls back when variable missing after execution", async () => {
+    const sandboxMetrics: FakeSandboxMetrics = {
+      createCalls: 0,
+      executeCalls: 0,
+      snippets: []
+    }
+
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function*() {
+          const runtime = yield* RlmRuntime
+          const subscription = yield* PubSub.subscribe(runtime.events)
+
+          const answer = yield* runScheduler({
+            query: "compute and submit",
+            context: "ctx"
+          }).pipe(Effect.either)
+
+          const events = yield* subscription.takeAll
+          return { answer, events: Chunk.toReadonlyArray(events) }
+        }).pipe(
+          Effect.provide(
+            makeLayers({
+              responses: [
+                // First: code + variable SUBMIT, but code doesn't set the variable
+                {
+                  text: '```js\n__vars.wrongName = "oops"\n```',
+                  toolCalls: [{
+                    name: "SUBMIT",
+                    params: { variable: "finalAnswer" }
+                  }]
+                },
+                // Second: model corrects itself with direct SUBMIT
+                submitAnswer("corrected-answer")
+              ],
+              sandboxMetrics,
+              sandboxOptions: {
+                executeHandler: (_code, vars) => {
+                  vars.set("wrongName", "oops")
+                  return "done"
+                }
+              }
+            })
+          )
+        )
+      )
+    )
+
+    // Code should have been executed
+    expect(sandboxMetrics.executeCalls).toBe(1)
+    // Should emit SUBMIT_RESOLVE_FAILED after code ran but variable was missing
+    const resolveFailedWarning = result.events.find((event) =>
+      event._tag === "SchedulerWarning" && event.code === "SUBMIT_RESOLVE_FAILED"
+    )
+    expect(resolveFailedWarning).toBeDefined()
+    if (resolveFailedWarning && resolveFailedWarning._tag === "SchedulerWarning") {
+      expect(resolveFailedWarning.message).toContain("after code execution")
+    }
+    // Model should get another chance and succeed with direct answer
+    expect(result.answer._tag).toBe("Right")
+    if (result.answer._tag === "Right") {
+      expect(result.answer.right).toEqual({ source: "answer", answer: "corrected-answer" })
+    }
   })
 
   test("tool-enabled generation degrades to text mode when tool path fails", async () => {

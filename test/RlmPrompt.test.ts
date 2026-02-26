@@ -304,7 +304,7 @@ describe("buildReplPrompt empty output hint", () => {
     const textContent = lastMsg.role === "user"
       ? (lastMsg.content as ReadonlyArray<{ readonly text: string }>)[0]!.text
       : ""
-    expect(textContent).toContain("(no output — did you forget to print?)")
+    expect(textContent).toContain("(no output — use print() to see results)")
   })
 
   test("non-empty executionOutput passes through", () => {

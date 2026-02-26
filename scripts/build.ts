@@ -17,7 +17,10 @@ const target = (process.argv[2] ?? "bun") as
   | "bun"
   | `bun-${string}`
 
-const root = resolve(import.meta.dirname!, "..")
+if (!import.meta.dirname) {
+  throw new Error("build.ts must be run as a file, not from eval/REPL")
+}
+const root = resolve(import.meta.dirname, "..")
 const dist = resolve(root, "dist")
 
 // Clean & create dist/
@@ -25,13 +28,13 @@ rmSync(dist, { recursive: true, force: true })
 mkdirSync(dist, { recursive: true })
 
 // 1. Bundle sandbox worker → dist/sandbox-worker.js
+// Entrypoint is sandbox-worker.ts, so default naming produces sandbox-worker.js
 console.log("Bundling sandbox-worker.js...")
 const workerResult = await Bun.build({
   entrypoints: [resolve(root, "src/sandbox-worker.ts")],
   outdir: dist,
   target: "bun",
   minify: true,
-  naming: "sandbox-worker.js",
 })
 
 if (!workerResult.success) {
@@ -44,6 +47,9 @@ if (!workerResult.success) {
 console.log("  → dist/sandbox-worker.js")
 
 // 2. Compile CLI binary → dist/rlm
+// __RLM_COMPILED__ is a build-time constant that WorkerPath.ts uses to
+// detect compiled mode. It is NOT a runtime env var — it gets inlined
+// as a string literal by the bundler's define pass.
 console.log(`Compiling rlm binary (target: ${target})...`)
 const compileArgs = [
   "bun", "build",
@@ -52,7 +58,7 @@ const compileArgs = [
   "--minify",
   "--target", target,
   "--outfile", resolve(dist, "rlm"),
-  "--define", "process.env.RLM_COMPILED='1'",
+  "--define", '__RLM_COMPILED__="1"',
 ]
 
 const proc = Bun.spawn(compileArgs, {

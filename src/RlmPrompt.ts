@@ -107,7 +107,7 @@ export const buildReplPrompt = (options: BuildReplPromptOptions): Prompt.Prompt 
     messages.push({ role: "assistant", content: trimmedResponse })
     if (entry.executionOutput !== undefined) {
       const outputText = entry.executionOutput === ""
-        ? "(no output — did you forget to print?)"
+        ? "(no output — use print() to see results)"
         : entry.executionOutput
       messages.push({
         role: "user",

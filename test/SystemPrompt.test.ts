@@ -289,6 +289,29 @@ describe("SystemPrompt", () => {
     expect(prompt).toContain("Strict mode: bridge calls are disabled")
   })
 
+  test("REPL prompt includes File System & Shell section in permissive mode", () => {
+    const prompt = buildReplSystemPrompt(baseOptions)
+    expect(prompt).toContain("## File System & Shell")
+    expect(prompt).toContain("await readFile")
+    expect(prompt).toContain("await writeFile")
+    expect(prompt).toContain("await listDir")
+    expect(prompt).toContain("await stat")
+    expect(prompt).toContain("await mkdir")
+    expect(prompt).toContain("await remove")
+    expect(prompt).toContain("await exists")
+    expect(prompt).toContain("await shell")
+    expect(prompt).toContain("cwd()")
+    expect(prompt).toContain("sh -c")
+    expect(prompt).toContain("auto-cleaned")
+  })
+
+  test("strict mode suppresses File System & Shell section", () => {
+    const prompt = buildReplSystemPrompt({ ...baseOptions, sandboxMode: "strict" })
+    expect(prompt).not.toContain("## File System & Shell")
+    expect(prompt).not.toContain("await readFile")
+    expect(prompt).not.toContain("await shell")
+  })
+
   test("strict mode suppresses tools section", () => {
     const prompt = buildReplSystemPrompt({
       ...baseOptions,
@@ -605,7 +628,7 @@ describe("SystemPrompt", () => {
       ]
     })
     expect(prompt).toContain("auto-detects format")
-    expect(prompt).toContain("NDJSON, JSON array, CSV, and TSV")
+    expect(prompt).toContain("NDJSON, JSON array, CSV, TSV, and plain-text")
   })
 
   test("REPL prompt shows detected primaryTextField in context guidance", () => {

@@ -26,7 +26,8 @@ const InitPayloadSchema = {
     Schema.positive(),
     Schema.lessThanOrEqualTo(64 * 1024 * 1024)
   )),
-  tools: Schema.optional(Schema.Array(ToolDescriptorSchema))
+  tools: Schema.optional(Schema.Array(ToolDescriptorSchema)),
+  sandboxWorkDir: Schema.optional(Schema.String)
 }
 
 export const RunnerWorkerFrame = Schema.Union(

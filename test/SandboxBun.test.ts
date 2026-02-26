@@ -633,4 +633,702 @@ describe("SandboxBun", () => {
       }
     }
   }, 15_000)
+
+  // --- FS/Shell integration tests ---
+
+  test("writeFile then readFile round-trip", async () => {
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function*() {
+          const factory = yield* SandboxFactory
+          const sandbox = yield* factory.create({ callId: "fs-rw" as CallId, depth: 0 })
+          return yield* sandbox.execute(`
+            await writeFile("test.txt", "hello world")
+            const content = await readFile("test.txt")
+            print(content)
+          `)
+        })
+      ).pipe(Effect.provide(makeTestLayer()))
+    )
+    expect(result).toBe("hello world")
+  })
+
+  test("listDir returns written files", async () => {
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function*() {
+          const factory = yield* SandboxFactory
+          const sandbox = yield* factory.create({ callId: "fs-list" as CallId, depth: 0 })
+          return yield* sandbox.execute(`
+            await writeFile("a.txt", "aaa")
+            await writeFile("b.txt", "bbb")
+            const files = await listDir()
+            print(JSON.stringify(files.sort()))
+          `)
+        })
+      ).pipe(Effect.provide(makeTestLayer()))
+    )
+    expect(JSON.parse(result)).toEqual(["a.txt", "b.txt"])
+  })
+
+  test("stat returns correct type and size", async () => {
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function*() {
+          const factory = yield* SandboxFactory
+          const sandbox = yield* factory.create({ callId: "fs-stat" as CallId, depth: 0 })
+          return yield* sandbox.execute(`
+            await writeFile("data.json", '{"key":"value"}')
+            const info = await stat("data.json")
+            print(info.type + "," + info.size)
+          `)
+        })
+      ).pipe(Effect.provide(makeTestLayer()))
+    )
+    expect(result).toBe("File,15")
+  })
+
+  test("mkdir + exists round-trip", async () => {
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function*() {
+          const factory = yield* SandboxFactory
+          const sandbox = yield* factory.create({ callId: "fs-mkdir" as CallId, depth: 0 })
+          return yield* sandbox.execute(`
+            await mkdir("sub/nested")
+            const e = await exists("sub/nested")
+            print(String(e))
+          `)
+        })
+      ).pipe(Effect.provide(makeTestLayer()))
+    )
+    expect(result).toBe("true")
+  })
+
+  test("remove deletes file", async () => {
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function*() {
+          const factory = yield* SandboxFactory
+          const sandbox = yield* factory.create({ callId: "fs-rm" as CallId, depth: 0 })
+          return yield* sandbox.execute(`
+            await writeFile("temp.txt", "data")
+            await remove("temp.txt")
+            const e = await exists("temp.txt")
+            print(String(e))
+          `)
+        })
+      ).pipe(Effect.provide(makeTestLayer()))
+    )
+    expect(result).toBe("false")
+  })
+
+  test("shell echo returns stdout", async () => {
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function*() {
+          const factory = yield* SandboxFactory
+          const sandbox = yield* factory.create({ callId: "sh-echo" as CallId, depth: 0 })
+          return yield* sandbox.execute(`
+            const r = await shell("echo hello")
+            print(r.stdout.trim() + "," + r.exitCode)
+          `)
+        })
+      ).pipe(Effect.provide(makeTestLayer()))
+    )
+    expect(result).toBe("hello,0")
+  })
+
+  test("shell exit 1 returns non-zero exitCode", async () => {
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function*() {
+          const factory = yield* SandboxFactory
+          const sandbox = yield* factory.create({ callId: "sh-exit" as CallId, depth: 0 })
+          return yield* sandbox.execute(`
+            const r = await shell("exit 1")
+            print(String(r.exitCode))
+          `)
+        })
+      ).pipe(Effect.provide(makeTestLayer()))
+    )
+    expect(result).toBe("1")
+  })
+
+  test("shell timeout fires on long-running command", async () => {
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function*() {
+          const factory = yield* SandboxFactory
+          const sandbox = yield* factory.create({ callId: "sh-timeout" as CallId, depth: 0 })
+          return yield* sandbox.execute(`
+            try {
+              await shell("sleep 60", { timeout: 500 })
+              print("no-timeout")
+            } catch (e) {
+              print("timeout:" + e.message)
+            }
+          `)
+        })
+      ).pipe(Effect.provide(makeTestLayer()))
+    )
+    expect(result).toContain("timeout:")
+    expect(result).toContain("timed out")
+  }, 15_000)
+
+  test("readFile path escape attempt throws", async () => {
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function*() {
+          const factory = yield* SandboxFactory
+          const sandbox = yield* factory.create({ callId: "fs-escape" as CallId, depth: 0 })
+          return yield* sandbox.execute(`
+            try {
+              await readFile("../../etc/passwd")
+              print("escaped!")
+            } catch (e) {
+              print("blocked:" + e.message)
+            }
+          `)
+        })
+      ).pipe(Effect.provide(makeTestLayer()))
+    )
+    expect(result).toContain("blocked:")
+    expect(result).toContain("Path escapes sandbox")
+  })
+
+  test("strict mode: FS bindings throw appropriate error", async () => {
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function*() {
+          const factory = yield* SandboxFactory
+          const sandbox = yield* factory.create({ callId: "fs-strict" as CallId, depth: 0 })
+          return yield* sandbox.execute(`
+            try {
+              await readFile("test.txt")
+              print("allowed!")
+            } catch (e) {
+              print("caught:" + e.message)
+            }
+          `)
+        })
+      ).pipe(Effect.provide(makeTestLayer(undefined, { sandboxMode: "strict" })))
+    )
+    expect(result).toContain("caught:")
+    expect(result).toContain("not available in strict sandbox mode")
+  })
+
+  test("cwd returns dot", async () => {
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function*() {
+          const factory = yield* SandboxFactory
+          const sandbox = yield* factory.create({ callId: "fs-cwd" as CallId, depth: 0 })
+          return yield* sandbox.execute("print(cwd())")
+        })
+      ).pipe(Effect.provide(makeTestLayer()))
+    )
+    expect(result).toBe(".")
+  })
+
+  test("writeFile auto-creates parent directories", async () => {
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function*() {
+          const factory = yield* SandboxFactory
+          const sandbox = yield* factory.create({ callId: "fs-nested" as CallId, depth: 0 })
+          return yield* sandbox.execute(`
+            await writeFile("deep/nested/dir/file.txt", "nested content")
+            const content = await readFile("deep/nested/dir/file.txt")
+            print(content)
+          `)
+        })
+      ).pipe(Effect.provide(makeTestLayer()))
+    )
+    expect(result).toBe("nested content")
+  })
+
+  test("files persist across executions within same sandbox", async () => {
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function*() {
+          const factory = yield* SandboxFactory
+          const sandbox = yield* factory.create({ callId: "fs-persist" as CallId, depth: 0 })
+          yield* sandbox.execute('await writeFile("persist.txt", "iter1")')
+          return yield* sandbox.execute(`
+            const content = await readFile("persist.txt")
+            print(content)
+          `)
+        })
+      ).pipe(Effect.provide(makeTestLayer()))
+    )
+    expect(result).toBe("iter1")
+  })
+
+  test("shell writes file readable by FS bindings", async () => {
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function*() {
+          const factory = yield* SandboxFactory
+          const sandbox = yield* factory.create({ callId: "sh-fs" as CallId, depth: 0 })
+          return yield* sandbox.execute(`
+            await shell("echo 'shell wrote this' > output.txt")
+            const content = await readFile("output.txt")
+            print(content.trim())
+          `)
+        })
+      ).pipe(Effect.provide(makeTestLayer()))
+    )
+    expect(result).toBe("shell wrote this")
+  })
+
+  test("symlink escape blocked by readFile", async () => {
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function*() {
+          const factory = yield* SandboxFactory
+          const sandbox = yield* factory.create({ callId: "symlink-read" as CallId, depth: 0 })
+          return yield* sandbox.execute(`
+            await shell("ln -s /tmp escape-link")
+            try {
+              await readFile("escape-link")
+              print("escaped!")
+            } catch (e) {
+              print("blocked:" + e.message)
+            }
+          `)
+        })
+      ).pipe(Effect.provide(makeTestLayer()))
+    )
+    expect(result).toContain("blocked:")
+    expect(result).toContain("Symlink escapes sandbox")
+  })
+
+  test("symlink escape blocked by writeFile", async () => {
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function*() {
+          const factory = yield* SandboxFactory
+          const sandbox = yield* factory.create({ callId: "symlink-write" as CallId, depth: 0 })
+          return yield* sandbox.execute(`
+            await shell("mkdir -p legit && ln -s /tmp legit/escape")
+            try {
+              await writeFile("legit/escape/pwned.txt", "gotcha")
+              print("escaped!")
+            } catch (e) {
+              print("blocked:" + e.message)
+            }
+          `)
+        })
+      ).pipe(Effect.provide(makeTestLayer()))
+    )
+    expect(result).toContain("blocked:")
+    expect(result).toContain("Symlink escapes sandbox")
+  })
+
+  test("symlink escape blocked by listDir", async () => {
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function*() {
+          const factory = yield* SandboxFactory
+          const sandbox = yield* factory.create({ callId: "symlink-list" as CallId, depth: 0 })
+          return yield* sandbox.execute(`
+            await shell("ln -s /tmp escape-dir")
+            try {
+              await listDir("escape-dir")
+              print("escaped!")
+            } catch (e) {
+              print("blocked:" + e.message)
+            }
+          `)
+        })
+      ).pipe(Effect.provide(makeTestLayer()))
+    )
+    expect(result).toContain("blocked:")
+    expect(result).toContain("Symlink escapes sandbox")
+  })
+
+  test("symlink escape blocked by stat", async () => {
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function*() {
+          const factory = yield* SandboxFactory
+          const sandbox = yield* factory.create({ callId: "symlink-stat" as CallId, depth: 0 })
+          return yield* sandbox.execute(`
+            await shell("ln -s /etc/hosts escape-stat")
+            try {
+              await stat("escape-stat")
+              print("escaped!")
+            } catch (e) {
+              print("blocked:" + e.message)
+            }
+          `)
+        })
+      ).pipe(Effect.provide(makeTestLayer()))
+    )
+    expect(result).toContain("blocked:")
+    expect(result).toContain("Symlink escapes sandbox")
+  })
+
+  test("symlink escape blocked by exists", async () => {
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function*() {
+          const factory = yield* SandboxFactory
+          const sandbox = yield* factory.create({ callId: "symlink-exists" as CallId, depth: 0 })
+          return yield* sandbox.execute(`
+            await shell("ln -s /etc/hosts escape-exists")
+            try {
+              await exists("escape-exists")
+              print("escaped!")
+            } catch (e) {
+              print("blocked:" + e.message)
+            }
+          `)
+        })
+      ).pipe(Effect.provide(makeTestLayer()))
+    )
+    expect(result).toContain("blocked:")
+    expect(result).toContain("Symlink escapes sandbox")
+  })
+
+  test("symlink escape blocked by remove", async () => {
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function*() {
+          const factory = yield* SandboxFactory
+          const sandbox = yield* factory.create({ callId: "symlink-remove" as CallId, depth: 0 })
+          return yield* sandbox.execute(`
+            await shell("ln -s /tmp escape-rm")
+            try {
+              await remove("escape-rm")
+              print("escaped!")
+            } catch (e) {
+              print("blocked:" + e.message)
+            }
+          `)
+        })
+      ).pipe(Effect.provide(makeTestLayer()))
+    )
+    expect(result).toContain("blocked:")
+    expect(result).toContain("Symlink escapes sandbox")
+  })
+
+  // --- Real-world workflow tests ---
+
+  test("grep through files: write multiple files then grep for pattern", async () => {
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function*() {
+          const factory = yield* SandboxFactory
+          const sandbox = yield* factory.create({ callId: "grep-flow" as CallId, depth: 0 })
+          return yield* sandbox.execute(`
+            await writeFile("log1.txt", "2025-01-01 ERROR connection timeout\\n2025-01-01 INFO started")
+            await writeFile("log2.txt", "2025-01-02 WARN disk 80%\\n2025-01-02 ERROR out of memory")
+            await writeFile("log3.txt", "2025-01-03 INFO healthy\\n2025-01-03 INFO request ok")
+            const { stdout } = await shell("grep -rn ERROR .")
+            const lines = stdout.trim().split("\\n").sort()
+            print(JSON.stringify(lines))
+          `)
+        })
+      ).pipe(Effect.provide(makeTestLayer()))
+    )
+    const lines = JSON.parse(result)
+    expect(lines).toHaveLength(2)
+    expect(lines.some((l: string) => l.includes("connection timeout"))).toBe(true)
+    expect(lines.some((l: string) => l.includes("out of memory"))).toBe(true)
+  })
+
+  test("grep with regex and count: filter structured log data", async () => {
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function*() {
+          const factory = yield* SandboxFactory
+          const sandbox = yield* factory.create({ callId: "grep-regex" as CallId, depth: 0 })
+          return yield* sandbox.execute(`
+            const logLines = Array.from({ length: 20 }, (_, i) => {
+              const level = i % 5 === 0 ? "ERROR" : i % 3 === 0 ? "WARN" : "INFO"
+              return "2025-01-" + String(i + 1).padStart(2, "0") + " " + level + " event " + i
+            })
+            await writeFile("app.log", logLines.join("\\n"))
+            const { stdout: errorCount } = await shell("grep -c ERROR app.log")
+            const { stdout: warnCount } = await shell("grep -c WARN app.log")
+            print(errorCount.trim() + "," + warnCount.trim())
+          `)
+        })
+      ).pipe(Effect.provide(makeTestLayer()))
+    )
+    expect(result).toBe("4,5")
+  })
+
+  test("shell pipe: write JSON, filter with grep, process with shell pipeline", async () => {
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function*() {
+          const factory = yield* SandboxFactory
+          const sandbox = yield* factory.create({ callId: "shell-pipe" as CallId, depth: 0 })
+          return yield* sandbox.execute(`
+            const records = [
+              { id: 1, name: "Alice", role: "admin" },
+              { id: 2, name: "Bob", role: "user" },
+              { id: 3, name: "Carol", role: "admin" },
+              { id: 4, name: "Dave", role: "user" }
+            ]
+            await writeFile("users.jsonl", records.map(r => JSON.stringify(r)).join("\\n"))
+            const { stdout } = await shell("grep admin users.jsonl | wc -l")
+            print(stdout.trim())
+          `)
+        })
+      ).pipe(Effect.provide(makeTestLayer()))
+    )
+    expect(result).toBe("2")
+  })
+
+  test("CSV processing: write CSV, use shell awk/sort to extract data", async () => {
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function*() {
+          const factory = yield* SandboxFactory
+          const sandbox = yield* factory.create({ callId: "csv-process" as CallId, depth: 0 })
+          return yield* sandbox.execute(`
+            const csv = [
+              "name,score,grade",
+              "Alice,95,A",
+              "Bob,78,B",
+              "Carol,92,A",
+              "Dave,65,D",
+              "Eve,88,B"
+            ].join("\\n")
+            await writeFile("scores.csv", csv)
+            // Extract names with grade A, sorted
+            const { stdout } = await shell("grep ',A$' scores.csv | cut -d, -f1 | sort")
+            print(stdout.trim())
+          `)
+        })
+      ).pipe(Effect.provide(makeTestLayer()))
+    )
+    expect(result).toBe("Alice\nCarol")
+  })
+
+  test("multi-step data pipeline: write, transform, read back", async () => {
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function*() {
+          const factory = yield* SandboxFactory
+          const sandbox = yield* factory.create({ callId: "pipeline" as CallId, depth: 0 })
+          return yield* sandbox.execute(`
+            // Step 1: Create structured data
+            const data = {
+              articles: [
+                { id: 1, title: "Effect TS Guide", tags: ["typescript", "fp"] },
+                { id: 2, title: "React Hooks", tags: ["react", "frontend"] },
+                { id: 3, title: "Bun Runtime", tags: ["typescript", "runtime"] }
+              ]
+            }
+            await writeFile("data.json", JSON.stringify(data, null, 2))
+
+            // Step 2: Use shell to verify file written correctly
+            const { stdout: wcOut } = await shell("wc -l < data.json")
+            const lineCount = parseInt(wcOut.trim())
+
+            // Step 3: Read back and filter in JS
+            const raw = await readFile("data.json")
+            const parsed = JSON.parse(raw)
+            const tsArticles = parsed.articles.filter(a => a.tags.includes("typescript"))
+
+            // Step 4: Write filtered results
+            await writeFile("filtered.json", JSON.stringify(tsArticles))
+
+            // Step 5: Verify with stat
+            const info = await stat("filtered.json")
+            print(tsArticles.length + "," + info.type + "," + (lineCount > 5))
+          `)
+        })
+      ).pipe(Effect.provide(makeTestLayer()))
+    )
+    expect(result).toBe("2,File,true")
+  })
+
+  test("find + grep workflow: nested directory search", async () => {
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function*() {
+          const factory = yield* SandboxFactory
+          const sandbox = yield* factory.create({ callId: "find-grep" as CallId, depth: 0 })
+          return yield* sandbox.execute(`
+            await mkdir("src")
+            await mkdir("test")
+            await mkdir("docs")
+            await writeFile("src/main.ts", "export function hello() { return 'world' }")
+            await writeFile("src/util.ts", "export function add(a: number, b: number) { return a + b }")
+            await writeFile("test/main.test.ts", "import { hello } from '../src/main'\\ntest('hello', () => {})")
+            await writeFile("docs/readme.txt", "No code here, just docs about hello")
+
+            // Find all .ts files containing "hello"
+            const { stdout } = await shell("find . -name '*.ts' -exec grep -l hello {} \\\\;")
+            const files = stdout.trim().split("\\n").sort()
+            print(JSON.stringify(files))
+          `)
+        })
+      ).pipe(Effect.provide(makeTestLayer()))
+    )
+    const files = JSON.parse(result)
+    expect(files).toHaveLength(2)
+    expect(files).toContain("./src/main.ts")
+    expect(files).toContain("./test/main.test.ts")
+  })
+
+  test("iterative refinement: write intermediate results across executions", async () => {
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function*() {
+          const factory = yield* SandboxFactory
+          const sandbox = yield* factory.create({ callId: "iterative" as CallId, depth: 0 })
+
+          // Iteration 1: Explore data
+          yield* sandbox.execute(`
+            const rawData = [
+              "apple 5", "banana 3", "cherry 8", "date 2",
+              "elderberry 6", "fig 1", "grape 4", "honeydew 7"
+            ]
+            await writeFile("raw.txt", rawData.join("\\n") + "\\n")
+            // Exploration: count items
+            const { stdout } = await shell("wc -l < raw.txt")
+            await writeFile("meta.json", JSON.stringify({ totalItems: parseInt(stdout.trim()) }))
+          `)
+
+          // Iteration 2: Filter based on exploration
+          yield* sandbox.execute(`
+            const meta = JSON.parse(await readFile("meta.json"))
+            const { stdout } = await shell("awk '$2 >= 5' raw.txt | sort -k2 -rn")
+            await writeFile("filtered.txt", stdout.trim())
+          `)
+
+          // Iteration 3: Read final results
+          return yield* sandbox.execute(`
+            const filtered = await readFile("filtered.txt")
+            const meta = JSON.parse(await readFile("meta.json"))
+            const resultLines = filtered.split("\\n")
+            print(meta.totalItems + ":" + resultLines.length)
+          `)
+        })
+      ).pipe(Effect.provide(makeTestLayer()))
+    )
+    expect(result).toBe("8:4")
+  })
+
+  test("shell stderr capture: command that produces both stdout and stderr", async () => {
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function*() {
+          const factory = yield* SandboxFactory
+          const sandbox = yield* factory.create({ callId: "stderr" as CallId, depth: 0 })
+          return yield* sandbox.execute(`
+            const r = await shell("echo out-msg; echo err-msg >&2")
+            print(r.stdout.trim() + "|" + r.stderr.trim() + "|" + r.exitCode)
+          `)
+        })
+      ).pipe(Effect.provide(makeTestLayer()))
+    )
+    expect(result).toBe("out-msg|err-msg|0")
+  })
+
+  test("shell cwd option: run command in subdirectory", async () => {
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function*() {
+          const factory = yield* SandboxFactory
+          const sandbox = yield* factory.create({ callId: "shell-cwd" as CallId, depth: 0 })
+          return yield* sandbox.execute(`
+            await mkdir("subproject")
+            await writeFile("subproject/data.txt", "sub-content")
+            const { stdout } = await shell("cat data.txt", { cwd: "subproject" })
+            print(stdout.trim())
+          `)
+        })
+      ).pipe(Effect.provide(makeTestLayer()))
+    )
+    expect(result).toBe("sub-content")
+  })
+
+  test("large file handling: write and grep through substantial content", async () => {
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function*() {
+          const factory = yield* SandboxFactory
+          const sandbox = yield* factory.create({ callId: "large-file" as CallId, depth: 0 })
+          return yield* sandbox.execute(`
+            // Generate 1000 log lines, seed a few needles
+            const lines = []
+            for (let i = 0; i < 1000; i++) {
+              if (i === 137 || i === 555 || i === 899) {
+                lines.push("line-" + i + " CRITICAL system failure detected")
+              } else {
+                lines.push("line-" + i + " INFO normal operation")
+              }
+            }
+            await writeFile("big.log", lines.join("\\n"))
+
+            // Use grep to find the needles
+            const { stdout } = await shell("grep -n CRITICAL big.log")
+            const hits = stdout.trim().split("\\n")
+            print(hits.length + ":" + hits.map(h => h.split(":")[0]).join(","))
+          `)
+        })
+      ).pipe(Effect.provide(makeTestLayer()))
+    )
+    // 3 CRITICAL lines at line numbers 138, 556, 900 (1-indexed)
+    expect(result).toBe("3:138,556,900")
+  })
+
+  test("FS error handling: readFile on missing file produces catchable error", async () => {
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function*() {
+          const factory = yield* SandboxFactory
+          const sandbox = yield* factory.create({ callId: "fs-error" as CallId, depth: 0 })
+          return yield* sandbox.execute(`
+            try {
+              await readFile("nonexistent.txt")
+              print("no-error")
+            } catch (e) {
+              // LLM should be able to handle missing files gracefully
+              const fallback = "default data"
+              await writeFile("nonexistent.txt", fallback)
+              const content = await readFile("nonexistent.txt")
+              print("recovered:" + content)
+            }
+          `)
+        })
+      ).pipe(Effect.provide(makeTestLayer()))
+    )
+    expect(result).toBe("recovered:default data")
+  })
+
+  test("shell + FS interop: use shell to generate data, process with JS, write results", async () => {
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function*() {
+          const factory = yield* SandboxFactory
+          const sandbox = yield* factory.create({ callId: "interop-full" as CallId, depth: 0 })
+          return yield* sandbox.execute(`
+            // Use shell to generate a sequence
+            const { stdout } = await shell("seq 1 20")
+            const numbers = stdout.trim().split("\\n").map(Number)
+
+            // Process in JS
+            const evens = numbers.filter(n => n % 2 === 0)
+            const sum = evens.reduce((a, b) => a + b, 0)
+            await writeFile("evens.json", JSON.stringify({ evens, sum }))
+
+            // Verify with shell
+            const { stdout: catOut } = await shell("cat evens.json")
+            const verified = JSON.parse(catOut)
+            print(verified.sum + "," + verified.evens.length)
+          `)
+        })
+      ).pipe(Effect.provide(makeTestLayer()))
+    )
+    expect(result).toBe("110,10")
+  })
 })

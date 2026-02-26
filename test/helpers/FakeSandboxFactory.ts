@@ -8,7 +8,8 @@ export interface FakeSandboxMetrics {
 }
 
 export const makeFakeSandboxFactoryLayer = (
-  metrics?: FakeSandboxMetrics
+  metrics?: FakeSandboxMetrics,
+  options?: { executeHandler?: (code: string, vars: Map<string, unknown>) => string }
 ): Layer.Layer<SandboxFactory> =>
   Layer.succeed(
     SandboxFactory,
@@ -25,6 +26,9 @@ export const makeFakeSandboxFactoryLayer = (
             metrics?.snippets.push(code)
             if (metrics) {
               metrics.executeCalls += 1
+            }
+            if (options?.executeHandler) {
+              return options.executeHandler(code, vars)
             }
             return `executed:${code.length}`
           }),

@@ -1,5 +1,6 @@
-import { Deferred, Effect, Ref, Scope } from "effect"
+import { Deferred, Effect, Option, Ref, Scope } from "effect"
 import type { SandboxInstance, VariableMetadata } from "./Sandbox"
+import type { SubmitPayload } from "./SubmitTool"
 import type { BridgeRequestId, CallId, MediaAttachment } from "./RlmTypes"
 import { TranscriptEntry } from "./RlmTypes"
 import type { RlmToolAny } from "./RlmTool"
@@ -37,6 +38,7 @@ export interface CallContext {
   readonly variableSnapshot: Ref.Ref<VariableSnapshot>
   readonly consecutiveStalls: Ref.Ref<number>
   readonly codeExecuted: Ref.Ref<boolean>
+  readonly pendingSubmit: Ref.Ref<Option.Option<{ payload: SubmitPayload; rawResponse: string }>>
 }
 
 export interface MakeCallContextOptions {
@@ -70,6 +72,7 @@ export const makeCallContext = (options: MakeCallContextOptions): Effect.Effect<
     })
     const consecutiveStalls = yield* Ref.make(0)
     const codeExecuted = yield* Ref.make(false)
+    const pendingSubmit = yield* Ref.make<Option.Option<{ payload: SubmitPayload; rawResponse: string }>>(Option.none())
 
     return {
       ...options,
@@ -77,7 +80,8 @@ export const makeCallContext = (options: MakeCallContextOptions): Effect.Effect<
       transcript,
       variableSnapshot,
       consecutiveStalls,
-      codeExecuted
+      codeExecuted,
+      pendingSubmit
     }
   })
 
@@ -131,3 +135,15 @@ export const attachExecutionOutput = (
     })
     return next
   })
+
+export const setPendingSubmit = (
+  ctx: CallContext,
+  payload: SubmitPayload,
+  rawResponse: string
+): Effect.Effect<void> =>
+  Ref.set(ctx.pendingSubmit, Option.some({ payload, rawResponse }))
+
+export const takePendingSubmit = (
+  ctx: CallContext
+): Effect.Effect<Option.Option<{ payload: SubmitPayload; rawResponse: string }>> =>
+  Ref.getAndSet(ctx.pendingSubmit, Option.none())

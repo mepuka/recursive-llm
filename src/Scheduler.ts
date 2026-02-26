@@ -10,7 +10,9 @@ import {
   markCodeExecuted,
   readIteration,
   readTranscript,
-  resetConsecutiveStalls
+  resetConsecutiveStalls,
+  setPendingSubmit,
+  takePendingSubmit
 } from "./CallContext"
 import type { CallContext } from "./CallContext"
 import { extractCodeBlock } from "./CodeExtractor"
@@ -734,7 +736,23 @@ const runSchedulerInternal = Effect.fn("Scheduler.runInternal")(function*(option
       })
       const code = extractCodeBlock(response.text)
       if (submitAnswer._tag === "Found") {
+        if (code !== null && submitAnswer.value.source === "variable") {
+          // Variable-referencing SUBMIT + code: execute code first, resolve SUBMIT after
+          yield* publishSchedulerWarning({
+            code: "MIXED_SUBMIT_AND_CODE",
+            message: "Model returned both SUBMIT and executable code; executing code first, then resolving SUBMIT variable",
+            callId: callState.callId,
+            commandTag: command._tag
+          })
+          yield* setPendingSubmit(callState, submitAnswer.value, response.text)
+          yield* resetConsecutiveStalls(callState)
+          yield* appendTranscript(callState, response.text)
+          yield* incrementIteration(callState)
+          yield* enqueue(RlmCommand.ExecuteCode({ callId: callState.callId, code }))
+          return
+        }
         if (code !== null) {
+          // Direct SUBMIT (answer/value) + code: skip code, resolve immediately
           yield* publishSchedulerWarning({
             code: "MIXED_SUBMIT_AND_CODE",
             message: "Model returned both SUBMIT and executable code; prioritizing SUBMIT and ignoring code block",
@@ -980,6 +998,34 @@ const runSchedulerInternal = Effect.fn("Scheduler.runInternal")(function*(option
             Effect.logDebug(`Trace variable snapshot write failed: ${String(error)}`))
         )
       )
+
+      const pending = yield* takePendingSubmit(callState)
+      if (Option.isSome(pending)) {
+        const { payload, rawResponse } = pending.value
+        const resolvedSubmit = yield* resolveSubmitPayload(callState, payload, rawResponse).pipe(
+          Effect.catchAll((error: OutputValidationError) =>
+            Effect.gen(function*() {
+              yield* publishSchedulerWarning({
+                code: "SUBMIT_RESOLVE_FAILED",
+                message: `SUBMIT variable resolution failed after code execution: ${error.message}; feeding error back to model for self-correction.`,
+                callId: command.callId,
+                commandTag: command._tag
+              })
+              yield* attachExecutionOutput(callState,
+                `\u2717 SUBMIT rejected: ${error.message}\nFix your __vars assignment with code first, then call SUBMIT. Do NOT retry SUBMIT immediately — write a \`\`\`js code block to fix the issue.`
+              )
+              yield* enqueue(RlmCommand.GenerateStep({ callId: command.callId }))
+              return undefined
+            })
+          )
+        )
+        if (resolvedSubmit === undefined) return
+        yield* enqueue(RlmCommand.Finalize({
+          callId: callState.callId,
+          payload: resolvedSubmit
+        }))
+        return
+      }
 
       yield* enqueue(RlmCommand.GenerateStep({ callId: command.callId }))
     })

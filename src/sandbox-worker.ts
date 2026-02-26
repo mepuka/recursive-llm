@@ -1,6 +1,10 @@
 import { WorkerRunner } from "@effect/platform"
-import { BunWorkerRunner } from "@effect/platform-bun"
-import { Effect, Schema, Stream } from "effect"
+import { BunContext, BunWorkerRunner } from "@effect/platform-bun"
+import { Command, FileSystem } from "@effect/platform"
+import { Duration, Effect, Fiber, ManagedRuntime, Option, Schema, Stream } from "effect"
+import * as nodePath from "node:path"
+import * as nodeFs from "node:fs"
+import { clampPath } from "./SandboxPathClamp"
 import {
   RunnerBridgeFailedRequest,
   RunnerBridgeResultRequest,
@@ -32,6 +36,15 @@ let workerDepth = 0
 let sandboxMode: "permissive" | "strict" = "permissive"
 let hasMediaAttachments = false
 let toolNames: ReadonlyArray<string> = []
+let sandboxWorkDir: string | null = null
+let platformRuntime: ManagedRuntime.ManagedRuntime<BunContext.BunContext, never> | null = null
+
+const getPlatformRuntime = () => {
+  if (!platformRuntime) {
+    platformRuntime = ManagedRuntime.make(BunContext.layer)
+  }
+  return platformRuntime
+}
 
 const hasProcessIpc =
   typeof process !== "undefined" &&
@@ -111,7 +124,7 @@ const makeStrictScope = (
     init_corpus,
     init_corpus_from_context,
     undefined,
-    // Tool functions
+    // Tool functions (includes FS/shell bindings from injectedHelpers)
     ...tools,
 
     // Common JS built-ins
@@ -619,6 +632,219 @@ async function executeCode(
     return learnIntoCorpus(sourceDocuments, normalizedOptions as InitCorpusOptions)
   }
 
+  // --- FS/shell scope bindings ---
+
+  const fsStrictGuard = () => {
+    if (sandboxMode === "strict" || sandboxWorkDir === null) {
+      throw new Error("File system operations not available in strict sandbox mode")
+    }
+  }
+
+  const mapPlatformError = (path: string) => (e: unknown) => {
+    if (typeof e === "object" && e !== null && "_tag" in e) {
+      const tagged = e as { _tag: string; reason?: string; message?: string }
+      if (tagged._tag === "SystemError") {
+        return new Error(`${tagged.reason ?? "SystemError"}: ${tagged.message ?? path}`)
+      }
+      if (tagged._tag === "BadArgument") {
+        return new Error(tagged.message ?? "Bad argument")
+      }
+    }
+    return e instanceof Error ? e : new Error(String(e))
+  }
+
+  /** Resolve realPath and verify it stays within sandboxWorkDir. */
+  const assertContained = (resolvedPath: string, fs: FileSystem.FileSystem): Effect.Effect<void, Error> =>
+    Effect.gen(function*() {
+      const real = yield* fs.realPath(resolvedPath).pipe(
+        Effect.catchTag("SystemError", () => Effect.succeed(resolvedPath))
+      )
+      if (real !== sandboxWorkDir! && !real.startsWith(sandboxWorkDir! + nodePath.sep)) {
+        yield* Effect.fail(new Error(`Symlink escapes sandbox: ${resolvedPath}`))
+      }
+    })
+
+  const readFile = async (path: string): Promise<string> => {
+    fsStrictGuard()
+    const clamped = clampPath(path, sandboxWorkDir!)
+    try {
+      return await getPlatformRuntime().runPromise(
+        Effect.gen(function*() {
+          const fs = yield* FileSystem.FileSystem
+          yield* assertContained(clamped, fs)
+          return yield* fs.readFileString(clamped)
+        })
+      )
+    } catch (e) {
+      throw mapPlatformError(path)(e)
+    }
+  }
+
+  const writeFile = async (path: string, content: string): Promise<void> => {
+    fsStrictGuard()
+    const clamped = clampPath(path, sandboxWorkDir!)
+    try {
+      await getPlatformRuntime().runPromise(
+        Effect.gen(function*() {
+          const fs = yield* FileSystem.FileSystem
+          const dir = nodePath.dirname(clamped)
+          if (dir !== sandboxWorkDir) {
+            yield* fs.makeDirectory(dir, { recursive: true })
+          }
+          yield* assertContained(dir, fs)
+          yield* fs.writeFileString(clamped, content)
+        })
+      )
+    } catch (e) {
+      throw mapPlatformError(path)(e)
+    }
+  }
+
+  const listDir = async (path?: string): Promise<string[]> => {
+    fsStrictGuard()
+    const clamped = path !== undefined ? clampPath(path, sandboxWorkDir!) : sandboxWorkDir!
+    try {
+      return await getPlatformRuntime().runPromise(
+        Effect.gen(function*() {
+          const fs = yield* FileSystem.FileSystem
+          yield* assertContained(clamped, fs)
+          return yield* fs.readDirectory(clamped)
+        })
+      )
+    } catch (e) {
+      throw mapPlatformError(path ?? ".")(e)
+    }
+  }
+
+  const stat = async (path: string): Promise<{ type: string; size: number; mtime: string | null }> => {
+    fsStrictGuard()
+    const clamped = clampPath(path, sandboxWorkDir!)
+    try {
+      return await getPlatformRuntime().runPromise(
+        Effect.gen(function*() {
+          const fs = yield* FileSystem.FileSystem
+          yield* assertContained(clamped, fs)
+          const info = yield* fs.stat(clamped)
+          return {
+            type: info.type,
+            size: Number(info.size),
+            mtime: Option.isSome(info.mtime) ? info.mtime.value.toISOString() : null
+          }
+        })
+      )
+    } catch (e) {
+      throw mapPlatformError(path)(e)
+    }
+  }
+
+  const mkdir = async (path: string): Promise<void> => {
+    fsStrictGuard()
+    const clamped = clampPath(path, sandboxWorkDir!)
+    try {
+      await getPlatformRuntime().runPromise(
+        Effect.gen(function*() {
+          const fs = yield* FileSystem.FileSystem
+          yield* fs.makeDirectory(clamped, { recursive: true })
+          yield* assertContained(clamped, fs)
+        })
+      )
+    } catch (e) {
+      throw mapPlatformError(path)(e)
+    }
+  }
+
+  const remove = async (path: string): Promise<void> => {
+    fsStrictGuard()
+    const clamped = clampPath(path, sandboxWorkDir!)
+    try {
+      await getPlatformRuntime().runPromise(
+        Effect.gen(function*() {
+          const fs = yield* FileSystem.FileSystem
+          yield* assertContained(clamped, fs)
+          yield* fs.remove(clamped, { recursive: true })
+        })
+      )
+    } catch (e) {
+      throw mapPlatformError(path)(e)
+    }
+  }
+
+  const exists = async (path: string): Promise<boolean> => {
+    fsStrictGuard()
+    const clamped = clampPath(path, sandboxWorkDir!)
+    try {
+      return await getPlatformRuntime().runPromise(
+        Effect.gen(function*() {
+          const fs = yield* FileSystem.FileSystem
+          const pathExists = yield* fs.exists(clamped)
+          if (pathExists) {
+            yield* assertContained(clamped, fs)
+          }
+          return pathExists
+        })
+      )
+    } catch (e) {
+      throw mapPlatformError(path)(e)
+    }
+  }
+
+  const shell = async (
+    command: string,
+    options?: { timeout?: number; cwd?: string }
+  ): Promise<{ stdout: string; stderr: string; exitCode: number }> => {
+    fsStrictGuard()
+    const timeoutMs = options?.timeout ?? 30_000
+    const maxOutputBytes = 1024 * 1024 // 1MB per stream
+    const subcwd = options?.cwd ? clampPath(options.cwd, sandboxWorkDir!) : sandboxWorkDir!
+
+    try {
+      return await getPlatformRuntime().runPromise(
+        Effect.scoped(
+          Effect.gen(function*() {
+            const cmd = Command.make("sh", "-c", command).pipe(
+              Command.workingDirectory(subcwd),
+              Command.env({
+                PATH: "/usr/local/bin:/usr/bin:/bin",
+                HOME: sandboxWorkDir!,
+                TMPDIR: sandboxWorkDir!,
+                LANG: "en_US.UTF-8"
+              })
+            )
+            const proc = yield* Command.start(cmd)
+
+            const stdoutFiber = yield* Stream.runFold(proc.stdout, "", (acc, chunk) =>
+              acc.length >= maxOutputBytes ? acc : acc + new TextDecoder().decode(chunk)
+            ).pipe(Effect.fork)
+
+            const stderrFiber = yield* Stream.runFold(proc.stderr, "", (acc, chunk) =>
+              acc.length >= maxOutputBytes ? acc : acc + new TextDecoder().decode(chunk)
+            ).pipe(Effect.fork)
+
+            const exitCode = yield* proc.exitCode
+            const stdoutStr = yield* Fiber.join(stdoutFiber)
+            const stderrStr = yield* Fiber.join(stderrFiber)
+
+            return {
+              stdout: stdoutStr.slice(0, maxOutputBytes),
+              stderr: stderrStr.slice(0, maxOutputBytes),
+              exitCode
+            }
+          })
+        ).pipe(
+          Effect.timeoutFail({
+            duration: Duration.millis(timeoutMs),
+            onTimeout: () => new Error(`Shell command timed out after ${timeoutMs}ms`)
+          }),
+          Effect.catchAll((e) => Effect.fail(e instanceof Error ? e : new Error(String(e))))
+        )
+      )
+    } catch (e) {
+      throw e instanceof Error ? e : new Error(String(e))
+    }
+  }
+
+  const cwd = (): string => "."
+
   try {
     if (sandboxMode === "strict") {
       for (const blocked of STRICT_BLOCKLIST) {
@@ -632,7 +858,16 @@ async function executeCode(
     const AsyncFunction = Object.getPrototypeOf(async function() {}).constructor
     const injectedHelpers = {
       init_corpus,
-      init_corpus_from_context
+      init_corpus_from_context,
+      readFile,
+      writeFile,
+      listDir,
+      stat,
+      mkdir,
+      remove,
+      exists,
+      shell,
+      cwd
     }
     const injectedFunctions = {
       ...activeToolFunctions,
@@ -744,6 +979,15 @@ const RESERVED_BINDINGS = new Set([
   "budget",
   "init_corpus",
   "init_corpus_from_context",
+  "readFile",
+  "writeFile",
+  "listDir",
+  "stat",
+  "mkdir",
+  "remove",
+  "exists",
+  "shell",
+  "cwd",
   "__strictScope"
 ])
 
@@ -761,7 +1005,8 @@ const InitPayloadSchema = Schema.Struct({
     name: Schema.String,
     parameterNames: Schema.optional(Schema.Array(Schema.String)),
     description: Schema.optional(Schema.String)
-  })))
+  }))),
+  sandboxWorkDir: Schema.optional(Schema.String)
 })
 
 type InitPayload = typeof InitPayloadSchema.Type
@@ -811,8 +1056,19 @@ const applyInitMessage = (raw: unknown): void => {
   }
 
   toolNames = normalizeToolNames(msg.tools)
+
+  if (sandboxMode === "permissive") {
+    if (typeof msg.sandboxWorkDir === "string" && msg.sandboxWorkDir.length > 0) {
+      sandboxWorkDir = msg.sandboxWorkDir
+    } else {
+      sandboxWorkDir = nodeFs.mkdtempSync(
+        nodePath.join(nodeFs.realpathSync(Bun.env.TMPDIR ?? "/tmp"), `rlm-sandbox-${workerCallId}-`)
+      )
+    }
+  }
+
   console.error(
-    `[sandbox-worker] Init: callId=${workerCallId} depth=${workerDepth} mode=${sandboxMode} maxFrameBytes=${maxFrameBytes} tools=${toolNames.join(",")}`
+    `[sandbox-worker] Init: callId=${workerCallId} depth=${workerDepth} mode=${sandboxMode} maxFrameBytes=${maxFrameBytes} tools=${toolNames.join(",")}${sandboxWorkDir ? ` workDir=${sandboxWorkDir}` : ""}`
   )
 }
 
@@ -955,6 +1211,14 @@ function handleMessage(message: unknown): void {
         pendingBridge.delete(id)
       }
       toolNames = []
+      if (sandboxWorkDir !== null) {
+        try { nodeFs.rmSync(sandboxWorkDir, { recursive: true, force: true }) } catch {}
+        sandboxWorkDir = null
+      }
+      if (platformRuntime !== null) {
+        platformRuntime.dispose().catch(() => {})
+        platformRuntime = null
+      }
       closeWorker(0)
       break
     }
@@ -1049,6 +1313,14 @@ if (hasProcessIpc) {
               pendingBridge.delete(id)
             }
             toolNames = []
+            if (sandboxWorkDir !== null) {
+              try { nodeFs.rmSync(sandboxWorkDir, { recursive: true, force: true }) } catch {}
+              sandboxWorkDir = null
+            }
+            if (platformRuntime !== null) {
+              platformRuntime.dispose().catch(() => {})
+              platformRuntime = null
+            }
           })
       })
     ).pipe(

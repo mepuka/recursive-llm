@@ -1,6 +1,8 @@
 import { Worker as EffectWorker } from "@effect/platform"
 import { BunWorker } from "@effect/platform-bun"
 import { Clock, Data, Deferred, Duration, Effect, Exit, Fiber, FiberSet, Layer, Match, Option, Queue, Ref, Runtime, Scope, Stream } from "effect"
+import * as nodeFs from "node:fs"
+import * as nodePath from "node:path"
 import { BridgeHandler } from "./BridgeHandler"
 import { SandboxError } from "./RlmError"
 import { SandboxConfig, SandboxFactory, type SandboxInstance, type VariableMetadata } from "./Sandbox"
@@ -318,7 +320,8 @@ const shutdownWorker = (
   config: SandboxConfig["Type"],
   health: Ref.Ref<HealthState>,
   pendingRequests: Ref.Ref<Map<string, Deferred.Deferred<unknown, SandboxError>>>,
-  incomingFrames: Queue.Queue<WorkerToHost>
+  incomingFrames: Queue.Queue<WorkerToHost>,
+  sandboxWorkDir?: string
 ) =>
   Effect.gen(function*() {
     yield* Ref.set(health, "shuttingDown")
@@ -332,6 +335,13 @@ const shutdownWorker = (
     yield* Ref.set(health, "dead")
     yield* failAllPending(pendingRequests, "Sandbox shut down")
     yield* Queue.shutdown(incomingFrames)
+
+    // Host-side cleanup of temp dir (survives SIGKILL of worker)
+    if (sandboxWorkDir !== undefined) {
+      yield* Effect.sync(() => {
+        try { nodeFs.rmSync(sandboxWorkDir, { recursive: true, force: true }) } catch {}
+      })
+    }
   })
 
 // --- Instance creation ---
@@ -352,6 +362,13 @@ const createSpawnSandboxInstance = (
     const bunExecutable = Bun.which("bun") ?? "bun"
     const strictSandboxCwd = Bun.env.TMPDIR ?? process.env.TMPDIR ?? "/tmp"
     const strictMode = config.sandboxMode === "strict"
+
+    // Host creates temp dir so it can clean up even if worker is SIGKILLed
+    const hostSandboxWorkDir = !strictMode
+      ? nodeFs.mkdtempSync(
+          nodePath.join(nodeFs.realpathSync(Bun.env.TMPDIR ?? process.env.TMPDIR ?? "/tmp"), `rlm-sandbox-${options.callId}-`)
+        )
+      : undefined
     const health = yield* Ref.make<HealthState>("alive")
     const pendingRequests = yield* Ref.make(new Map<string, Deferred.Deferred<unknown, SandboxError>>())
     const incomingFrames = yield* Queue.bounded<WorkerToHost>(config.incomingFrameQueueCapacity)
@@ -419,7 +436,7 @@ const createSpawnSandboxInstance = (
         procHandle = p
         return p
       }),
-      (p) => shutdownWorker(p, config, health, pendingRequests, incomingFrames)
+      (p) => shutdownWorker(p, config, health, pendingRequests, incomingFrames, hostSandboxWorkDir)
     )
 
     // Exit watcher — detect unexpected exits
@@ -454,7 +471,8 @@ const createSpawnSandboxInstance = (
       maxFrameBytes: config.maxFrameBytes,
       ...(options.tools !== undefined && options.tools.length > 0
         ? { tools: options.tools }
-        : {})
+        : {}),
+      ...(hostSandboxWorkDir !== undefined ? { sandboxWorkDir: hostSandboxWorkDir } : {})
     })
 
     const state: SandboxState = { proc, health, pendingRequests, config, callId: options.callId, executeDeadline }
@@ -509,6 +527,15 @@ const createWorkerSandboxInstance = (
   config: SandboxConfig["Type"]
 ) =>
   Effect.gen(function*() {
+    const strictMode = config.sandboxMode === "strict"
+
+    // Host creates temp dir so it can clean up even if worker is SIGKILLed
+    const hostSandboxWorkDir = !strictMode
+      ? nodeFs.mkdtempSync(
+          nodePath.join(nodeFs.realpathSync(Bun.env.TMPDIR ?? process.env.TMPDIR ?? "/tmp"), `rlm-sandbox-${options.callId}-`)
+        )
+      : undefined
+
     const health = yield* Ref.make<HealthState>("alive")
     const pendingRequests = yield* Ref.make(new Map<string, Deferred.Deferred<unknown, SandboxError>>())
     const incomingFrames = yield* Queue.bounded<WorkerToHost>(config.incomingFrameQueueCapacity)
@@ -633,7 +660,8 @@ const createWorkerSandboxInstance = (
                         hasMediaAttachments: msg.hasMediaAttachments === true,
                         maxFrameBytes:
                           typeof msg.maxFrameBytes === "number" ? msg.maxFrameBytes : undefined,
-                        ...(tools !== undefined ? { tools } : {})
+                        ...(tools !== undefined ? { tools } : {}),
+                        ...(typeof msg.sandboxWorkDir === "string" ? { sandboxWorkDir: msg.sandboxWorkDir } : {})
                       })
                     ).pipe(
                       Effect.mapError((err) => new SandboxError({ message: `Worker init failed: ${String(err)}` }))
@@ -771,7 +799,7 @@ const createWorkerSandboxInstance = (
 
         return procLike
       }),
-      (p) => shutdownWorker(p, config, health, pendingRequests, incomingFrames)
+      (p) => shutdownWorker(p, config, health, pendingRequests, incomingFrames, hostSandboxWorkDir)
     )
 
     yield* Effect.forkScoped(
@@ -803,7 +831,8 @@ const createWorkerSandboxInstance = (
       maxFrameBytes: config.maxFrameBytes,
       ...(options.tools !== undefined && options.tools.length > 0
         ? { tools: options.tools }
-        : {})
+        : {}),
+      ...(hostSandboxWorkDir !== undefined ? { sandboxWorkDir: hostSandboxWorkDir } : {})
     })
 
     const state: SandboxState = { proc, health, pendingRequests, config, callId: options.callId, executeDeadline }

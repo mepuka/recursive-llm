@@ -195,9 +195,37 @@ export const buildReplSystemPromptStatic = (
     const limitLabel = options.maxFrameBytes >= 1024 * 1024
       ? `${Math.floor(options.maxFrameBytes / (1024 * 1024))}MB`
       : `${Math.max(1, Math.floor(options.maxFrameBytes / 1024))}KB`
-    lines.push(`Individual \`__vars\` entries cannot exceed ~${limitLabel} when serialized. For very large datasets, split across multiple variables or aggregate before submission.`)
+    lines.push(`Individual \`__vars\` entries cannot exceed ~${limitLabel} when serialized (IPC frame limit). For very large datasets, split across multiple variables or aggregate before submission.`)
   }
   lines.push("")
+  if (!isStrict) {
+    lines.push("## File System & Shell")
+    lines.push("You have a temporary working directory for reading/writing files and running shell commands.")
+    lines.push("")
+    lines.push("### File operations")
+    lines.push("File helpers are path-clamped: only relative paths within the sandbox directory are allowed. Absolute paths, `../` traversals, and symlinks pointing outside the sandbox are rejected.")
+    lines.push("- `await readFile(\"data.json\")` → file contents as string")
+    lines.push("- `await writeFile(\"output.txt\", \"hello\")` → writes file (auto-creates parent dirs)")
+    lines.push("- `await listDir()` or `await listDir(\"subdir\")` → array of entry names")
+    lines.push("- `await stat(\"data.json\")` → `{ type: \"File\", size: 1234, mtime: \"2025-...\" }`")
+    lines.push("- `await mkdir(\"subdir/nested\")` → creates directory recursively")
+    lines.push("- `await remove(\"old.txt\")` → removes file or directory")
+    lines.push("- `await exists(\"data.json\")` → boolean")
+    lines.push("")
+    lines.push("### Shell execution")
+    lines.push("Shell commands run via `sh -c` with cwd set to the sandbox directory. They can access the broader host filesystem (not path-clamped like file helpers). Use relative paths to stay within the sandbox.")
+    lines.push("- `const { stdout, stderr, exitCode } = await shell(\"ls -la\")`")
+    lines.push("- `await shell(\"jq '.items[]' data.json > filtered.json\")`")
+    lines.push("- `await shell(\"python3 script.py\", { timeout: 60000 })` — custom timeout (default 30s)")
+    lines.push("- Env: minimal (PATH, HOME, TMPDIR point to sandbox dir).")
+    lines.push("- Max output: 1MB per stream.")
+    lines.push("")
+    lines.push("### Notes")
+    lines.push("- Files persist across iterations within the same call.")
+    lines.push("- The directory is auto-cleaned when the call finishes.")
+    lines.push("- Use `cwd()` to see the sandbox root (always `\".\"`).")
+    lines.push("")
+  }
   lines.push("## Strategy")
   lines.push("You have multiple iterations. Use them. Do NOT try to finish everything in one step.")
   lines.push("")
@@ -279,7 +307,7 @@ export const buildReplSystemPromptStatic = (
     lines.push("For selective retrieval tasks, prefer a retrieval-first pattern over scanning every record:")
     lines.push("1. Parse records from `__vars.context`.")
     lines.push("2. Build one corpus: `CreateCorpus` + batched `LearnCorpus` (~500 records per call), or call `init_corpus_from_context({ corpusId, batchSize })`.")
-    lines.push("   `init_corpus_from_context` auto-detects format from `__vars.contextMeta` and handles NDJSON, JSON array, CSV, and TSV parsing internally.")
+    lines.push("   `init_corpus_from_context` auto-detects format from `__vars.contextMeta` and handles NDJSON, JSON array, CSV, TSV, and plain-text (line-by-line) parsing internally.")
     lines.push("3. Run `QueryCorpus` to shortlist candidates, then use `llm_query` on just the shortlist.")
     lines.push("4. Use `CorpusStats` for diagnostics and `DeleteCorpus` when finished.")
     lines.push("")
@@ -360,6 +388,7 @@ export const buildReplSystemPromptStatic = (
     lines.push("`const results = await llm_query_batched(queries, contexts?)` — run multiple independent semantic sub-calls in parallel. Returns a string array in input order.")
     if (options.mediaNames !== undefined && options.mediaNames.length > 0) {
       lines.push("`const result = await llm_query_with_media(prompt, ...mediaNames)` — multimodal sub-call using registered media attachments.")
+      lines.push("  Example: `const result = await llm_query_with_media(\"Compare these two images\", \"photo1\", \"photo2\")`")
     }
     lines.push("- MUST use `await` — without it you get `[object Promise]`, not the answer.")
     lines.push("- Each call counts against your LLM call budget.")
@@ -708,6 +737,7 @@ export const buildReplSystemPromptStatic = (
           lines.push("- Helpers available in the sandbox:")
           lines.push("  - `init_corpus(documents, options?)` — batch-learn an array of documents and set `__vars.contextCorpusId`.")
           lines.push("  - `init_corpus_from_context(options?)` — parse `__vars.context` via `__vars.contextMeta`, learn corpus, and set `__vars.contextCorpusId`.")
+          lines.push("  Options for both: `{ corpusId?: string, batchSize?: number (default 500), textField?: string, maxDocuments?: number, dedupeById?: boolean (default true) }`")
         }
         lines.push("- Document shape: `{ text: string, id?: string }` — also accepts objects with `content`, `body`, `body_markdown`, or `description` fields.")
         lines.push("- Override text field detection: pass `{ textField: \"fieldName\" }` to `init_corpus` or `init_corpus_from_context`.")
