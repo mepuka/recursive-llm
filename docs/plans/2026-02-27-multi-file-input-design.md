@@ -1,7 +1,7 @@
 # Multi-File Input: Filesystem-First Design
 
 **Date:** 2026-02-27
-**Status:** Approved (Rev 2 — addresses code review findings)
+**Status:** Approved (Rev 3 — addresses second review pass)
 
 ## Problem
 
@@ -45,21 +45,26 @@ rlm "analyze with instructions" \
 
 **Validation rules:**
 - Each path must point to a regular file (no directories, no device files).
-- Symlinks are resolved at validation time and the resolved path must be a regular file.
+- Symlinks are resolved at validation time (`fs.realpathSync`) and the resolved path must be a regular file.
 - Unreadable files produce a deterministic `CliInputError` before the run starts.
 - Logical names must match `[A-Za-z][A-Za-z0-9_-]*` (same regex as `--media`).
-- Staged filenames are `<logicalName>.<originalExtension>` — if two inputs would produce the same staged filename (e.g., same logical name with different source paths), the duplicate-name check catches it first.
+- Logical names longer than 128 characters are rejected.
+- Staged filenames are `<logicalName>.<originalExtension>` — uniqueness follows from logical name uniqueness.
 
 ### --context-file Deprecation
 
 `--context-file` is **retained as a deprecated alias** that maps to `--input context=<path>`. When used:
 1. The file is staged to the sandbox directory as `context.<ext>` (same as any `--input`).
-2. A stderr warning is emitted: `⚠ --context-file is deprecated; use --input instead.`
+2. A stderr warning is emitted: `⚠ --context-file is deprecated and its behavior has changed. File is staged to sandbox directory; use readFile('context.<ext>') to access contents. Migrate to --input instead.`
 3. Cannot be combined with an `--input` that also uses the logical name `context`.
 
-This avoids the hard CLI break (finding #2) — @effect/cli still parses the flag, normalize maps it, and users get a clear migration signal.
+**Behavioral break (accepted):** Unlike the old behavior, `--context-file` no longer populates `__vars.context` with file contents. The file is staged to the sandbox directory only. The deprecation warning communicates this clearly.
 
-**Note:** Unlike the old behavior, `--context-file` no longer populates `__vars.context` with file contents. It stages the file to the sandbox directory. This is a behavioral change. The deprecation warning should mention this: `"File is now staged to sandbox directory; use readFile('context.<ext>') to access contents."`
+**Precedence with --context:** When both `--context` (inline string) and `--context-file` (deprecated alias) are provided, both take effect independently:
+- `--context` populates `__vars.context` with the inline string.
+- `--context-file` stages the file to the sandbox directory as `context.<ext>` and adds it to `__vars.inputs`.
+
+This differs from the old behavior (where `--context-file` overrode `--context`). The warning message should note this.
 
 ### Programmatic API
 
@@ -83,6 +88,7 @@ interface CompleteOptionsBase {
 ```
 
 - `context` becomes optional (`string | undefined`, was required `string`).
+- **Normalization contract:** At the API boundary (`Rlm.stream` / `Rlm.complete`), `undefined` context is normalized to `""` before passing to the Scheduler. Internal code continues to use `context.length` safely. The `context` field in `CompletionOptions` (internal) remains `string`, never `undefined`.
 - New `inputs` array carries file-based data sources.
 - `context`, `inputs`, or both may be provided. Query-only calls (neither context nor inputs) are valid — the model just has no data to work with.
 - `contextMetadata` applies only to inline `context`. Each input carries its own metadata.
@@ -100,16 +106,14 @@ CLI (--input users=data/users.ndjson --input posts=data/posts.ndjson)
   │  Metadata values from prefix analysis are estimates, marked as such.
   │
   ├─ Rlm.stream({ query, inputs: [...], context?: "..." })
+  │       ↓ context normalized to "" if undefined
   │
   ├─ Scheduler handleStartCall (ROOT CALL ONLY):
-  │    1. Copy each input file into sandbox working directory using
-  │       Bun.write(dest, Bun.file(src)) — atomic, no partial files.
+  │    1. Copy each input file into sandbox working directory.
   │       Destination: <sandboxDir>/<logicalName>.<originalExtension>
   │    2. Inject __vars.inputs manifest (metadata only, not content).
-  │    3. If inline context provided, inject __vars.context as before.
+  │    3. If inline context provided (non-empty), inject __vars.context.
   │    4. Inject __vars.query as before.
-  │    NOTE: Sub-calls (recursive depth > 0) inherit the parent's
-  │    sandbox directory and do NOT re-stage files.
   │
   └─ Sandbox: model accesses files via readFile("users.ndjson")
               or shell("jq '.[] | .name' users.ndjson")
@@ -117,6 +121,14 @@ CLI (--input users=data/users.ndjson --input posts=data/posts.ndjson)
 ```
 
 **Key property:** File contents never cross the IPC boundary. They're copied at the filesystem level. The IPC frame limit (32MB) applies only to the `__vars.inputs` manifest, which is lightweight metadata (~1-2KB per file, well under the limit even at 50 files).
+
+### Sandbox Lifecycle and Sub-calls
+
+Each `StartCall` creates a fresh sandbox with its own working directory. Sub-calls spawned by `llm_query()` get their **own** sandbox and do NOT share the root call's working directory. This is existing behavior and this design does not change it.
+
+**Consequence: input files are available only in the root call's sandbox.** Sub-calls receive their context through the `llm_query(query, context)` second argument, which the root-call model must provide from data it has already read. This is the correct pattern — the root call reads input files, extracts relevant data, and passes subsets to sub-calls via their context argument.
+
+**Root-call only staging:** File staging happens only when `inputs` is non-empty AND `depth === 0`. The `inputs` array is NOT forwarded to sub-call `StartCall` commands.
 
 ### __vars.inputs Manifest Schema
 
@@ -127,32 +139,32 @@ interface InputManifestEntry {
   readonly path: string          // Relative path in sandbox dir (e.g., "users.ndjson")
   readonly bytes: number         // File size in bytes (exact, from stat)
   readonly format: string        // Detected format: "ndjson" | "json" | "csv" | etc.
-  readonly lines: number | null  // Exact line count if file ≤ 250KB, else estimated from prefix. null if unknown.
+  readonly lines: number | null  // Line count. null if unknown.
   readonly linesEstimated: boolean // true if lines was estimated from prefix
-  readonly recordCount: number | null  // Exact or estimated record count. null for non-structured.
+  readonly recordCount: number | null  // Record count. null for non-structured.
   readonly recordCountEstimated: boolean
   readonly fields: string[] | null     // Detected field names (first record). null if non-structured.
   readonly sampleRecord: string | null // First record as string (up to 220 chars). null if non-structured.
 }
 ```
 
-**Accuracy contract:** `bytes` is always exact (from `stat`). `lines` and `recordCount` are exact for files where the full content was analyzed (≤ 250KB), and estimated for larger files (derived from the first 250KB prefix). The `*Estimated` boolean flags let the model know when values are approximate. `fields` and `sampleRecord` always come from the first record regardless of file size.
+**Accuracy contract:** `bytes` is always exact (from `stat`). `lines` and `recordCount` are exact for files where the full content was analyzed (≤ 250KB), and estimated for larger files (derived from the first 250KB prefix). The `*Estimated` boolean flags distinguish exact from approximate values. `fields` and `sampleRecord` always come from the first record regardless of file size.
 
 ### File Staging Safety
 
-**Atomicity:** Files are copied with `Bun.write(destPath, Bun.file(srcPath))`. If any copy fails, the entire StartCall fails and the sandbox directory is cleaned up by the existing scope cleanup.
+**Copy semantics:** Files are copied with `Bun.write(destPath, Bun.file(srcPath))`. This is not transactional — a crash during copy can leave a partial file. However, if the copy call itself returns an error (source disappeared, permission denied, disk full), the error propagates as a `SandboxError` that terminates the `StartCall`. The sandbox directory is cleaned up by the existing scope close logic.
+
+**Post-copy size check:** After all files are copied, the total staged bytes are re-checked against the 2GB limit. If a file grew between CLI validation and copy (TOCTOU), and the total now exceeds the limit, the `StartCall` fails with a `SandboxError`. This is a best-effort safeguard — not a hard guarantee against concurrent modification.
 
 **Symlink handling:** Symlinks in `--input` paths are resolved at CLI validation time (`fs.realpathSync`). The resolved path is used for both validation (must be a regular file) and copying. The staged file in the sandbox directory is always a regular file, never a symlink.
 
-**TOCTOU mitigation:** The file is validated (exists, is regular, is readable, size check) at CLI parse time and then copied at StartCall time. If the file changes or disappears between these points, the copy will fail and the error surfaces as a `SandboxError` that terminates the call. This is acceptable — the alternative (locking source files) is impractical for a CLI tool.
-
-**Collision prevention:** Staged filename is `<logicalName>.<extension>`. Since logical names are unique (enforced at CLI validation), and extensions are preserved from the source file, collisions can only occur if two inputs have the same logical name — which is already rejected. If a staged filename collides with a sandbox-internal file (unlikely but possible), the copy overwrites it; sandbox-internal files are ephemeral.
-
-**Root-call only:** File staging happens only for the root call (`depth === 0`). Sub-calls spawned by `llm_query()` inherit the parent's sandbox directory and see the same files. They do NOT re-copy or re-stage.
+**Collision prevention:** Staged filename is `<logicalName>.<extension>`. Since logical names are unique (enforced at CLI validation), collisions between input files cannot occur. If a staged filename collides with a sandbox-internal file (unlikely but possible), the copy overwrites it; sandbox-internal files are ephemeral.
 
 ### System Prompt Changes
 
-When `inputs` are present, the system prompt adds an "Input Files" section:
+When `inputs` are present, the system prompt adds an "Input Files" section.
+
+**Prompt budget:** The input files table is capped at **20 entries**. If more than 20 inputs are provided, the first 20 are shown in the table and a summary line follows: `(and N more files — see __vars.inputs for full manifest)`. This prevents unbounded prompt growth.
 
 ```
 ## Input Files
@@ -173,11 +185,12 @@ For large files, avoid reading the entire file into a single variable.
 Use shell tools, read in chunks, or process line-by-line.
 ```
 
-**Prompt sanitization:** File names, field names, and sample records are sanitized before interpolation into the system prompt. Specifically:
-- Newlines, carriage returns, and backticks are stripped from all metadata strings.
+**Prompt sanitization:** All metadata strings are sanitized before interpolation into the system prompt markdown table:
+- Newlines (`\n`, `\r`), backticks, and **pipe characters** (`|`) are stripped or replaced with spaces to prevent markdown table/code injection.
 - Field names are truncated to 64 chars each, capped at 24 fields shown.
 - Sample records are truncated to 220 chars.
-- File names longer than 128 chars are rejected at CLI validation.
+- File names longer than 128 chars are rejected at CLI validation (never reach the prompt).
+- All interpolated strings are passed through a shared `sanitizePromptString(s: string, maxLen: number)` helper.
 
 The existing "Variable Space" section continues to describe `__vars.context` (if inline context is provided) and `__vars.query`.
 
@@ -186,8 +199,9 @@ The existing "Variable Space" section continues to describe `__vars.context` (if
 | Before | After | Notes |
 |--------|-------|-------|
 | `--context "string"` | `--context "string"` | Unchanged |
-| `--context-file path` | `--context-file path` | Deprecated alias → `--input context=path`. Stderr warning emitted. File staged to disk, NOT injected into __vars.context. |
-| `Rlm.stream({ context: "..." })` | `Rlm.stream({ context: "..." })` | `context` is now optional |
+| `--context-file path` | `--context-file path` | Deprecated alias → `--input context=path`. **Behavioral break:** no longer populates __vars.context. Stderr warning emitted. |
+| `--context "s" --context-file p` | `--context "s" --context-file p` | **Changed:** Both now take effect (context→__vars.context, file→staged). Old behavior: context-file overrode context. |
+| `Rlm.stream({ context: "..." })` | `Rlm.stream({ context: "..." })` | `context` is now optional externally, normalized to `""` internally |
 | `__vars.context` | `__vars.context` | Still populated for inline `--context` only |
 | `__vars.contextMeta` | `__vars.contextMeta` | Still populated for inline `--context` only |
 | — | `__vars.inputs` | New: array of input file metadata |
@@ -196,6 +210,7 @@ The existing "Variable Space" section continues to describe `__vars.context` (if
 
 - **Media attachments** (`--media`, `--media-url`): unchanged. These are for binary blobs sent to multimodal LLM calls, not for sandbox data processing.
 - **Sandbox filesystem API** (`readFile`, `writeFile`, `shell`, etc.): unchanged. Input files are just regular files in the working directory.
+- **Sandbox lifecycle:** Each call still gets its own sandbox and working directory. Input file staging is additive to the root call's sandbox only.
 - **IPC protocol**: unchanged. Only the `__vars.inputs` manifest goes through IPC — metadata only, well within frame limits.
 - **Bridge calls** (`llm_query`, `llm_query_batched`): unchanged.
 
@@ -203,16 +218,23 @@ The existing "Variable Space" section continues to describe `__vars.context` (if
 
 | File | Change |
 |------|--------|
-| `src/cli/Command.ts` | Add `--input` option, deprecate `--context-file` (keep as alias) |
+| `src/cli/Command.ts` | Add `--input` option, keep `--context-file` as deprecated |
 | `src/cli/Normalize.ts` | Parse `--input` specs with symlink resolution, file validation, size/count limits. Map `--context-file` to `--input context=path` with warning. |
-| `src/CliLayer.ts` | Update `CliArgs` interface: add `inputs`, remove `contextFile` (internal only; CLI still accepts the flag) |
+| `src/CliLayer.ts` | Update `CliArgs` interface: add `inputs`, keep `contextFile` mapped internally |
 | `src/cli/Run.ts` | Analyze input file metadata (prefix read), pass `inputs` to Rlm |
-| `src/Rlm.ts` | Update `CompleteOptionsBase`: make `context` optional, add `inputs` |
+| `src/Rlm.ts` | Update `CompleteOptionsBase`: make `context` optional, add `inputs`, normalize `undefined` to `""` |
 | `src/RlmTypes.ts` | Add `InputFile`, `InputManifestEntry` types, update `CompletionOptions` |
-| `src/Scheduler.ts` | Stage files to sandbox dir (root call only), inject `__vars.inputs` manifest |
-| `src/SystemPrompt.ts` | Add "Input Files" section with sanitized metadata table |
+| `src/Scheduler.ts` | Stage files to sandbox dir (root call only, depth===0), inject `__vars.inputs` manifest, post-copy size check |
+| `src/SystemPrompt.ts` | Add "Input Files" section with sanitized metadata table, 20-entry cap, `sanitizePromptString` helper |
 | `src/ContextMetadata.ts` | Support partial analysis (first 250KB) with estimated flags |
-| `test/CliCommand.test.ts` | Test `--input` parsing, `--context-file` deprecation alias |
-| `test/CliNormalize.test.ts` | Test `--input` validation (limits, symlinks, duplicates, malformed specs) |
-| `test/Scheduler.test.ts` | Test file staging (root-only), manifest injection, copy failure handling, cleanup |
-| `test/SystemPrompt.test.ts` | Test input files prompt section, sanitization |
+
+## Test Plan
+
+| Test File | Cases |
+|-----------|-------|
+| `test/CliCommand.test.ts` | `--input` parsing (named, auto-named), `--context-file` deprecation alias emits warning, `--context-file` maps to input, unknown flag rejection unchanged |
+| `test/CliNormalize.test.ts` | Validation: duplicate names, name regex, symlink resolution, unreadable files, 50-file limit, 2GB limit, malformed specs (missing path, empty name), `--context-file` + `--input context=` conflict |
+| `test/Scheduler.test.ts` | File staging at depth=0, no staging at depth>0, manifest injection shape, post-copy size re-check, copy failure → SandboxError, sandbox cleanup on staging failure |
+| `test/SystemPrompt.test.ts` | Input files table rendering, 20-entry cap with summary, sanitization (pipe chars, newlines, backticks in field names), estimated vs exact record counts |
+| `test/Rlm.test.ts` | `context: undefined` normalized to `""`, query-only calls (no context, no inputs), `inputs` forwarded to scheduler |
+| `test/CliCommand.test.ts` | Precedence: `--context` + `--context-file` both take effect independently |
