@@ -19,6 +19,7 @@ export interface CliArgs {
   query: string
   context: string
   contextFile?: string
+  inputs?: ReadonlyArray<{ readonly name: string; readonly path: string }>
   provider: RlmProvider
   model: string
   subModel?: string

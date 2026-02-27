@@ -95,6 +95,11 @@ const mediaUrl = Options.text("media-url").pipe(
   Options.withDescription("Media attachment from URL (repeatable): name=url")
 )
 
+const input = Options.text("input").pipe(
+  Options.repeated,
+  Options.withDescription("Input file (repeatable): name=path or just path (auto-named from basename)")
+)
+
 const noPromptCaching = Options.boolean("no-prompt-caching").pipe(
   Options.withDescription("Disable Anthropic prompt caching breakpoints")
 )
@@ -157,6 +162,7 @@ const commandConfig = {
   namedModel,
   media,
   mediaUrl,
+  input,
   noPromptCaching,
   noCache,
   quiet,

@@ -1,3 +1,5 @@
+import * as nodeFs from "node:fs"
+import * as nodePath from "node:path"
 import { Effect, Option, Schema } from "effect"
 import type { CliArgs } from "../CliLayer"
 import type { RlmModelTarget, RlmProvider } from "../RlmConfig"
@@ -12,6 +14,7 @@ export interface ParsedCliConfig {
   readonly namedModel: ReadonlyArray<string>
   readonly media: ReadonlyArray<string>
   readonly mediaUrl: ReadonlyArray<string>
+  readonly input: ReadonlyArray<string>
   readonly subDelegationEnabled: boolean
   readonly disableSubDelegation: boolean
   readonly subDelegationDepthThreshold: Option.Option<number>
@@ -140,6 +143,104 @@ const parseNamedPathSpecs = (
     return [...byName.entries()].map(([name, value]) => ({ name, value }))
   })
 
+const MAX_INPUT_FILES = 50
+const MAX_INPUT_NAME_LENGTH = 128
+const MAX_INPUT_TOTAL_BYTES = 2 * 1024 * 1024 * 1024 // 2 GB
+
+const deriveInputName = (filePath: string): string => {
+  const base = nodePath.basename(filePath)
+  const dotIndex = base.lastIndexOf(".")
+  return dotIndex > 0 ? base.slice(0, dotIndex) : base
+}
+
+export const parseInputSpecs = (
+  specs: ReadonlyArray<string>
+): Effect.Effect<Array<{ name: string; path: string }> | undefined, CliInputError> =>
+  Effect.gen(function*() {
+    if (specs.length === 0) return undefined
+
+    if (specs.length > MAX_INPUT_FILES) {
+      return yield* failCliInput(
+        `Error: too many --input files (${specs.length}); maximum is ${MAX_INPUT_FILES}`
+      )
+    }
+
+    const seen = new Map<string, string>()
+    const results: Array<{ name: string; path: string }> = []
+
+    for (const spec of specs) {
+      const equalsIndex = spec.indexOf("=")
+      let name: string
+      let rawPath: string
+
+      if (equalsIndex > 0) {
+        name = spec.slice(0, equalsIndex).trim()
+        rawPath = spec.slice(equalsIndex + 1).trim()
+      } else {
+        rawPath = spec.trim()
+        name = deriveInputName(rawPath)
+      }
+
+      if (name.length === 0) {
+        return yield* failCliInput(`Error: empty name in --input "${spec}"`)
+      }
+      if (name.length > MAX_INPUT_NAME_LENGTH) {
+        return yield* failCliInput(
+          `Error: --input name "${name}" exceeds ${MAX_INPUT_NAME_LENGTH} character limit`
+        )
+      }
+      if (!NAMED_MODEL_KEY_RE.test(name)) {
+        return yield* failCliInput(
+          `Error: invalid --input name "${name}" (use letters, numbers, _ or -, starting with a letter)`
+        )
+      }
+      if (rawPath.length === 0) {
+        return yield* failCliInput(`Error: empty path in --input "${spec}"`)
+      }
+
+      if (seen.has(name)) {
+        return yield* failCliInput(
+          `Error: duplicate --input name "${name}" (first: "${seen.get(name)}", second: "${rawPath}")`
+        )
+      }
+
+      let resolvedPath: string
+      try {
+        resolvedPath = nodeFs.realpathSync(rawPath)
+      } catch {
+        return yield* failCliInput(`Error: --input file not found: "${rawPath}"`)
+      }
+
+      let stat: nodeFs.Stats
+      try {
+        stat = nodeFs.statSync(resolvedPath)
+      } catch {
+        return yield* failCliInput(`Error: cannot stat --input file: "${resolvedPath}"`)
+      }
+
+      if (!stat.isFile()) {
+        return yield* failCliInput(`Error: --input path is not a regular file: "${rawPath}"`)
+      }
+
+      seen.set(name, rawPath)
+      results.push({ name, path: resolvedPath })
+    }
+
+    let totalBytes = 0
+    for (const entry of results) {
+      const stat = nodeFs.statSync(entry.path)
+      totalBytes += stat.size
+    }
+    if (totalBytes > MAX_INPUT_TOTAL_BYTES) {
+      const totalMB = (totalBytes / (1024 * 1024)).toFixed(1)
+      return yield* failCliInput(
+        `Error: total --input size ${totalMB} MB exceeds 2 GB limit`
+      )
+    }
+
+    return results
+  })
+
 export const providerApiKeyEnv = (provider: RlmProvider): ProviderApiKeyEnv =>
   provider === "anthropic"
     ? "ANTHROPIC_API_KEY"
@@ -186,6 +287,26 @@ export const normalizeCliArgs = (
     const namedModels = yield* parseNamedModelSpecs(parsed.namedModel)
     const media = yield* parseNamedPathSpecs(parsed.media, "--media")
     const mediaUrls = yield* parseNamedPathSpecs(parsed.mediaUrl, "--media-url")
+
+    // --context-file → --input context=path deprecation mapping
+    const inputSpecs = [...parsed.input]
+    if (contextFile !== undefined) {
+      const hasExplicitContextInput = inputSpecs.some((spec) => {
+        const eq = spec.indexOf("=")
+        return eq > 0 && spec.slice(0, eq).trim() === "context"
+      })
+      if (hasExplicitContextInput) {
+        return yield* failCliInput(
+          "Error: --context-file conflicts with --input context=...; use --input only"
+        )
+      }
+      console.error(
+        "[deprecated] --context-file is deprecated; use --input context=<path> instead"
+      )
+      inputSpecs.push(`context=${contextFile}`)
+    }
+    const resolvedInputs = yield* parseInputSpecs(inputSpecs)
+
     const subDelegationEnabled = resolveSubDelegationEnabled(
       rawArgs,
       parsed.subDelegationEnabled,
@@ -266,6 +387,7 @@ export const normalizeCliArgs = (
       nlpTools: parsed.nlpTools,
       ...(parsed.noTrace ? { noTrace: true } : {}),
       ...(contextFile !== undefined ? { contextFile } : {}),
+      ...(resolvedInputs !== undefined ? { inputs: resolvedInputs } : {}),
       ...(subModel !== undefined ? { subModel } : {}),
       ...(subDelegationEnabled !== undefined ? { subDelegationEnabled } : {}),
       ...(subDelegationDepthThreshold !== undefined ? { subDelegationDepthThreshold } : {}),
