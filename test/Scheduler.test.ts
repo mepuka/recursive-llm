@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test"
 import { Chunk, Deferred, Effect, Exit, Layer, Option, PubSub, Queue, Ref, Schema, Stream } from "effect"
+import * as nodeFs from "node:fs"
+import * as nodePath from "node:path"
+import * as os from "node:os"
 import { complete, stream } from "../src/Rlm"
 import { LlmCallLive } from "../src/LlmCall"
 import { RlmConfig, type RlmConfigService } from "../src/RlmConfig"
@@ -1563,6 +1566,38 @@ describe("Scheduler integration", () => {
       expect(result._tag).toBe("Left")
     }
   }, 10_000)
+
+  test("rejects invalid programmatic input names before staging", async () => {
+    const tmpDir = nodeFs.mkdtempSync(nodePath.join(os.tmpdir(), "rlm-invalid-input-"))
+    const filePath = nodePath.join(tmpDir, "data.txt")
+    nodeFs.writeFileSync(filePath, "hello")
+
+    try {
+      const result = await Effect.runPromise(
+        complete({
+          query: "test invalid input name",
+          context: "",
+          inputs: [{ name: "../escape", path: filePath }]
+        }).pipe(
+          Effect.either,
+          Effect.provide(
+            makeLayers({
+              responses: [submitAnswer("unreachable")]
+            })
+          ),
+          Effect.timeout("5 seconds")
+        )
+      )
+
+      expect(result._tag).toBe("Left")
+      if (result._tag === "Left") {
+        const causeMessage = String((result.left as { readonly cause?: unknown }).cause ?? "")
+        expect(causeMessage).toContain("Invalid input file name")
+      }
+    } finally {
+      nodeFs.rmSync(tmpDir, { recursive: true, force: true })
+    }
+  }, 10_000)
 })
 
 describe("Scheduler tool dispatch (e2e with real sandbox)", () => {
@@ -1630,6 +1665,41 @@ describe("Scheduler tool dispatch (e2e with real sandbox)", () => {
     expect(toolCalled).toBe(true)
     expect(answer).toBe("5")
   }, 15_000)
+
+  test("stages input files for recursive sub-calls", async () => {
+    const tmpDir = nodeFs.mkdtempSync(nodePath.join(os.tmpdir(), "rlm-input-subcall-"))
+    const hostInput = nodePath.join(tmpDir, "notes.txt")
+    nodeFs.writeFileSync(hostInput, "hello-from-input\n")
+
+    try {
+      const answer = await Effect.runPromise(
+        complete({
+          query: "read staged input recursively",
+          context: "",
+          inputs: [{ name: "notes", path: hostInput }]
+        }).pipe(
+          Effect.provide(makeRealSandboxLayers({
+            responses: [
+              {
+                text: "```js\nconst child = await llm_query('read from staged file', '')\n__vars.child = child\nprint(child)\n```"
+              },
+              {
+                text: "```js\nconst text = await readFile('notes.txt')\n__vars.text = text.trim()\nprint(__vars.text)\n```"
+              },
+              { toolCalls: [{ name: "SUBMIT", params: { variable: "text" } }] },
+              { toolCalls: [{ name: "SUBMIT", params: { variable: "child" } }] }
+            ],
+            config: { maxDepth: 2 }
+          })),
+          Effect.timeout("15 seconds")
+        )
+      )
+
+      expect(answer).toBe("hello-from-input")
+    } finally {
+      nodeFs.rmSync(tmpDir, { recursive: true, force: true })
+    }
+  }, 20_000)
 
   test("tool bridge calls retry transient failures before surfacing errors", async () => {
     let attempts = 0

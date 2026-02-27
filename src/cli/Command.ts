@@ -19,7 +19,7 @@ const context = Options.text("context").pipe(
 
 const contextFile = Options.text("context-file").pipe(
   Options.optional,
-  Options.withDescription("Read context from file")
+  Options.withDescription("Deprecated: stage file as --input context=<path> (does not populate --context)")
 )
 
 const provider = Options.choice("provider", PROVIDERS).pipe(

@@ -76,7 +76,10 @@ export interface MediaAttachment {
 export interface InputFile {
   readonly name: string
   readonly path: string
-  readonly metadata?: ContextMetadata
+  readonly metadata?: ContextMetadata & {
+    readonly linesEstimated?: boolean
+    readonly recordCountEstimated?: boolean
+  }
 }
 
 export interface InputManifestEntry {

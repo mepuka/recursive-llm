@@ -107,7 +107,12 @@ const STRUCTURED_CONTEXT_FORMATS = new Set<ContextMetadata["format"]>([
 ])
 
 const sanitizePromptString = (s: string, maxLen: number): string =>
-  s.replace(/[\n\r|`]/g, " ").slice(0, maxLen).trim()
+  s
+    .replace(/[^\x20-\x7E]/g, " ")
+    .replace(/[|`<>]/g, " ")
+    .replace(/\s+/g, " ")
+    .slice(0, maxLen)
+    .trim()
 
 const formatBytes = (bytes: number): string => {
   if (bytes >= 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`
@@ -164,7 +169,7 @@ export const buildReplSystemPromptStatic = (
   }
   lines.push("")
   lines.push("## Variable Space")
-  lines.push("Your query is in `__vars.query`, any context is in `__vars.context`, and when available metadata is in `__vars.contextMeta`.")
+  lines.push("Your query is in `__vars.query`, any context is in `__vars.context`, context metadata (when available) is in `__vars.contextMeta`, and staged input-file metadata (when available) is in `__vars.inputs`.")
   lines.push("Access these via code — do NOT guess at content. Example:")
   lines.push("```js")
   lines.push("print(JSON.stringify(__vars.contextMeta ?? null)) // metadata (if provided)")
@@ -250,9 +255,14 @@ export const buildReplSystemPromptStatic = (
     lines.push("")
     lines.push("Access with `await readFile(\"users.ndjson\")` or process with shell tools.")
     lines.push("File metadata is also available in `__vars.inputs`.")
+    lines.push("`__vars.inputs` entries use:")
+    lines.push("`{ name, path, bytes, format, lines, linesEstimated, recordCount, recordCountEstimated, fields, sampleRecord }`")
+    if (canRecurse) {
+      lines.push("Recursive sub-calls receive these same staged inputs in their own sandbox work directories.")
+    }
     lines.push("")
     lines.push("For large files, avoid reading the entire file into a single variable.")
-    lines.push("Use shell tools, read in chunks, or process line-by-line.")
+    lines.push("Use shell tools, read in chunks, or process line-by-line (e.g., `head`, `tail`, `sed -n`, `jq` pipelines).")
     lines.push("")
   }
   if (!isStrict) {

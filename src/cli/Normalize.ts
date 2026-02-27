@@ -301,7 +301,7 @@ export const normalizeCliArgs = (
         )
       }
       console.error(
-        "[deprecated] --context-file is deprecated; use --input context=<path> instead"
+        "[deprecated] --context-file is deprecated; use --input context=<path> instead (file is staged; not loaded into --context)"
       )
       inputSpecs.push(`context=${contextFile}`)
     }

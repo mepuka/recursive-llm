@@ -89,6 +89,10 @@ export interface RunSchedulerOptions {
   readonly returnPartialOutcome?: boolean
 }
 
+const INPUT_NAME_RE = /^[A-Za-z][A-Za-z0-9_-]*$/
+const MAX_INPUT_NAME_LENGTH = 128
+const MAX_STAGED_INPUT_BYTES = 2 * 1024 * 1024 * 1024
+
 const formatExecutionError = (error: unknown): string => {
   if (typeof error === "object" && error !== null && "message" in error) {
     const message = (error as { readonly message?: unknown }).message
@@ -447,54 +451,85 @@ const runSchedulerInternal = Effect.fn("Scheduler.runInternal")(function*(option
             : {})
         }).pipe(Effect.provideService(Scope.Scope, callScope))
 
-        // Stage input files (root call only, depth === 0)
+        // Stage input files for this call when provided.
         let inputManifest: Array<InputManifestEntry> | undefined
-        if (command.depth === 0 && options.inputs !== undefined && options.inputs.length > 0) {
+        if (options.inputs !== undefined && options.inputs.length > 0) {
           const sandboxWorkDir = sandbox.workDir
-          if (sandboxWorkDir !== undefined) {
-            inputManifest = []
-            let totalStagedBytes = 0
-            const MAX_STAGED_BYTES = 2 * 1024 * 1024 * 1024
+          if (sandboxWorkDir === undefined) {
+            return yield* Effect.fail(new SandboxError({
+              message: "Input files require a filesystem-enabled sandbox (strict mode disables staged inputs)"
+            }))
+          }
 
-            for (const inputFile of options.inputs) {
-              const srcFile = Bun.file(inputFile.path)
-              const srcExists = yield* Effect.promise(() => srcFile.exists())
-              if (!srcExists) {
-                return yield* Effect.fail(new SandboxError({
-                  message: `Input file not found: ${inputFile.path}`
-                }))
-              }
+          inputManifest = []
+          let totalStagedBytes = 0
 
-              const srcSize = srcFile.size
-              const ext = inputFile.path.includes(".")
-                ? inputFile.path.slice(inputFile.path.lastIndexOf("."))
-                : ""
-              const destFilename = `${inputFile.name}${ext}`
-              const destPath = nodePath.join(sandboxWorkDir, destFilename)
-
-              yield* Effect.promise(() => Bun.write(destPath, srcFile))
-
-              totalStagedBytes += srcSize
-              if (totalStagedBytes > MAX_STAGED_BYTES) {
-                return yield* Effect.fail(new SandboxError({
-                  message: `Total staged input size exceeds 2GB limit`
-                }))
-              }
-
-              const meta = inputFile.metadata
-              inputManifest.push({
-                name: inputFile.name,
-                path: destFilename,
-                bytes: srcSize,
-                format: meta?.format ?? "unknown",
-                lines: meta?.lines ?? null,
-                linesEstimated: (meta as Record<string, unknown>)?.linesEstimated === true,
-                recordCount: meta?.recordCount ?? null,
-                recordCountEstimated: (meta as Record<string, unknown>)?.recordCountEstimated === true,
-                fields: meta?.fields ?? null,
-                sampleRecord: meta?.sampleRecord ?? null
-              })
+          for (const inputFile of options.inputs) {
+            if (inputFile.name.length > MAX_INPUT_NAME_LENGTH || !INPUT_NAME_RE.test(inputFile.name)) {
+              return yield* Effect.fail(new SandboxError({
+                message: `Invalid input file name "${inputFile.name}" (must match ${INPUT_NAME_RE.source}, <= ${MAX_INPUT_NAME_LENGTH} chars)`
+              }))
             }
+
+            const srcFile = Bun.file(inputFile.path)
+            const srcExists = yield* Effect.promise(() => srcFile.exists())
+            if (!srcExists) {
+              return yield* Effect.fail(new SandboxError({
+                message: `Input file not found: ${inputFile.path}`
+              }))
+            }
+
+            const srcSize = srcFile.size
+            if (!Number.isFinite(srcSize) || srcSize < 0) {
+              return yield* Effect.fail(new SandboxError({
+                message: `Could not determine input file size: ${inputFile.path}`
+              }))
+            }
+            if (totalStagedBytes + srcSize > MAX_STAGED_INPUT_BYTES) {
+              return yield* Effect.fail(new SandboxError({
+                message: "Total staged input size exceeds 2GB limit"
+              }))
+            }
+
+            const ext = nodePath.extname(nodePath.basename(inputFile.path))
+            const destFilename = `${inputFile.name}${ext}`
+            const destPath = nodePath.resolve(sandboxWorkDir, destFilename)
+            const relative = nodePath.relative(sandboxWorkDir, destPath)
+            if (relative.startsWith("..") || nodePath.isAbsolute(relative)) {
+              return yield* Effect.fail(new SandboxError({
+                message: `Resolved staged path escapes sandbox: ${destFilename}`
+              }))
+            }
+            const destExists = yield* Effect.promise(() => Bun.file(destPath).exists())
+            if (destExists) {
+              return yield* Effect.fail(new SandboxError({
+                message: `Staged input destination already exists: ${destFilename}`
+              }))
+            }
+
+            yield* Effect.promise(() => Bun.write(destPath, srcFile))
+
+            const stagedBytes = Bun.file(destPath).size
+            totalStagedBytes += stagedBytes
+            if (totalStagedBytes > MAX_STAGED_INPUT_BYTES) {
+              return yield* Effect.fail(new SandboxError({
+                message: "Total staged input size exceeds 2GB limit"
+              }))
+            }
+
+            const meta = inputFile.metadata
+            inputManifest.push({
+              name: inputFile.name,
+              path: destFilename,
+              bytes: stagedBytes,
+              format: meta?.format ?? "unknown",
+              lines: meta?.lines ?? null,
+              linesEstimated: meta?.linesEstimated === true,
+              recordCount: meta?.recordCount ?? null,
+              recordCountEstimated: meta?.recordCountEstimated === true,
+              fields: meta?.fields ?? null,
+              sampleRecord: meta?.sampleRecord ?? null
+            })
           }
         }
 

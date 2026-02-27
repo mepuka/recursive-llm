@@ -916,6 +916,8 @@ describe("SystemPrompt", () => {
     expect(prompt).toContain("15.0 MB")
     expect(prompt).toContain("~15,000")
     expect(prompt).toContain("id, name, email")
+    expect(prompt).toContain("`__vars.inputs` entries use:")
+    expect(prompt).toContain("linesEstimated")
   })
 
   test("does not include Input Files section when no inputs", () => {
@@ -942,10 +944,11 @@ describe("SystemPrompt", () => {
         name: "test", path: "test.ndjson", bytes: 100,
         format: "ndjson", lines: 1, linesEstimated: false,
         recordCount: 1, recordCountEstimated: false,
-        fields: ["field|with|pipes"], sampleRecord: "x"
+        fields: ["field|with|pipes", "<script>alert(1)</script>"], sampleRecord: "x"
       }]
     })
     expect(prompt).not.toContain("field|with")
+    expect(prompt).not.toContain("<script>")
   })
 })
 
