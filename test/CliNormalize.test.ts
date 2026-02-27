@@ -111,7 +111,6 @@ describe("CLI normalization", () => {
     expect(cliArgs).toEqual({
       query: "What is recursive decomposition?",
       context: "context",
-      contextFile: fixtureA,
       inputs: [{ name: "context", path: nodeFs.realpathSync(fixtureA) }],
       provider: "google",
       model: "gemini-2.0-pro",
@@ -476,7 +475,7 @@ describe("--input CLI wiring", () => {
       },
       ["query", "--context-file", fixtureA]
     )
-    expect(cliArgs.contextFile).toBe(fixtureA)
+    expect((cliArgs as any).contextFile).toBeUndefined()
     expect(cliArgs.inputs).toEqual([
       { name: "context", path: nodeFs.realpathSync(fixtureA) }
     ])

@@ -5,7 +5,7 @@ import { Rlm } from "../Rlm"
 import { formatEvent, type RenderOptions } from "../RlmRenderer"
 import type { RlmToolAny } from "../RlmTool"
 import { analyzeContext } from "../ContextMetadata"
-import type { MediaAttachment } from "../RlmTypes"
+import type { InputFile, MediaAttachment } from "../RlmTypes"
 import * as path from "node:path"
 
 const detectMediaType = (filePath: string): string => {
@@ -33,13 +33,15 @@ const detectMediaType = (filePath: string): string => {
 
 export const runCliProgram = (cliArgs: CliArgs) =>
   Effect.gen(function*() {
-    const contextFile = cliArgs.contextFile
-    const context = contextFile
-      ? yield* Effect.promise(() => Bun.file(contextFile).text())
-      : cliArgs.context
+    const context = cliArgs.context
     const contextMetadata = context.length > 0
-      ? analyzeContext(context, contextFile !== undefined ? path.basename(contextFile) : undefined)
+      ? analyzeContext(context, undefined)
       : undefined
+
+    const inputFiles: ReadonlyArray<InputFile> | undefined = cliArgs.inputs?.map(entry => ({
+      name: entry.name,
+      path: entry.path
+    }))
 
     const tools: ReadonlyArray<RlmToolAny> = cliArgs.nlpTools
       ? yield* nlpTools.pipe(
@@ -94,6 +96,7 @@ export const runCliProgram = (cliArgs: CliArgs) =>
       context,
       ...(contextMetadata !== undefined ? { contextMetadata } : {}),
       ...(mediaAttachments.length > 0 ? { mediaAttachments } : {}),
+      ...(inputFiles !== undefined && inputFiles.length > 0 ? { inputs: inputFiles } : {}),
       tools
     }).pipe(
       Stream.runFoldEffect(

@@ -172,42 +172,71 @@ describe("CLI runtime execution", () => {
     expect(output.stderr).not.toContain("\x1b[")
   })
 
-  test("loads context from --context-file and passes it to stream", async () => {
-    const contextPath = `/tmp/recursive-llm-cli-context-${Date.now()}.txt`
-    await Bun.write(contextPath, "file context")
-
+  test("passes context string directly to stream (contextFile removed)", async () => {
     let capturedContext = ""
 
-    try {
-      await captureOutput(() =>
-        Effect.runPromise(
-          runCliProgram({
-            ...baseCliArgs,
-            context: "inline context should be ignored",
-            contextFile: contextPath
-          }).pipe(
-            Effect.provide(
-              makeRlmLayer(
-                [
-                  RlmEvent.CallFinalized({
-                    completionId: "completion-4",
-                    callId,
-                    depth: 0,
-                    answer: "ok"
-                  })
-                ],
-                (options) => {
-                  capturedContext = options.context
-                }
-              )
+    await captureOutput(() =>
+      Effect.runPromise(
+        runCliProgram({
+          ...baseCliArgs,
+          context: "inline context"
+        }).pipe(
+          Effect.provide(
+            makeRlmLayer(
+              [
+                RlmEvent.CallFinalized({
+                  completionId: "completion-4",
+                  callId,
+                  depth: 0,
+                  answer: "ok"
+                })
+              ],
+              (options) => {
+                capturedContext = options.context ?? ""
+              }
             )
           )
         )
       )
-    } finally {
-      await Bun.file(contextPath).unlink()
+    )
+
+    expect(capturedContext).toBe("inline context")
+  })
+
+  test("passes inputs through to rlm.stream", async () => {
+    let capturedInputs: ReadonlyArray<{ name: string; path: string }> | undefined
+
+    const onStream = (options: any) => {
+      capturedInputs = options.inputs
     }
 
-    expect(capturedContext).toBe("file context")
+    await captureOutput(() =>
+      Effect.runPromise(
+        runCliProgram({
+          ...baseCliArgs,
+          inputs: [
+            { name: "data", path: "/tmp/data.csv" }
+          ]
+        }).pipe(
+          Effect.provide(
+            makeRlmLayer(
+              [
+                RlmEvent.CallFinalized({
+                  completionId: "completion-5",
+                  callId,
+                  depth: 0,
+                  answer: "ok"
+                })
+              ],
+              onStream
+            )
+          )
+        )
+      )
+    )
+
+    expect(capturedInputs).toEqual([
+      { name: "data", path: "/tmp/data.csv" }
+    ])
   })
 })

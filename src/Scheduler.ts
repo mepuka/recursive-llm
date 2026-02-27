@@ -56,6 +56,7 @@ import {
   CallId,
   type CompletionOutcome,
   type FinalAnswerPayload,
+  type InputFile,
   type MediaAttachment,
   type PartialResult,
   RlmCommand,
@@ -78,6 +79,7 @@ export interface RunSchedulerOptions {
   readonly contextMetadata?: ContextMetadata
   readonly contextTextField?: string
   readonly mediaAttachments?: ReadonlyArray<MediaAttachment>
+  readonly inputs?: ReadonlyArray<InputFile>
   readonly depth?: number
   readonly rootCallId?: CallId
   readonly tools?: ReadonlyArray<RlmToolAny>

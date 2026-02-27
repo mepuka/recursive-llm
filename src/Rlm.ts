@@ -6,7 +6,7 @@ import { RlmModel } from "./RlmModel"
 import type { RlmError } from "./RlmError"
 import { BudgetExhaustedError, NoFinalAnswerError, OutputValidationError } from "./RlmError"
 import { RlmRuntime, RlmRuntimeLive } from "./Runtime"
-import { CallId, type CompletionOutcome, RlmEvent } from "./RlmTypes"
+import { CallId, type CompletionOutcome, type InputFile, RlmEvent } from "./RlmTypes"
 import type { RunSchedulerOptions } from "./Scheduler"
 import { runScheduler, runSchedulerWithOutcome } from "./Scheduler"
 import { SandboxConfig, SandboxFactory } from "./Sandbox"
@@ -20,10 +20,11 @@ import { RunTraceConfig, RunTraceWriterBun, RunTraceWriterNoopLayer } from "./Ru
 
 export interface CompleteOptionsBase {
   readonly query: string
-  readonly context: string
+  readonly context?: string
   readonly contextMetadata?: ContextMetadata
   readonly contextTextField?: string
   readonly mediaAttachments?: RunSchedulerOptions["mediaAttachments"]
+  readonly inputs?: ReadonlyArray<InputFile>
   readonly depth?: number
   readonly tools?: ReadonlyArray<RlmToolAny>
 }
@@ -50,7 +51,7 @@ export interface RlmService {
 
 const toSchedulerOptions = (options: CompleteOptionsBase & { readonly outputSchema?: Schema.Schema<any, any, never> }): RunSchedulerOptions => ({
   query: options.query,
-  context: options.context,
+  context: options.context ?? "",
   ...(options.contextMetadata !== undefined
     ? { contextMetadata: options.contextMetadata }
     : {}),
@@ -59,6 +60,9 @@ const toSchedulerOptions = (options: CompleteOptionsBase & { readonly outputSche
     : {}),
   ...(options.mediaAttachments !== undefined && options.mediaAttachments.length > 0
     ? { mediaAttachments: options.mediaAttachments }
+    : {}),
+  ...(options.inputs !== undefined && options.inputs.length > 0
+    ? { inputs: options.inputs }
     : {}),
   ...(options.depth !== undefined ? { depth: options.depth } : {}),
   ...(options.tools !== undefined && options.tools.length > 0 ? { tools: options.tools } : {}),

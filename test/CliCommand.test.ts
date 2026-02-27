@@ -1,10 +1,26 @@
-import { afterEach, describe, expect, test } from "bun:test"
+import * as nodeFs from "node:fs"
+import * as nodePath from "node:path"
+import * as os from "node:os"
+import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test"
 import * as ValidationError from "@effect/cli/ValidationError"
 import { BunContext } from "@effect/platform-bun"
 import { Cause, Effect, Exit, Option } from "effect"
 import type { CliArgs } from "../src/CliLayer"
 import { runCliCommand } from "../src/cli/Command"
 import { CliInputError } from "../src/cli/Normalize"
+
+let tmpDir: string
+let fixtureFile: string
+
+beforeAll(() => {
+  tmpDir = nodeFs.mkdtempSync(nodePath.join(os.tmpdir(), "rlm-cmd-test-"))
+  fixtureFile = nodePath.join(tmpDir, "data.txt")
+  nodeFs.writeFileSync(fixtureFile, "test data")
+})
+
+afterAll(() => {
+  nodeFs.rmSync(tmpDir, { recursive: true, force: true })
+})
 
 const env = {
   ANTHROPIC_API_KEY: "anthropic-key",
@@ -176,6 +192,20 @@ describe("Effect CLI command", () => {
 
     const failure = getFailure(exit)
     expect(ValidationError.isValidationError(failure)).toBeTrue()
+  })
+
+  test("maps --input flags to CliArgs.inputs", async () => {
+    const captured = await runWithCapture([
+      "bun",
+      "src/cli.ts",
+      "analyze this",
+      "--input",
+      `doc=${fixtureFile}`
+    ])
+
+    expect(captured?.inputs).toEqual([
+      { name: "doc", path: nodeFs.realpathSync(fixtureFile) }
+    ])
   })
 
   test("fails with CliInputError when sub delegation is enabled without sub model", async () => {

@@ -386,7 +386,6 @@ export const normalizeCliArgs = (
       verbose: parsed.verbose,
       nlpTools: parsed.nlpTools,
       ...(parsed.noTrace ? { noTrace: true } : {}),
-      ...(contextFile !== undefined ? { contextFile } : {}),
       ...(resolvedInputs !== undefined ? { inputs: resolvedInputs } : {}),
       ...(subModel !== undefined ? { subModel } : {}),
       ...(subDelegationEnabled !== undefined ? { subDelegationEnabled } : {}),
