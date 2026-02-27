@@ -1,4 +1,5 @@
 import { Brand, Data, Deferred, Option, Scope } from "effect"
+import type { ContextMetadata } from "./ContextMetadata"
 import type { SandboxInstance } from "./Sandbox"
 import type { RlmError } from "./RlmError"
 import type { RlmToolAny } from "./RlmTool"
@@ -70,6 +71,25 @@ export interface MediaAttachment {
   readonly name: string
   readonly mediaType: string
   readonly data: string | Uint8Array | URL
+}
+
+export interface InputFile {
+  readonly name: string
+  readonly path: string
+  readonly metadata?: ContextMetadata
+}
+
+export interface InputManifestEntry {
+  readonly name: string
+  readonly path: string
+  readonly bytes: number
+  readonly format: string
+  readonly lines: number | null
+  readonly linesEstimated: boolean
+  readonly recordCount: number | null
+  readonly recordCountEstimated: boolean
+  readonly fields: ReadonlyArray<string> | null
+  readonly sampleRecord: string | null
 }
 
 // --- Tagged Enums ---
