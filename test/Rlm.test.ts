@@ -424,6 +424,26 @@ describe("Rlm typed output", () => {
     }
   })
 
+  test("complete with query-only (no context) succeeds", async () => {
+    const result = await Effect.runPromise(
+      complete({
+        query: "What is 2+2?"
+      }).pipe(
+        Effect.either,
+        Effect.provide(
+          makeLayers({
+            responses: [submitAnswer("4")]
+          })
+        )
+      )
+    )
+
+    expect(result._tag).toBe("Right")
+    if (result._tag === "Right") {
+      expect(result.right).toBe("4")
+    }
+  })
+
   test("complete without outputSchema returns SUBMIT answer string", async () => {
     const result = await Effect.runPromise(
       complete({
