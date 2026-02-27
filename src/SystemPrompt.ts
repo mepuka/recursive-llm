@@ -31,6 +31,7 @@ export interface ReplSystemPromptOptions {
   readonly sandboxMode?: "permissive" | "strict"
   readonly subModelContextChars?: number
   readonly contextMetadata?: ContextMetadata
+  readonly bridgeTimeoutMs?: number
 }
 
 // Keep this in sync with effect-nlp's exported tool names (currently 19 tools).
@@ -191,6 +192,11 @@ export const buildReplSystemPromptStatic = (
   lines.push("delete __vars.rawExtractions // don't carry forward parsed intermediates")
   lines.push("```")
   lines.push("Large `__vars` waste context tokens. Keep only what you need for remaining iterations.")
+  lines.push("If a previously-stored `__vars` key appears undefined, diagnose with:")
+  lines.push("```js")
+  lines.push("print(Object.keys(__vars))  // what keys survived?")
+  lines.push("```")
+  lines.push("Common causes: (a) you used `const`/`let` instead of `__vars`, (b) the value exceeded the IPC frame limit, (c) a typo in the variable name.")
   if (options.maxFrameBytes !== undefined) {
     const limitLabel = options.maxFrameBytes >= 1024 * 1024
       ? `${Math.floor(options.maxFrameBytes / (1024 * 1024))}MB`
@@ -359,6 +365,7 @@ export const buildReplSystemPromptStatic = (
   lines.push("7. MINIMIZE RETYPING — Do not paste context text into code as string literals. Access data through `__vars` and compute over it. Retyping wastes tokens and introduces errors.")
   if (canRecurse) {
     lines.push("8. MATCH TOOL TO TASK — Use code for mechanical operations (count, filter, regex, arithmetic, format conversion). Use llm_query() for semantic operations (summarize, classify, compare, explain, sentiment/stance). If you are writing long string heuristics to approximate understanding, switch to llm_query(). If the user explicitly requests rule-based matching, code is valid.")
+    lines.push("9. VARIABLE NAME CONSISTENCY — When using `SUBMIT({ variable: \"name\" })`, the variable name must EXACTLY match the key you assigned in `__vars`. Check spelling and casing.")
   }
   lines.push("")
   lines.push("## Common Mistakes — DO NOT")
@@ -395,6 +402,9 @@ export const buildReplSystemPromptStatic = (
     lines.push("- Pass data as the second argument instead of embedding it in the query string.")
     lines.push("- If context is not a string, serialize it first (for example `JSON.stringify(data)`).")
     lines.push("- Prefer `llm_query_batched` or `Promise.all([...llm_query(...)])` for independent chunk analysis; use sequential `await` only when each step depends on the previous output.")
+    if (options.bridgeTimeoutMs !== undefined) {
+      lines.push(`- Each llm_query/llm_query_batched call has a ${Math.floor(options.bridgeTimeoutMs / 1000)}s timeout. Complex queries on large context may timeout — break into smaller chunks if needed.`)
+    }
     if (options.subModelContextChars !== undefined) {
       const approxRecordsPerCall = Math.max(1, Math.floor(options.subModelContextChars / 500))
       lines.push(`- Sub-model context guidance: each llm_query call handles ~${options.subModelContextChars} chars (~${approxRecordsPerCall} short records). Size your chunks accordingly.`)
@@ -679,6 +689,31 @@ export const buildReplSystemPromptStatic = (
       lines.push("Then: `SUBMIT({ answer: synthesis })`")
     }
     lines.push("")
+    if (options.depth < options.maxDepth) {
+      lines.push("## Multi-Agent Coordination")
+      lines.push("When delegating to multiple sub-agents via llm_query or llm_query_batched:")
+      lines.push("")
+      lines.push("1. **Store results immediately** — assign each result to __vars before any further processing:")
+      lines.push("   ```js")
+      lines.push("   const results = await llm_query_batched(queries, contexts)")
+      lines.push("   __vars.subResults = results  // CRITICAL: persist immediately")
+      lines.push("   print(`Got ${results.length} sub-agent results (${results.map(r => r.length)} chars)`)")
+      lines.push("   ```")
+      lines.push("")
+      lines.push("2. **Print summaries, not full results** — sub-agent results may be large; printing them wastes the output truncation budget. Print counts and lengths only.")
+      lines.push("")
+      lines.push("3. **Assemble in a dedicated iteration** — don't process and assemble in the same iteration:")
+      lines.push("   ```js")
+      lines.push("   // Iteration N+1: assemble from stored results")
+      lines.push("   const report = __vars.subResults.map((r, i) => `## Analysis ${i+1}\\n${r}`).join('\\n\\n')")
+      lines.push("   __vars.finalReport = report")
+      lines.push("   print(`Final report: ${report.length} chars, ${report.split('\\n').length} lines`)")
+      lines.push("   ```")
+      lines.push("")
+      lines.push("4. **Submit via variable reference** for large assembled results:")
+      lines.push("   `SUBMIT({ variable: \"finalReport\" })`")
+      lines.push("")
+    }
   }
 
   if (!isStrict && options.tools && options.tools.length > 0) {
@@ -780,7 +815,7 @@ export const buildReplSystemPromptStatic = (
 }
 
 export const buildReplSystemPromptDynamic = (
-  options: Pick<ReplSystemPromptOptions, "iteration" | "budget"> & { maxIterations: number }
+  options: Pick<ReplSystemPromptOptions, "iteration" | "budget"> & { maxIterations: number; maxExecutionOutputChars?: number }
 ): string => {
   const lines: Array<string> = []
   lines.push("## Budget (current snapshot — call `budget()` in code for live values)")
@@ -795,6 +830,9 @@ export const buildReplSystemPromptDynamic = (
   }
   if (options.budget.maxTimeMs !== undefined) {
     lines.push(`Elapsed time: ${options.budget.elapsedMs ?? 0}ms / ${options.budget.maxTimeMs}ms.`)
+  }
+  if (options.maxExecutionOutputChars !== undefined) {
+    lines.push(`Output from print() is truncated at ~${options.maxExecutionOutputChars} chars. For large results, store in __vars and print only summaries.`)
   }
   if (options.budget.iterationsRemaining <= 0) {
     lines.push("WARNING: This is your LAST iteration. If you have verified output, call SUBMIT() now.")
@@ -811,7 +849,18 @@ export const buildReplSystemPrompt = (options: ReplSystemPromptOptions): string 
   })
 }
 
-export const buildExtractSystemPrompt = (outputJsonSchema?: object, variableNames?: ReadonlyArray<string>): string => {
+export interface ExtractVariableMetadata {
+  readonly name: string
+  readonly type: string
+  readonly size?: number
+  readonly preview?: string
+}
+
+export const buildExtractSystemPrompt = (
+  outputJsonSchema?: object,
+  variableNames?: ReadonlyArray<string>,
+  variableMetadata?: ReadonlyArray<ExtractVariableMetadata>
+): string => {
   const submitInvocationSchema = buildSubmitInvocationSchema(outputJsonSchema)
   const lines: Array<string> = []
   lines.push("You ran out of iterations. Based on the work done so far, provide your best answer now.")
@@ -820,7 +869,18 @@ export const buildExtractSystemPrompt = (outputJsonSchema?: object, variableName
   lines.push("You MUST finalize using exactly one SUBMIT tool call.")
   lines.push("Do NOT output code blocks or commentary.")
   lines.push("PREFER `SUBMIT({ variable: \"name\" })` if your result already exists in `__vars` — this avoids generating a large answer inline and is faster.")
-  if (variableNames !== undefined && variableNames.length > 0) {
+  if (variableMetadata !== undefined && variableMetadata.length > 0) {
+    const capped = variableMetadata.slice(0, 30)
+    lines.push("Available variables in `__vars`:")
+    for (const v of capped) {
+      const sizeStr = v.size !== undefined ? ` (${v.size})` : ""
+      const previewStr = v.preview ? ` — ${v.preview.slice(0, 100)}` : ""
+      lines.push(`  - \`${v.name}\`: ${v.type}${sizeStr}${previewStr}`)
+    }
+    if (variableMetadata.length > 30) {
+      lines.push(`  (and ${variableMetadata.length - 30} more)`)
+    }
+  } else if (variableNames !== undefined && variableNames.length > 0) {
     const filtered = variableNames
       .filter(n => n !== "context" && n !== "contextMeta" && n !== "query")
       .map(n => n.replace(/[`\n\r]/g, ""))

@@ -76,6 +76,7 @@ describe("Effect CLI command", () => {
       maxLlmCalls: 120,
       quiet: true,
       noColor: true,
+      verbose: false,
       nlpTools: false,
       googleApiKey: "google-key",
       googleApiUrl: "https://vertex.googleapis.com"
@@ -100,6 +101,7 @@ describe("Effect CLI command", () => {
       model: "claude-sonnet-4-5-20250929",
       quiet: false,
       noColor: false,
+      verbose: false,
       nlpTools: false,
       openaiApiKey: "openai-key"
     })

@@ -115,6 +115,20 @@ const nlpTools = Options.boolean("nlp-tools").pipe(
   Options.withDescription("Enable built-in NLP tools (DocumentStats, ChunkBySentences, ExtractEntities, etc.)")
 )
 
+const outputFile = Options.text("output-file").pipe(
+  Options.optional,
+  Options.withDescription("Write final answer to file (clean text, no ANSI)")
+)
+
+const verbose = Options.boolean("verbose").pipe(
+  Options.withDescription("Show untruncated output in terminal")
+)
+
+const bridgeTimeout = Options.integer("bridge-timeout").pipe(
+  Options.optional,
+  Options.withDescription("Bridge call timeout in seconds (default: 300)")
+)
+
 const noTrace = Options.boolean("no-trace").pipe(
   Options.withDescription("Disable run trace persistence")
 )
@@ -147,7 +161,10 @@ const commandConfig = {
   noCache,
   quiet,
   noColor,
+  verbose,
   nlpTools,
+  outputFile,
+  bridgeTimeout,
   noTrace,
   traceDir
 }

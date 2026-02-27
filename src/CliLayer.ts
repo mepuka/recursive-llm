@@ -37,7 +37,10 @@ export interface CliArgs {
   noCache?: boolean
   quiet: boolean
   noColor: boolean
+  verbose: boolean
   nlpTools: boolean
+  outputFile?: string
+  bridgeTimeoutMs?: number
   noTrace?: boolean
   traceDir?: string
   anthropicApiKey?: string
@@ -185,6 +188,7 @@ export const makeCliConfig = (cliArgs: CliArgs): RlmConfigService => {
     eventBufferCapacity: 4096,
     maxExecutionOutputChars: 8_000,
     enablePromptCaching: cliArgs.enablePromptCaching ?? true,
+    ...(cliArgs.bridgeTimeoutMs !== undefined ? { bridgeTimeoutMs: cliArgs.bridgeTimeoutMs } : {}),
     ...(cliArgs.noCache === true ? { cache: { enabled: false } } : {}),
     llmRetryCount: 1,
     llmRetryBaseDelayMs: 100,

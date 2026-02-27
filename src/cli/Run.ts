@@ -42,7 +42,14 @@ export const runCliProgram = (cliArgs: CliArgs) =>
       : undefined
 
     const tools: ReadonlyArray<RlmToolAny> = cliArgs.nlpTools
-      ? yield* nlpTools.pipe(Effect.orDie)
+      ? yield* nlpTools.pipe(
+          Effect.catchAll((error) =>
+            Effect.gen(function*() {
+              yield* Effect.logWarning(`--nlp-tools: failed to load NLP tools (${error.message}). Install effect-nlp and wink-nlp to use this feature. Continuing without NLP tools.`)
+              return [] as ReadonlyArray<RlmToolAny>
+            })
+          )
+        )
       : []
     const attachmentMap = new Map<string, MediaAttachment>()
 
@@ -72,7 +79,14 @@ export const runCliProgram = (cliArgs: CliArgs) =>
 
     const renderOpts: RenderOptions = {
       quiet: cliArgs.quiet,
-      noColor: cliArgs.noColor
+      noColor: cliArgs.noColor,
+      ...(cliArgs.verbose ? {
+        modelTruncateLimit: 50_000,
+        outputTruncateLimit: 50_000,
+        finalTruncateLimit: 50_000,
+        maxCodeLines: 500,
+        maxOutputLines: 500
+      } : {})
     }
 
     const result = yield* rlm.stream({
@@ -101,6 +115,10 @@ export const runCliProgram = (cliArgs: CliArgs) =>
 
     if (result.failed || !result.answer) {
       process.exitCode = 1
+    }
+
+    if (cliArgs.outputFile) {
+      yield* Effect.promise(() => Bun.write(cliArgs.outputFile!, result.answer + "\n"))
     }
 
     process.stdout.write(result.answer + "\n")

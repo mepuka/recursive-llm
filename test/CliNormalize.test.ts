@@ -30,7 +30,10 @@ const baseParsed: ParsedCliConfig = {
   noCache: false,
   quiet: false,
   noColor: false,
+  verbose: false,
   nlpTools: false,
+  outputFile: Option.none(),
+  bridgeTimeout: Option.none(),
   noTrace: false,
   traceDir: Option.none()
 }
@@ -91,6 +94,7 @@ describe("CLI normalization", () => {
       enablePromptCaching: false,
       quiet: true,
       noColor: true,
+      verbose: false,
       nlpTools: false,
       googleApiKey: "google-key",
       googleApiUrl: "https://vertex.googleapis.com"

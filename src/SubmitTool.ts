@@ -214,7 +214,10 @@ export const extractSubmitAnswer = (
     readonly outputMode: "plain" | "structured"
   }
 ): SubmitAnswerExtraction => {
-  const submitCalls = response.toolCalls.filter((toolCall) => toolCall.name === SUBMIT_TOOL_NAME)
+  const submitCalls = response.toolCalls.filter((toolCall) => {
+    const normalized = toolCall.name.startsWith("$") ? toolCall.name.slice(1) : toolCall.name
+    return normalized === SUBMIT_TOOL_NAME
+  })
 
   if (submitCalls.length === 0) {
     return { _tag: "Missing" }

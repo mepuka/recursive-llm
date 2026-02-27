@@ -25,7 +25,10 @@ export interface ParsedCliConfig {
   readonly noCache: boolean
   readonly quiet: boolean
   readonly noColor: boolean
+  readonly verbose: boolean
   readonly nlpTools: boolean
+  readonly outputFile: Option.Option<string>
+  readonly bridgeTimeout: Option.Option<number>
   readonly noTrace: boolean
   readonly traceDir: Option.Option<string>
 }
@@ -177,6 +180,8 @@ export const normalizeCliArgs = (
     const maxTimeMs = toUndefined(parsed.maxTimeMs)
     const enablePromptCaching = parsed.noPromptCaching ? false : undefined
     const sandboxTransport = toUndefined(parsed.sandboxTransport)
+    const outputFile = toUndefined(parsed.outputFile)
+    const bridgeTimeout = toUndefined(parsed.bridgeTimeout)
     const traceDir = toUndefined(parsed.traceDir)
     const namedModels = yield* parseNamedModelSpecs(parsed.namedModel)
     const media = yield* parseNamedPathSpecs(parsed.media, "--media")
@@ -210,6 +215,9 @@ export const normalizeCliArgs = (
     }
     if (maxTimeMs !== undefined && maxTimeMs < 1) {
       return yield* failCliInput("Error: --max-time-ms must be an integer >= 1")
+    }
+    if (bridgeTimeout !== undefined && bridgeTimeout < 1) {
+      return yield* failCliInput("Error: --bridge-timeout must be an integer >= 1")
     }
 
     if (subDelegationEnabled === true && subModel === undefined) {
@@ -254,6 +262,7 @@ export const normalizeCliArgs = (
       model: parsed.model,
       quiet: parsed.quiet,
       noColor: parsed.noColor,
+      verbose: parsed.verbose,
       nlpTools: parsed.nlpTools,
       ...(parsed.noTrace ? { noTrace: true } : {}),
       ...(contextFile !== undefined ? { contextFile } : {}),
@@ -279,6 +288,8 @@ export const normalizeCliArgs = (
         : {}),
       ...(traceDir !== undefined ? { traceDir } : {}),
       ...(enablePromptCaching !== undefined ? { enablePromptCaching } : {}),
+      ...(outputFile !== undefined ? { outputFile } : {}),
+      ...(bridgeTimeout !== undefined ? { bridgeTimeoutMs: bridgeTimeout * 1000 } : {}),
       ...(parsed.noCache ? { noCache: true } : {}),
       ...(anthropicApiKey !== undefined ? { anthropicApiKey } : {}),
       ...(openaiApiKey !== undefined ? { openaiApiKey } : {}),

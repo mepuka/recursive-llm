@@ -328,9 +328,16 @@ const runSchedulerInternal = Effect.fn("Scheduler.runInternal")(function*(option
       const transcript = yield* readTranscript(callState)
       const vars = makeCallVariableSpace(callState)
       const cached = yield* vars.cached
-      const varNames = cached.variables.map(v => v.name)
+      const varMeta = cached.variables
+        .filter(v => v.name !== "context" && v.name !== "contextMeta" && v.name !== "query")
+        .map(v => ({
+          name: v.name,
+          type: v.type,
+          ...(v.size !== undefined ? { size: v.size } : {}),
+          ...(v.preview !== undefined ? { preview: v.preview } : {})
+        }))
       const extractPrompt = buildExtractPrompt({
-        systemPrompt: buildExtractSystemPrompt(callState.outputJsonSchema, varNames),
+        systemPrompt: buildExtractSystemPrompt(callState.outputJsonSchema, undefined, varMeta),
         query: callState.query,
         ...(callState.contextMetadata !== undefined || callState.context.length > 0
           ? { contextMetadata: callState.contextMetadata ?? analyzeContext(callState.context) }
@@ -470,6 +477,9 @@ const runSchedulerInternal = Effect.fn("Scheduler.runInternal")(function*(option
           sandboxMode: sandboxConfig.sandboxMode,
           ...(config.subModelContextChars !== undefined
             ? { subModelContextChars: config.subModelContextChars }
+            : {}),
+          ...(config.bridgeTimeoutMs !== undefined
+            ? { bridgeTimeoutMs: config.bridgeTimeoutMs }
             : {})
         } as const
         const staticSystemPromptPrefix = buildReplSystemPromptStatic(staticSystemPromptArgs)
@@ -646,7 +656,8 @@ const runSchedulerInternal = Effect.fn("Scheduler.runInternal")(function*(option
           elapsedMs: Date.now() - runtime.completionStartedAtMs,
           ...(config.maxTimeMs !== undefined ? { maxTimeMs: config.maxTimeMs } : {})
         },
-        maxIterations: config.maxIterations
+        maxIterations: config.maxIterations,
+        maxExecutionOutputChars: config.maxExecutionOutputChars
       })
 
       const prompt = buildReplPrompt({
@@ -950,21 +961,26 @@ const runSchedulerInternal = Effect.fn("Scheduler.runInternal")(function*(option
       }))
 
       yield* markCodeExecuted(callState)
-      yield* attachExecutionOutput(
-        callState,
-        truncateExecutionOutput(command.output, config.maxExecutionOutputChars)
-      )
 
       const vars = makeCallVariableSpace(callState)
+      let syncWarning = ""
       yield* vars.sync.pipe(
         Effect.catchAll((error) =>
-          publishSchedulerWarning({
-            code: "VARIABLE_SYNC_FAILED",
-            message: `Failed to refresh sandbox variable snapshot after code execution: ${formatExecutionError(error)}. Continuing with cached snapshot.`,
-            callId: command.callId,
-            commandTag: command._tag
+          Effect.gen(function*() {
+            yield* publishSchedulerWarning({
+              code: "VARIABLE_SYNC_FAILED",
+              message: `Failed to refresh sandbox variable snapshot after code execution: ${formatExecutionError(error)}. Continuing with cached snapshot.`,
+              callId: command.callId,
+              commandTag: command._tag
+            })
+            syncWarning = `\n⚠ Variable snapshot sync failed: ${formatExecutionError(error)}. Your __vars assignments may not be visible to SUBMIT. Print Object.keys(__vars) to verify.`
           })
         )
+      )
+
+      yield* attachExecutionOutput(
+        callState,
+        truncateExecutionOutput(command.output, config.maxExecutionOutputChars) + syncWarning
       )
 
       yield* Effect.fork(
