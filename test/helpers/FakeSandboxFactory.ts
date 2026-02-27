@@ -1,4 +1,7 @@
 import { Effect, Layer } from "effect"
+import * as nodeFs from "node:fs"
+import * as os from "node:os"
+import * as nodePath from "node:path"
 import { SandboxFactory } from "../../src/Sandbox"
 
 export interface FakeSandboxMetrics {
@@ -20,8 +23,10 @@ export const makeFakeSandboxFactoryLayer = (
         }
 
         const vars = new Map<string, unknown>()
+        const workDir = nodeFs.mkdtempSync(nodePath.join(os.tmpdir(), "rlm-fake-sandbox-"))
 
         return Effect.succeed({
+          workDir,
           execute: Effect.fn("FakeSandbox.execute")(function*(code: string) {
             metrics?.snippets.push(code)
             if (metrics) {

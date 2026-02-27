@@ -235,8 +235,11 @@ describe("CLI runtime execution", () => {
       )
     )
 
-    expect(capturedInputs).toEqual([
-      { name: "data", path: "/tmp/data.csv" }
-    ])
+    expect(capturedInputs).toBeDefined()
+    expect(capturedInputs!.length).toBe(1)
+    expect(capturedInputs![0].name).toBe("data")
+    expect(capturedInputs![0].path).toBe("/tmp/data.csv")
+    // metadata is enriched by analyzeFilePrefix in runCliProgram
+    expect(capturedInputs![0].metadata).toBeDefined()
   })
 })

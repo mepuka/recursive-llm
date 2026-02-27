@@ -57,6 +57,7 @@ import {
   type CompletionOutcome,
   type FinalAnswerPayload,
   type InputFile,
+  type InputManifestEntry,
   type MediaAttachment,
   type PartialResult,
   RlmCommand,
@@ -70,6 +71,7 @@ import { publishEvent, publishSchedulerWarning } from "./scheduler/Events"
 import { enqueue } from "./scheduler/Queue"
 import { hashSchema, makeSubcallCacheKey } from "./scheduler/CacheKey"
 import { analyzeContext, type ContextMetadata } from "./ContextMetadata"
+import * as nodePath from "node:path"
 
 import type { RlmToolAny } from "./RlmTool"
 
@@ -445,6 +447,57 @@ const runSchedulerInternal = Effect.fn("Scheduler.runInternal")(function*(option
             : {})
         }).pipe(Effect.provideService(Scope.Scope, callScope))
 
+        // Stage input files (root call only, depth === 0)
+        let inputManifest: Array<InputManifestEntry> | undefined
+        if (command.depth === 0 && options.inputs !== undefined && options.inputs.length > 0) {
+          const sandboxWorkDir = sandbox.workDir
+          if (sandboxWorkDir !== undefined) {
+            inputManifest = []
+            let totalStagedBytes = 0
+            const MAX_STAGED_BYTES = 2 * 1024 * 1024 * 1024
+
+            for (const inputFile of options.inputs) {
+              const srcFile = Bun.file(inputFile.path)
+              const srcExists = yield* Effect.promise(() => srcFile.exists())
+              if (!srcExists) {
+                return yield* Effect.fail(new SandboxError({
+                  message: `Input file not found: ${inputFile.path}`
+                }))
+              }
+
+              const srcSize = srcFile.size
+              const ext = inputFile.path.includes(".")
+                ? inputFile.path.slice(inputFile.path.lastIndexOf("."))
+                : ""
+              const destFilename = `${inputFile.name}${ext}`
+              const destPath = nodePath.join(sandboxWorkDir, destFilename)
+
+              yield* Effect.promise(() => Bun.write(destPath, srcFile))
+
+              totalStagedBytes += srcSize
+              if (totalStagedBytes > MAX_STAGED_BYTES) {
+                return yield* Effect.fail(new SandboxError({
+                  message: `Total staged input size exceeds 2GB limit`
+                }))
+              }
+
+              const meta = inputFile.metadata
+              inputManifest.push({
+                name: inputFile.name,
+                path: destFilename,
+                bytes: srcSize,
+                format: meta?.format ?? "unknown",
+                lines: meta?.lines ?? null,
+                linesEstimated: (meta as Record<string, unknown>)?.linesEstimated === true,
+                recordCount: meta?.recordCount ?? null,
+                recordCountEstimated: (meta as Record<string, unknown>)?.recordCountEstimated === true,
+                fields: meta?.fields ?? null,
+                sampleRecord: meta?.sampleRecord ?? null
+              })
+            }
+          }
+        }
+
         const contextMetadata = deriveContextMetadata(command)
         const toolDescriptors = command.tools?.map((tool) => ({
           name: tool.name,
@@ -482,6 +535,9 @@ const runSchedulerInternal = Effect.fn("Scheduler.runInternal")(function*(option
             : {}),
           ...(config.bridgeTimeoutMs !== undefined
             ? { bridgeTimeoutMs: config.bridgeTimeoutMs }
+            : {}),
+          ...(inputManifest !== undefined && inputManifest.length > 0
+            ? { inputManifest }
             : {})
         } as const
         const staticSystemPromptPrefix = buildReplSystemPromptStatic(staticSystemPromptArgs)
@@ -547,6 +603,9 @@ const runSchedulerInternal = Effect.fn("Scheduler.runInternal")(function*(option
               ? { contextTextField: resolvedContextTextField }
               : {})
           })
+        }
+        if (inputManifest !== undefined && inputManifest.length > 0) {
+          yield* vars.inject("inputs", inputManifest)
         }
 
         yield* setCallState(command.callId, state)

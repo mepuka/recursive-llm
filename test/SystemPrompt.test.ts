@@ -892,6 +892,61 @@ describe("SystemPrompt", () => {
     expect(prompt).toContain("500 lines")
     expect(prompt).toContain("prefer `SUBMIT({ variable:")
   })
+
+  test("includes Input Files table when inputManifest is provided", () => {
+    const prompt = buildReplSystemPromptStatic({
+      ...baseOptions,
+      inputManifest: [{
+        name: "users",
+        path: "users.ndjson",
+        bytes: 15_728_640,
+        format: "ndjson",
+        lines: 15000,
+        linesEstimated: true,
+        recordCount: 15000,
+        recordCountEstimated: true,
+        fields: ["id", "name", "email"],
+        sampleRecord: '{"id":1}'
+      }]
+    })
+
+    expect(prompt).toContain("## Input Files")
+    expect(prompt).toContain("users.ndjson")
+    expect(prompt).toContain("ndjson")
+    expect(prompt).toContain("15.0 MB")
+    expect(prompt).toContain("~15,000")
+    expect(prompt).toContain("id, name, email")
+  })
+
+  test("does not include Input Files section when no inputs", () => {
+    const prompt = buildReplSystemPromptStatic(baseOptions)
+    expect(prompt).not.toContain("## Input Files")
+  })
+
+  test("caps Input Files table at 20 entries", () => {
+    const entries = Array.from({ length: 25 }, (_, i) => ({
+      name: `file${i}`, path: `file${i}.csv`, bytes: 1000,
+      format: "csv", lines: 10, linesEstimated: false,
+      recordCount: 9, recordCountEstimated: false,
+      fields: ["a", "b"], sampleRecord: "1,2"
+    }))
+    const prompt = buildReplSystemPromptStatic({ ...baseOptions, inputManifest: entries })
+    expect(prompt).toContain("and 5 more files")
+    expect(prompt).not.toContain("| file20.csv")
+  })
+
+  test("sanitizes pipe characters in input manifest fields", () => {
+    const prompt = buildReplSystemPromptStatic({
+      ...baseOptions,
+      inputManifest: [{
+        name: "test", path: "test.ndjson", bytes: 100,
+        format: "ndjson", lines: 1, linesEstimated: false,
+        recordCount: 1, recordCountEstimated: false,
+        fields: ["field|with|pipes"], sampleRecord: "x"
+      }]
+    })
+    expect(prompt).not.toContain("field|with")
+  })
 })
 
 describe("buildExtractSystemPrompt", () => {

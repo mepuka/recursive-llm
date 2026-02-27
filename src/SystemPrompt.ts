@@ -1,4 +1,5 @@
 import type { ContextMetadata } from "./ContextMetadata"
+import type { InputManifestEntry } from "./RlmTypes"
 import { buildSubmitInvocationSchema } from "./SubmitTool"
 
 export interface ToolDescriptor {
@@ -32,6 +33,7 @@ export interface ReplSystemPromptOptions {
   readonly subModelContextChars?: number
   readonly contextMetadata?: ContextMetadata
   readonly bridgeTimeoutMs?: number
+  readonly inputManifest?: ReadonlyArray<InputManifestEntry>
 }
 
 // Keep this in sync with effect-nlp's exported tool names (currently 19 tools).
@@ -103,6 +105,19 @@ const STRUCTURED_CONTEXT_FORMATS = new Set<ContextMetadata["format"]>([
   "csv",
   "tsv"
 ])
+
+const sanitizePromptString = (s: string, maxLen: number): string =>
+  s.replace(/[\n\r|`]/g, " ").slice(0, maxLen).trim()
+
+const formatBytes = (bytes: number): string => {
+  if (bytes >= 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  return `${bytes} B`
+}
+
+const formatNumber = (n: number): string =>
+  new Intl.NumberFormat("en-US").format(n)
 
 export const buildReplSystemPromptStatic = (
   options: Omit<ReplSystemPromptOptions, "iteration" | "budget">
@@ -204,6 +219,42 @@ export const buildReplSystemPromptStatic = (
     lines.push(`Individual \`__vars\` entries cannot exceed ~${limitLabel} when serialized (IPC frame limit). For very large datasets, split across multiple variables or aggregate before submission.`)
   }
   lines.push("")
+  if (options.inputManifest !== undefined && options.inputManifest.length > 0) {
+    const INPUT_TABLE_CAP = 20
+    lines.push("## Input Files")
+    lines.push("The following data files are available in your working directory:")
+    lines.push("")
+    lines.push("| File | Format | Size | Records | Fields |")
+    lines.push("|------|--------|------|---------|--------|")
+    const shown = options.inputManifest.slice(0, INPUT_TABLE_CAP)
+    for (const entry of shown) {
+      const file = sanitizePromptString(entry.path, 128)
+      const format = sanitizePromptString(entry.format, 20)
+      const size = formatBytes(entry.bytes)
+      const records = entry.recordCount !== null
+        ? (entry.recordCountEstimated ? `~${formatNumber(entry.recordCount)}` : formatNumber(entry.recordCount))
+        : "\u2014"
+      const fields = entry.fields !== null
+        ? sanitizePromptString(
+            entry.fields.slice(0, 24).map(f => f.slice(0, 64)).join(", "),
+            200
+          )
+        : "\u2014"
+      lines.push(`| ${file} | ${format} | ${size} | ${records} | ${fields} |`)
+    }
+    if (options.inputManifest.length > INPUT_TABLE_CAP) {
+      lines.push(`(and ${options.inputManifest.length - INPUT_TABLE_CAP} more files \u2014 see __vars.inputs for full manifest)`)
+    }
+    lines.push("")
+    lines.push("(Record counts marked ~ are estimated from a file prefix.)")
+    lines.push("")
+    lines.push("Access with `await readFile(\"users.ndjson\")` or process with shell tools.")
+    lines.push("File metadata is also available in `__vars.inputs`.")
+    lines.push("")
+    lines.push("For large files, avoid reading the entire file into a single variable.")
+    lines.push("Use shell tools, read in chunks, or process line-by-line.")
+    lines.push("")
+  }
   if (!isStrict) {
     lines.push("## File System & Shell")
     lines.push("You have a temporary working directory for reading/writing files and running shell commands.")

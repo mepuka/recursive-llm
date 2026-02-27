@@ -25,6 +25,7 @@ export interface VariableMetadata {
 }
 
 export interface SandboxInstance {
+  readonly workDir?: string
   readonly execute: (code: string) => Effect.Effect<string, SandboxError>
   readonly setVariable: (name: string, value: unknown) => Effect.Effect<void, SandboxError>
   readonly getVariable: (name: string) => Effect.Effect<unknown, SandboxError>

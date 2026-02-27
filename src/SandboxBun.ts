@@ -478,6 +478,7 @@ const createSpawnSandboxInstance = (
     const state: SandboxState = { proc, health, pendingRequests, config, callId: options.callId, executeDeadline }
 
     return {
+      ...(hostSandboxWorkDir !== undefined ? { workDir: hostSandboxWorkDir } : {}),
       execute: (code: string) => {
         const requestId = crypto.randomUUID()
         return sendExecuteRequest(
@@ -838,6 +839,7 @@ const createWorkerSandboxInstance = (
     const state: SandboxState = { proc, health, pendingRequests, config, callId: options.callId, executeDeadline }
 
     return {
+      ...(hostSandboxWorkDir !== undefined ? { workDir: hostSandboxWorkDir } : {}),
       execute: (code: string) => {
         const requestId = crypto.randomUUID()
         return sendExecuteRequest(
