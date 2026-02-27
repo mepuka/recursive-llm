@@ -1,6 +1,10 @@
-import { describe, expect, test } from "bun:test"
+import { afterAll, beforeAll, describe, expect, test } from "bun:test"
+import * as nodeFs from "node:fs"
+import * as nodePath from "node:path"
+import * as os from "node:os"
 import {
   analyzeContext,
+  analyzeFilePrefix,
   detectPrimaryTextField,
   formatContextHint,
   MAX_JSON_METADATA_PARSE_CHARS
@@ -259,5 +263,62 @@ describe("ContextMetadata.formatContextHint", () => {
     expect(meta.chars).toBe(0)
     expect(meta.lines).toBe(0)
     expect(hint).toContain("0 chars")
+  })
+})
+
+describe("analyzeFilePrefix", () => {
+  let tmpDir: string
+
+  beforeAll(() => {
+    tmpDir = nodeFs.mkdtempSync(nodePath.join(os.tmpdir(), "rlm-prefix-test-"))
+  })
+
+  afterAll(() => {
+    nodeFs.rmSync(tmpDir, { recursive: true })
+  })
+
+  test("analyzes small ndjson file with exact counts", async () => {
+    const filePath = nodePath.join(tmpDir, "small.ndjson")
+    nodeFs.writeFileSync(filePath, '{"id":1,"name":"Alice"}\n{"id":2,"name":"Bob"}\n')
+
+    const meta = await analyzeFilePrefix(filePath)
+    expect(meta.format).toBe("ndjson")
+    expect(meta.fields).toEqual(["id", "name"])
+    expect(meta.recordCount).toBe(2)
+    expect(meta.linesEstimated).toBe(false)
+    expect(meta.recordCountEstimated).toBe(false)
+  })
+
+  test("returns estimated counts for large files", async () => {
+    const filePath = nodePath.join(tmpDir, "large.ndjson")
+    const line = JSON.stringify({ id: 1, name: "Alice".repeat(50) }) + "\n"
+    const lineCount = Math.ceil(260_000 / line.length)
+    nodeFs.writeFileSync(filePath, line.repeat(lineCount))
+
+    const meta = await analyzeFilePrefix(filePath)
+    expect(meta.format).toBe("ndjson")
+    expect(meta.linesEstimated).toBe(true)
+    expect(meta.recordCountEstimated).toBe(true)
+    expect(meta.fields).toEqual(["id", "name"])
+  })
+
+  test("analyzes csv file with exact counts", async () => {
+    const filePath = nodePath.join(tmpDir, "data.csv")
+    nodeFs.writeFileSync(filePath, "id,name,email\n1,Alice,alice@test.com\n2,Bob,bob@test.com\n")
+
+    const meta = await analyzeFilePrefix(filePath)
+    expect(meta.format).toBe("csv")
+    expect(meta.fields).toEqual(["id", "name", "email"])
+    expect(meta.recordCount).toBe(2)
+    expect(meta.linesEstimated).toBe(false)
+  })
+
+  test("uses provided fileName over basename", async () => {
+    const filePath = nodePath.join(tmpDir, "generic.txt")
+    nodeFs.writeFileSync(filePath, '{"x":1}\n{"x":2}\n')
+
+    const meta = await analyzeFilePrefix(filePath, "data.ndjson")
+    expect(meta.format).toBe("ndjson")
+    expect(meta.fileName).toBe("data.ndjson")
   })
 })

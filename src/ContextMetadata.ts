@@ -382,6 +382,50 @@ export const analyzeContext = (content: string, fileName?: string): ContextMetad
   return baseMetadata
 }
 
+export const PREFIX_READ_BYTES = 250_000
+
+export interface FileMetadataResult extends ContextMetadata {
+  readonly linesEstimated: boolean
+  readonly recordCountEstimated: boolean
+}
+
+export const analyzeFilePrefix = async (
+  filePath: string,
+  fileName?: string
+): Promise<FileMetadataResult> => {
+  const file = Bun.file(filePath)
+  const totalBytes = file.size
+  const isFullRead = totalBytes <= PREFIX_READ_BYTES
+  const prefix = await file.slice(0, PREFIX_READ_BYTES).text()
+
+  const resolvedFileName = fileName ?? filePath.split("/").pop()
+  const baseMeta = analyzeContext(prefix, resolvedFileName)
+
+  if (isFullRead) {
+    return {
+      ...baseMeta,
+      linesEstimated: false,
+      recordCountEstimated: false
+    }
+  }
+
+  // Estimate line and record counts from prefix ratio
+  const ratio = totalBytes / prefix.length
+  const estimatedLines = Math.round(baseMeta.lines * ratio)
+  const estimatedRecords = baseMeta.recordCount !== undefined
+    ? Math.round(baseMeta.recordCount * ratio)
+    : undefined
+
+  return {
+    ...baseMeta,
+    lines: estimatedLines,
+    linesEstimated: true,
+    ...(estimatedRecords !== undefined
+      ? { recordCount: estimatedRecords, recordCountEstimated: true }
+      : { recordCountEstimated: false })
+  }
+}
+
 export const formatContextHint = (meta: ContextMetadata): string => {
   const formatLabel = formatDisplayName(meta.format)
   if (meta.fileName !== undefined) {

@@ -4,7 +4,7 @@ import { nlpTools } from "../NlpTools"
 import { Rlm } from "../Rlm"
 import { formatEvent, type RenderOptions } from "../RlmRenderer"
 import type { RlmToolAny } from "../RlmTool"
-import { analyzeContext } from "../ContextMetadata"
+import { analyzeContext, analyzeFilePrefix } from "../ContextMetadata"
 import type { InputFile, MediaAttachment } from "../RlmTypes"
 import * as path from "node:path"
 
@@ -38,10 +38,19 @@ export const runCliProgram = (cliArgs: CliArgs) =>
       ? analyzeContext(context, undefined)
       : undefined
 
-    const inputFiles: ReadonlyArray<InputFile> | undefined = cliArgs.inputs?.map(entry => ({
-      name: entry.name,
-      path: entry.path
-    }))
+    let inputFiles: ReadonlyArray<InputFile> | undefined
+    if (cliArgs.inputs !== undefined && cliArgs.inputs.length > 0) {
+      const analyzed: Array<InputFile> = []
+      for (const entry of cliArgs.inputs) {
+        const meta = yield* Effect.promise(() => analyzeFilePrefix(entry.path))
+        analyzed.push({
+          name: entry.name,
+          path: entry.path,
+          metadata: meta
+        })
+      }
+      inputFiles = analyzed
+    }
 
     const tools: ReadonlyArray<RlmToolAny> = cliArgs.nlpTools
       ? yield* nlpTools.pipe(
