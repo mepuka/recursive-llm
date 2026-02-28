@@ -916,7 +916,7 @@ describe("SystemPrompt", () => {
     expect(prompt).toContain("15.0 MB")
     expect(prompt).toContain("~15,000")
     expect(prompt).toContain("id, name, email")
-    expect(prompt).toContain("`__vars.inputs` entries use:")
+    expect(prompt).toContain("`__vars.inputs` contains the full manifest")
     expect(prompt).toContain("linesEstimated")
   })
 

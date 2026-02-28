@@ -169,7 +169,11 @@ export const buildReplSystemPromptStatic = (
   }
   lines.push("")
   lines.push("## Variable Space")
-  lines.push("Your query is in `__vars.query`, any context is in `__vars.context`, context metadata (when available) is in `__vars.contextMeta`, and staged input-file metadata (when available) is in `__vars.inputs`.")
+  lines.push("Available variables:")
+  lines.push("- `__vars.query` — your query")
+  lines.push("- `__vars.context` — context string (may be empty)")
+  lines.push("- `__vars.contextMeta` — context metadata (if provided)")
+  lines.push("- `__vars.inputs` — staged input file metadata (if provided)")
   lines.push("Access these via code — do NOT guess at content. Example:")
   lines.push("```js")
   lines.push("print(JSON.stringify(__vars.contextMeta ?? null)) // metadata (if provided)")
@@ -251,12 +255,10 @@ export const buildReplSystemPromptStatic = (
       lines.push(`(and ${options.inputManifest.length - INPUT_TABLE_CAP} more files \u2014 see __vars.inputs for full manifest)`)
     }
     lines.push("")
-    lines.push("(Record counts marked ~ are estimated from a file prefix.)")
+    lines.push("Record counts marked ~ are estimated from a file prefix.")
     lines.push("")
     lines.push("Access with `await readFile(\"users.ndjson\")` or process with shell tools.")
-    lines.push("File metadata is also available in `__vars.inputs`.")
-    lines.push("`__vars.inputs` entries use:")
-    lines.push("`{ name, path, bytes, format, lines, linesEstimated, recordCount, recordCountEstimated, fields, sampleRecord }`")
+    lines.push("`__vars.inputs` contains the full manifest with fields: `{ name, path, bytes, format, lines, linesEstimated, recordCount, recordCountEstimated, fields, sampleRecord }`.")
     if (canRecurse) {
       lines.push("Recursive sub-calls receive these same staged inputs in their own sandbox work directories.")
     }
